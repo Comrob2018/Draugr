@@ -1,0 +1,7 @@
+# Core dependencies
+PyQt6
+requests
+packaging
+
+# Optional (used for data handling and enrichment)
+jsonschema
