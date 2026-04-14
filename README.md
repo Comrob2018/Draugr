@@ -1,4 +1,4 @@
-#Draugr
+**Draugr**  
 Draugr is a PyQt6 desktop vulnerability intelligence tool that analyzes software against multiple threat data sources — including the NVD,  
 CISA Known Exploited Vulnerabilities (KEV) catalog, EPSS scores, and public exploit references — to compute a weighted risk score per CVE.  
 It’s designed for analysts and developers who need fast, local vulnerability intelligence without relying on asset inventories or complex CMDBs.  
