@@ -1,0 +1,1184 @@
+{
+    "T1020.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1021": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1037": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1040": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1047": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059.006": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1070.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1114": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1114.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1114.003": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1119": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1127.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1137.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1213": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1213.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1213.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1213.005": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1219": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1530": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1537": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1543": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1547.003": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1547.004": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1547.009": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1550.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1552": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1552.004": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1557": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1558": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1563": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1565": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1610": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1651": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1072": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        }
+    ],
+    "T1078": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1078.001": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1078.003": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1078.004": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1195.001": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1213.003": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1542": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1542.001": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1553": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1213.004": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1528": [
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1552.001": [
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1021.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1021.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1021.003": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1021.004": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1021.005": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1021.006": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1021.008": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1037.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059.003": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059.004": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059.005": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059.007": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1059.008": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1070": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1070.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1070.008": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1114.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1133": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1137": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1505.004": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1505.005": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1547.012": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1547.013": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1552.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1552.005": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1552.007": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1557.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1558.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1558.003": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1558.004": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1563.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1563.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1565.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1565.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1567.003": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1567.004": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1602": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1602.001": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1602.002": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1609": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1612": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1613": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1619": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1647": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        },
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1659": [
+        {
+            "capability_id": "AC-17",
+            "capability_description": "Remote Access",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ExecutableDenylisting",
+            "d3fend_technique": "Executable Denylisting"
+        }
+    ],
+    "T1195.003": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1495": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1505": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1505.001": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1505.002": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1542.003": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1542.004": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1542.005": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1553.006": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1559.003": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1564.009": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        }
+    ],
+    "T1574.002": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1601": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1601.001": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1601.002": [
+        {
+            "capability_id": "SA-10",
+            "capability_description": "Developer Configuration Management",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#PlatformHardening",
+            "d3fend_technique": "Platform Hardening"
+        },
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1005": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1025": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1041": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1048": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1048.002": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1048.003": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1052": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1052.001": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1567": [
+        {
+            "capability_id": "AC-23",
+            "capability_description": "Data Mining Protection",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#UserDataTransferAnalysis",
+            "d3fend_technique": "User Data Transfer Analysis"
+        }
+    ],
+    "T1134.005": [
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ],
+    "T1552.006": [
+        {
+            "capability_id": "SA-11",
+            "capability_description": "Developer Testing and Evaluation",
+            "d3fend_url": "http://d3fend.mitre.org/ontologies/d3fend.owl#ApplicationHardening",
+            "d3fend_technique": "Application Hardening"
+        }
+    ]
+}
