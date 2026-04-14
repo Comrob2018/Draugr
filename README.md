@@ -46,7 +46,9 @@ python main.py
 
 📂 Output  
 CSV report — Contains CVE details, risk scores, exploit indicators, and KEV flags.  
-
+HTML Reports  
+Executive Report- All information needed for an excutive style report. Limit amounts of data to highest risk cves  
+Comprehensive Report - No limit to the amount of information included.  
 GUI view — Displays progress, results, and export options.  
 
 🧠 Optional Enrichment Databases  
