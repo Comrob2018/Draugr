@@ -3237,8 +3237,9 @@ class CVEScannerWindow(QMainWindow):
         if not out_path:
             QMessageBox.critical(self, "Error", "Please specify an output path.")
             return
-
-        output_dir = Path(out_path).expanduser().resolve()
+        base_dir = Path("results")
+        user_dir = Path(self.out_row.text())
+        output_dir = Path(base_dir / user_dir).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)          # <-- creates the folder
         # Use a fixed CSV name inside the folder (you can change it later)
         
