@@ -37,6 +37,7 @@ CPE MAPPING FILE (optional — cpe_mappings.json):
 # ----------------------------------------------------------------------
 import base64
 import csv
+import datetime
 import html
 import json
 import os
@@ -48,6 +49,8 @@ from pathlib import Path
 from packaging.version import Version, InvalidVersion
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ----------------------------------------------------------------------
 # Third‑party imports
@@ -72,8 +75,6 @@ try:
         QLabel,
         QLineEdit,
         QMainWindow,
-        QMenu,
-        QMenuBar,
         QMessageBox,
         QProgressBar,
         QPushButton,
@@ -171,31 +172,47 @@ def _build_nvd_url(base: str, params: Dict[str, Any]) -> str:
     return base + (("?" + "&".join(parts)) if parts else "")
 
 
-def nvd_get_json(url: str, params: Dict[str, Any], timeout: int = 60, max_attempts: int = 4) -> Dict[str, Any]:
+_nvd_lock = threading.Lock()
+_nvd_last_call: float = 0.0
+
+def nvd_get_json(url: str, params: Dict[str, Any], timeout: int = 60, max_attempts: int = 8) -> Dict[str, Any]:
     """Robust wrapper around NVD API calls with retry & rate‑limit handling."""
+    global _nvd_last_call
+    with _nvd_lock:
+        now = time.monotonic()
+        wait = 0.6 - (now - _nvd_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _nvd_last_call = time.monotonic()
     headers = {"User-Agent": USER_AGENT, "apiKey": NVD_API_KEY}
     request_url = _build_nvd_url(url, params)
+    last_exc: Optional[Exception] = None
     for attempt in range(1, max_attempts + 1):
         try:
             r = requests.get(request_url, headers=headers, timeout=timeout)
+            if r.status_code == 404:
+                raise RuntimeError(f"NVD returned 404— malformed CPE or unknown resource: {request_url}")
             if r.status_code in {429, 503}:
                 retry_after = r.headers.get("Retry-After")
                 sleep_s = (
                     float(retry_after)
                     if retry_after and retry_after.isdigit()
-                    else min(2 * attempt, 10)
+                    else min(4 * attempt, 30)
                 )
                 time.sleep(sleep_s)
-                continue
+                continue  # retry, don't count as exception
             r.raise_for_status()
             return r.json()
-        except Exception as exc:  # pragma: no cover – network failures are hard to test
+        except Exception as exc:
+            last_exc = exc
             if attempt == max_attempts:
                 raise RuntimeError(
-                    f"Failed NVD request for {url} with params={params!r}: {exc}"
+                    f"Failed NVD request after {max_attempts} attempts: {exc}"
                 ) from exc
             time.sleep(min(2 * attempt, 10))
-    raise RuntimeError("Unreachable code in nvd_get_json")  # safety
+    raise RuntimeError(
+        f"NVD rate-limited after {max_attempts} attempts — reduce max_workers or increase delay"
+    ) from last_exc
 
 
 # ----------------------------------------------------------------------
@@ -300,9 +317,10 @@ def iter_cves_by_cpe(
     start_index = 0
     page_size = 2000
     while True:
+        has_wildcard_version = ":*:" in cpe_name or cpe_name.endswith(":*")
         params = {
             "cpeName": cpe_name,
-            "isVulnerable": True,
+            "isVulnerable": not has_wildcard_version,
             "noRejected": True,
             "resultsPerPage": page_size,
             "startIndex": start_index,
@@ -943,6 +961,7 @@ def map_nist_controls(
         controls.update(nist_db.get(tid, {}).get("nist_controls", []))
     return sorted(controls)
 
+_fw_cache: Dict[tuple, Dict[str, Any]] = {}
 
 # ------------------------------------------------------------------
 # 7) Unified enrichment runner (called per CVE)
@@ -1413,10 +1432,81 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _load_mitre_scenarios_module():
+    """
+    Attempt to import the mitre_attack_scenarios module.
+
+    Searches for it in the same directory as the running script, then
+    falls back to the current working directory.  Returns the module
+    or None if unavailable.
+    """
+    import importlib.util as _ilu
+    for search_dir in [
+        os.path.dirname(os.path.abspath(__file__)),
+        os.getcwd(),
+    ]:
+        candidate = os.path.join(search_dir, "mitre_attack_scenarios.py")
+        if os.path.isfile(candidate):
+            try:
+                spec = _ilu.spec_from_file_location("mitre_attack_scenarios", candidate)
+                mod = _ilu.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+            except Exception:
+                pass
+    return None
+
+
+# Module-level lazy cache (populated on first call)
+_MITRE_MODULE = None
+_MITRE_MODULE_LOADED = False
+
+
+def _get_mitre_module():
+    """Return the mitre_attack_scenarios module (cached), or None."""
+    global _MITRE_MODULE, _MITRE_MODULE_LOADED
+    if not _MITRE_MODULE_LOADED:
+        _MITRE_MODULE = _load_mitre_scenarios_module()
+        _MITRE_MODULE_LOADED = True
+    return _MITRE_MODULE
+
+
+def get_attack_tactics(technique_id: str) -> List[str]:
+    """Return the ATT&CK tactic names for a technique ID, or [] if unavailable."""
+    mod = _get_mitre_module()
+    if mod and hasattr(mod, "TECHNIQUE_SCENARIOS"):
+        entry = mod.TECHNIQUE_SCENARIOS.get(technique_id, {})
+        return entry.get("tactics", [])
+    return []
+
+
+def get_attack_impact(technique_id: str) -> str:
+    """Return the tactic-based impact description for a technique ID."""
+    mod = _get_mitre_module()
+    if mod and hasattr(mod, "get_impact"):
+        return mod.get_impact(technique_id)
+    return ""
+
+
 def _scenario_template(attack_id: str, attack_name: str, software_name: str, cve_id: str) -> str:
-    """Return a short scenario narrative tied to ATT&CK technique."""
+    """
+    Return a scenario narrative tied to an ATT&CK technique.
+
+    Uses the full 632-technique mitre_attack_scenarios module when
+    available; otherwise falls back to the original built-in templates.
+    """
     aid = (attack_id or "").upper()
 
+    # --- Try the full MITRE scenarios module first ---
+    mod = _get_mitre_module()
+    if mod and hasattr(mod, "get_scenario"):
+        scenario = mod.get_scenario(aid, cve_id, software_name)
+        # get_scenario returns a "No scenario mapping found" message for
+        # unknown IDs — treat that as a miss and fall through.
+        if not scenario.startswith("No scenario mapping found"):
+            return scenario
+
+    # --- Built-in fallback (covers the most common techniques) ---
     templates = {
         "T1190": (
             f"An attacker targets a vulnerable public-facing instance of {software_name} "
@@ -1635,10 +1725,17 @@ def _format_scenarios(rows: List[Dict[str, Any]], software_name: str, limit) -> 
         else:
             attack_id, attack_name = first_attack, first_attack
 
+        # Tactic context from the MITRE scenarios module
+        tactics = get_attack_tactics(attack_id)
+        tactics_line = ", ".join(tactics) if tactics else (
+            row.get("ATT&CK Tactics", "") or "Unknown"
+        )
+
         count += 1
         lines.append(f"### Scenario {count}: {attack_name}")
         lines.append(f"- CVE: {row.get('CVE ID', '')}")
         lines.append(f"- ATT&CK Technique: {attack_id} ({attack_name})")
+        lines.append(f"- ATT&CK Tactics: {tactics_line}")
         lines.append(f"- Narrative: {_scenario_template(attack_id, attack_name, software_name, row.get('CVE ID', ''))}")
         lines.append(f"- Primary Mitigations:  {row.get('D3FEND Countermeasures', '') or row.get('NIST 800-53 Controls', '') or 'No mapped mitigations'}")
         lines.append("")
@@ -1695,21 +1792,50 @@ def _top_techniques(
         - name   : technique name
         - d3fend : list of D3FEND counter‑measures
         - nist   : list of NIST‑800‑53 controls
+        - tactics: list of ATT&CK tactic names
+
+    Rows use CSV-column keys: "ATT&CK Techniques" is a semicolon-
+    separated string of "T1190 (Exploit Public-Facing Application)" entries.
     """
     technique_counter: Counter = Counter()
     technique_meta: Dict[str, Dict[str, Any]] = {}
 
     for r in rows:
-        aid = r.get("attack_id")               # e.g. "T1190"
-        if not aid:
-            continue
-        technique_counter[aid] += 1
-        if aid not in technique_meta:           # store the extra data only once
-            technique_meta[aid] = {
-                "name": r.get("attack_name", ""),
-                "d3fend": r.get("d3fend_countermeasures", []),
-                "nist": r.get("nist_controls", []),
-            }
+        attacks = _split_multi(r.get("ATT&CK Techniques", ""))
+        d3f     = _split_multi(r.get("D3FEND Countermeasures", ""))
+        nist    = _split_multi(r.get("NIST 800-53 Controls", ""))
+        tactics = _split_multi(r.get("ATT&CK Tactics", ""))
+
+        for entry in attacks:
+            m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", entry)
+            if m:
+                aid, aname = m.group(1), m.group(2)
+            else:
+                aid, aname = entry.strip(), entry.strip()
+
+            if not aid:
+                continue
+
+            technique_counter[aid] += 1
+            if aid not in technique_meta:
+                technique_meta[aid] = {
+                    "name": aname,
+                    "d3fend": list(d3f),
+                    "nist": list(nist),
+                    "tactics": list(tactics),
+                    "d3fend_seen": set(d3f),
+                    "nist_seen": set(nist),
+                }
+            else:
+                rec = technique_meta[aid]
+                for d in d3f:
+                    if d not in rec["d3fend_seen"]:
+                        rec["d3fend_seen"].add(d)
+                        rec["d3fend"].append(d)
+                for n in nist:
+                    if n not in rec["nist_seen"]:
+                        rec["nist_seen"].add(n)
+                        rec["nist"].append(n)
 
     most_common = technique_counter.most_common(top_n)
     return [(aid, cnt, technique_meta[aid]) for aid, cnt in most_common]
@@ -1718,37 +1844,94 @@ def _top_techniques(
 def _executive_summary(rows: List[Dict[str, Any]]) -> str:
     """
     Build a **high‑level narrative** that lists:
-      • total CVEs, severity distribution,
-      • the top ATT&CK techniques,
+      • total CVEs, severity distribution, KEV and exploit counts,
+      • the top ATT&CK techniques with tactic context,
       • the defend‑mitigations (D3FEND + NIST) that cover the majority of findings.
     """
     # ----- severity totals -------------------------------------------------
     sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "OTHER": 0}
+    kev_total = 0
+    exploit_total = 0
+    confirmed_total = 0
+    max_risk_score = 0.0
+    software_set: set = set()
+
     for r in rows:
-        sev = (r.get("cvss_severity") or r.get("risk_label", "").upper())
-        sev_counts[sev] = sev_counts.get(sev, 0) + 1
+        sev = str(r.get("CVSS Severity", "") or r.get("Risk Level", "") or "").upper()
+        if sev in sev_counts:
+            sev_counts[sev] += 1
+        else:
+            sev_counts["OTHER"] += 1
+
+        if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES":
+            kev_total += 1
+        if str(r.get("Public Exploit", "")).upper() == "YES":
+            exploit_total += 1
+        if str(r.get("Version Confirmed", "")).upper() == "YES":
+            confirmed_total += 1
+
+        try:
+            rs = float(r.get("Risk Score", 0))
+            if rs > max_risk_score:
+                max_risk_score = rs
+        except (TypeError, ValueError):
+            pass
+
+        sw = str(r.get("Software Name", "")).strip()
+        if sw:
+            software_set.add(sw)
+
     total_cves = sum(sev_counts.values())
 
     # ----- top techniques --------------------------------------------------
-    top = _top_techniques(rows, top_n=3)
+    top = _top_techniques(rows, top_n=5)
 
     # ----- build markdown ---------------------------------------------------
     md = ["## Executive Summary", ""]
     md.append(
-        f"The scan identified **{total_cves}** CVEs. "
+        f"The scan identified **{total_cves}** CVEs across "
+        f"**{len(software_set)}** software {'items' if len(software_set) != 1 else 'item'}. "
         f"Severity breakdown – Critical: **{sev_counts['CRITICAL']}**, "
         f"High: **{sev_counts['HIGH']}**, Medium: **{sev_counts['MEDIUM']}**, "
         f"Low: **{sev_counts['LOW']}**."
     )
     md.append("")
-    md.append("The most prevalent ATT&CK techniques are:")
-    for aid, cnt, meta in top:
-        mitig = ", ".join(meta["d3fend"]) or "none"
-        nist  = ", ".join(meta["nist"])   or "none"
-        md.append(
-            f"- **{meta['name']}** ({aid}) – observed in **{cnt}** CVEs. "
-            f"Defend mitigations: {mitig}. NIST controls: {nist}."
-        )
+
+    # Key risk indicators
+    risk_items: List[str] = []
+    if kev_total:
+        risk_items.append(f"**{kev_total}** {'CVEs are' if kev_total != 1 else 'CVE is'} listed in the CISA Known Exploited Vulnerabilities catalog")
+    if exploit_total:
+        risk_items.append(f"**{exploit_total}** {'have' if exploit_total != 1 else 'has'} publicly available exploit code")
+    if confirmed_total:
+        risk_items.append(f"**{confirmed_total}** {'are' if confirmed_total != 1 else 'is'} version‑confirmed against the scanned software")
+    if max_risk_score:
+        risk_items.append(f"Highest weighted risk score: **{max_risk_score:.1f}**/100")
+
+    if risk_items:
+        md.append("Key risk indicators:")
+        for item in risk_items:
+            md.append(f"- {item}")
+        md.append("")
+
+    if top:
+        md.append("The most prevalent ATT&CK techniques are:")
+        for aid, cnt, meta in top:
+            tactics_str = ", ".join(meta.get("tactics", [])) or "—"
+            mitig = ", ".join(meta["d3fend"][:3]) or "none"
+            if len(meta["d3fend"]) > 3:
+                mitig += f" (+{len(meta['d3fend']) - 3} more)"
+            nist  = ", ".join(meta["nist"][:3])   or "none"
+            if len(meta["nist"]) > 3:
+                nist += f" (+{len(meta['nist']) - 3} more)"
+            md.append(
+                f"- **{meta['name']}** ({aid}) – observed in **{cnt}** CVEs. "
+                f"Tactics: {tactics_str}. "
+                f"D3FEND mitigations: {mitig}. NIST controls: {nist}."
+            )
+    else:
+        md.append("- No ATT&CK techniques were mapped for the identified CVEs.")
+
     md.append("")
     md.append(
         "Focusing remediation on the mitigations listed above will address "
@@ -1759,36 +1942,107 @@ def _executive_summary(rows: List[Dict[str, Any]]) -> str:
 
 def _conclusion_section(rows: List[Dict[str, Any]]) -> str:
     """
-    Provide a **step‑by‑step implementation guide** for the mitigations
-    surfaced in the executive summary.
+    Provide a data-driven step-by-step implementation guide for the
+    mitigations surfaced by the scan.
     """
-    top = _top_techniques(rows, top_n=3)
+    top = _top_techniques(rows, top_n=5)
+
+    # Gather aggregate stats for the conclusion
+    total_cves = len(rows)
+    kev_total = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
+    exploit_total = sum(1 for r in rows if str(r.get("Public Exploit", "")).upper() == "YES")
+    confirmed_total = sum(1 for r in rows if str(r.get("Version Confirmed", "")).upper() == "YES")
+    critical_count = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "CRITICAL")
+    high_count = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "HIGH")
+
+    # Collect all unique D3FEND and NIST controls across all rows
+    all_d3fend: List[str] = []
+    all_nist: List[str] = []
+    d3_seen: set = set()
+    nist_seen: set = set()
+    for r in rows:
+        for d in _split_multi(r.get("D3FEND Countermeasures", "")):
+            if d not in d3_seen:
+                d3_seen.add(d)
+                all_d3fend.append(d)
+        for n in _split_multi(r.get("NIST 800-53 Controls", "")):
+            if n not in nist_seen:
+                nist_seen.add(n)
+                all_nist.append(n)
 
     md = ["## Conclusion & Implementation Guidance", ""]
-    md.append(
-        "To fully secure the environment, apply the following actions in "
-        "the order shown."
-    )
-    step = 1
-    for _, _, meta in top:
-        for d3 in meta["d3fend"]:
-            md.append(f"{step}. Deploy D3FEND counter‑measure **{d3}**.")
-            step += 1
-        for n in meta["nist"]:
-            md.append(f"{step}. Enact NIST 800‑53 control **{n}**.")
-            step += 1
 
+    # Situation overview
+    md.append(
+        f"This assessment identified **{total_cves}** CVEs, of which "
+        f"**{critical_count}** are Critical and **{high_count}** are High severity."
+    )
+    if kev_total or exploit_total:
+        parts = []
+        if kev_total:
+            parts.append(f"**{kev_total}** appear in the CISA KEV catalog")
+        if exploit_total:
+            parts.append(f"**{exploit_total}** have public exploit code available")
+        md.append(f"{'; '.join(parts)}.")
+    if confirmed_total:
+        md.append(
+            f"Of these, **{confirmed_total}** are version-confirmed as affecting "
+            f"the scanned software."
+        )
     md.append("")
+
+    # Prioritised remediation steps from top techniques
+    if top:
+        md.append(
+            "To address the highest-impact attack vectors, apply the following "
+            "actions in priority order:"
+        )
+        md.append("")
+
+        step = 1
+        for aid, cnt, meta in top:
+            tname = meta.get("name", aid)
+            tactics = ", ".join(meta.get("tactics", [])) or "Unknown"
+            md.append(
+                f"**Priority {step}: {tname} ({aid})** -- "
+                f"affects {cnt} CVE{'s' if cnt != 1 else ''} "
+                f"(Tactics: {tactics})"
+            )
+            if meta["d3fend"]:
+                for d in meta["d3fend"][:3]:
+                    md.append(f"- Deploy D3FEND counter-measure: **{d}**")
+                if len(meta["d3fend"]) > 3:
+                    md.append(f"- ... and {len(meta['d3fend']) - 3} additional D3FEND measures")
+            if meta["nist"]:
+                for n in meta["nist"][:3]:
+                    md.append(f"- Enact NIST 800-53 control: **{n}**")
+                if len(meta["nist"]) > 3:
+                    md.append(f"- ... and {len(meta['nist']) - 3} additional NIST controls")
+            if not meta["d3fend"] and not meta["nist"]:
+                md.append("- No specific D3FEND or NIST mappings available for this technique")
+            md.append("")
+            step += 1
+    else:
+        md.append("No ATT&CK techniques were mapped; remediation should focus on patching the identified CVEs directly.")
+        md.append("")
+
+    # Summary totals
+    md.append(
+        f"Across all findings, **{len(all_d3fend)}** unique D3FEND counter-measures "
+        f"and **{len(all_nist)}** unique NIST 800-53 controls were identified."
+    )
+    md.append("")
+
     md.append(
         "Implementation roadmap:\n"
-        "1. **Prioritise** mitigations tied to the highest‑frequency techniques.\n"
-        "2. **Integrate** them into existing change‑management / patch‑processes.\n"
-        "3. **Validate** effectiveness with periodic red‑team or ATT&CK‑mapping tests.\n"
-        "4. **Monitor** for new CVEs and continuously update the mitigation set."
+        "1. **Prioritise** -- Address KEV-listed and publicly-exploitable CVEs first.\n"
+        "2. **Patch** -- Apply vendor patches for all version-confirmed CVEs.\n"
+        "3. **Harden** -- Deploy the D3FEND counter-measures and NIST controls listed above.\n"
+        "4. **Validate** -- Confirm effectiveness with periodic red-team or ATT&CK-mapping tests.\n"
+        "5. **Monitor** -- Continuously scan for new CVEs and update the mitigation set."
     )
     md.append("")
     return "\n".join(md)
-
 
 # ======================================================================
 #  HTML report helpers
@@ -1942,7 +2196,7 @@ body {
     font-family: 'Courier New', Courier, monospace;
     font-size: 13px;
     line-height: 1.6;
-    padding: 0 0 60px 0;
+    padding: 0 40px 60px 40px;
 }
 
 /* --------------------------------------------------------------
@@ -2294,6 +2548,7 @@ class ScanWorker(QThread):
     progress_signal = pyqtSignal(int, int)   # current, total
     status_signal = pyqtSignal(str)          # status bar text
     finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)           # error message (also written to error log)
 
     def __init__(self, software, kev_path, api_key, output_path, cpe_mapping_path="",
                  show_medium=True, show_low=True, resources_dir="", executive_report_path="", comp_report_path=""):
@@ -2308,24 +2563,263 @@ class ScanWorker(QThread):
         self.resources_dir = resources_dir
         self.executive_report_path = executive_report_path
         self.comp_report_path = comp_report_path
+        # Derive log and error file paths alongside the output CSV
+        out_base = Path(output_path)
+        self.scan_log_path  = str(out_base.with_name(f"{out_base.stem}_scan.log"))
+        self.error_log_path = str(out_base.with_name(f"{out_base.stem}_errors.log"))
+        self._scan_log_lines:  List[str] = []
+        self._error_log_lines: List[str] = []
+    
+    def _emit_log(self, msg: str, level: str = "info"):
+        """Emit to UI and buffer for scan log. Errors also go to the error buffer."""
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] [{level.upper():7}] {msg}"
+        self._scan_log_lines.append(line)
+        if level == "error":
+            self._error_log_lines.append(line)
+            self.error_signal.emit(msg)
+        self.emit_(msg, level)
+
+    def _scan_software_item(
+        self,
+        idx: int,
+        total: int,
+        name: str,
+        version: str,
+        kev_index: Dict,
+        cpe_mappings: Dict,
+        enrichment_dbs: Dict,
+    ) -> Tuple[List[Dict], List[Tuple[str, str]]]:
+        """
+        Process a single software item. Returns (rows, log_messages).
+        log_messages is a list of (message, level) tuples to emit in order.
+        """
+        logs: List[Tuple[str, str]] = []
+        rows: List[Dict] = []
+
+        label = f"{name} {version}".strip()
+        logs.append((f"[{idx}/{total}] Querying NVD for: {label}", "info"))
+
+        cves = find_cves_for_software(
+            name, version, kev_index=kev_index, cpe_mappings=cpe_mappings,
+        )
+        if not cves:
+            logs.append(("✓ No CVEs found.", "ok"))
+            delay = 0.2 if self.api_key else RATE_LIMIT_DELAY
+            time.sleep(delay)
+            return rows, logs
+
+        logs.append((f"Found {_plural(len(cves), 'CVE')} — enriching with EPSS & exploit data…", "info"))
+
+        cve_ids = [c["cve_id"] for c in cves]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            epss_future    = pool.submit(query_epss, cve_ids)
+            vulners_future = pool.submit(query_exploits_vulners, cve_ids)
+        epss_map    = epss_future.result()
+        vulners_map = vulners_future.result()
+        if vulners_map:
+            logs.append((f"✔ Vulners returned exploit data for {_plural(len(vulners_map), 'CVE')}.", "ok"))
+
+        critical_count = high_count = medium_count = low_count = other_count = 0
+        c_cves_confirmed: List[str] = []
+        h_cves_confirmed: List[str] = []
+        c_cves_unverified: List[str] = []
+        h_cves_unverified: List[str] = []
+        m_cves_confirmed: List[str] = []
+        m_cves_unverified: List[str] = []
+        l_cves_confirmed: List[str] = []
+        l_cves_unverified: List[str] = []
+        risk_entries: List[Tuple[float, str, str]] = []
+        exploit_cves: List[Tuple[str, str, str]] = []
+
+        for cve in cves:
+            cid          = cve["cve_id"]
+            epss         = epss_map.get(cid, {})
+            nvd_url      = f"https://nvd.nist.gov/vuln/detail/{cid}"
+            cvss_severity = str(cve.get("cvss_severity") or "").upper()
+
+            affected        = version_affected(version, cve.get("cpe_matches", []))
+            has_nvd_exploit = cve.get("has_public_exploit", False)
+            vulners_exploits = vulners_map.get(cid, [])
+            has_exploit     = has_nvd_exploit or bool(vulners_exploits)
+
+            exploit_sources: List[str] = []
+            if has_nvd_exploit:
+                exploit_sources.append("NVD refs")
+            if vulners_exploits:
+                sources = set(e.get("source", "") for e in vulners_exploits)
+                exploit_sources.extend(s for s in sources if s)
+
+            risk_score, risk_label = compute_risk_score(cve, epss, affected, has_exploit)
+            severity = cvss_severity if cvss_severity else risk_label.upper()
+
+            if severity == "CRITICAL":      critical_count += 1
+            elif severity == "HIGH":        high_count += 1
+            elif severity == "MEDIUM":      medium_count += 1
+            elif severity == "LOW":         low_count += 1
+            else:                           other_count += 1
+
+            cwe_ids_cve = cve.get("cwe_ids", [])
+            _fw_key = tuple(sorted(cwe_ids_cve))
+            if _fw_key not in _fw_cache:
+                _fw_cache[_fw_key] = enrich_cve_frameworks(cwe_ids_cve, enrichment_dbs)
+            fw = _fw_cache[_fw_key]
+
+            attack_str  = "; ".join(f"{t['technique_id']} ({t['technique_name']})" for t in fw["attack_techs"])
+            d3fend_str  = "; ".join(fw["d3fend"])
+            capec_str   = "; ".join(fw["capec_ids"])
+            nist_str    = "; ".join(fw["nist_controls"])
+
+            all_tactics: List[str] = []
+            all_impacts: List[str] = []
+            seen_tactics: set = set()
+            for t in fw["attack_techs"]:
+                tid = t["technique_id"]
+                for tactic in get_attack_tactics(tid):
+                    if tactic not in seen_tactics:
+                        seen_tactics.add(tactic)
+                        all_tactics.append(tactic)
+                impact = get_attack_impact(tid)
+                if impact and impact not in all_impacts:
+                    all_impacts.append(impact)
+
+            rows.append({
+                "Software Name": name, "Software Version": version,
+                "CVE ID": cid, "Description": cve.get("description", ""),
+                "CVE Date": cve.get("published", ""),
+                "CVSS Version": cve.get("cvss_version", ""),
+                "CVSS Base Score": cve.get("cvss_base_score", ""),
+                "CVSS Severity": cve.get("cvss_severity", ""),
+                "CVSS Exploitability": cve.get("cvss_exploitability", ""),
+                "CVSS Impact": cve.get("cvss_impact", ""),
+                "Known Exploited Vulnerability": cve.get("kev_known_exploited", "No"),
+                "KEV Date Added": cve.get("kev_date_added", ""),
+                "EPSS Score": epss.get("epss_score", ""),
+                "EPSS Percentile": epss.get("epss_percentile", ""),
+                "Public Exploit": "Yes" if has_exploit else "No",
+                "Exploit Sources": "; ".join(exploit_sources),
+                "Version Confirmed": (
+                    "Yes" if affected is True else "No" if affected is False else "Unverified"
+                ),
+                "Risk Score": risk_score, "Risk Level": risk_label,
+                "CWE": "; ".join(fw["cwe_expanded"]),
+                "CAPEC": capec_str, "ATT&CK Techniques": attack_str,
+                "ATT&CK Tactics": "; ".join(all_tactics),
+                "ATT&CK Impact": "; ".join(all_impacts),
+                "D3FEND Countermeasures": d3fend_str,
+                "NIST 800-53 Controls": nist_str, "NVD URL": nvd_url,
+            })
+
+            risk_entries.append((risk_score, risk_label, cid))
+            if has_exploit:
+                exploit_cves.append((cid, severity, "; ".join(exploit_sources)))
+
+            if severity in ("CRITICAL", "HIGH"):
+                if affected is True:
+                    (c_cves_confirmed if severity == "CRITICAL" else h_cves_confirmed).append(cid)
+                elif affected is None:
+                    (c_cves_unverified if severity == "CRITICAL" else h_cves_unverified).append(cid)
+            elif severity == "MEDIUM" and self.show_medium:
+                if affected is True:   m_cves_confirmed.append(cid)
+                elif affected is None: m_cves_unverified.append(cid)
+            elif severity == "LOW" and self.show_low:
+                if affected is True:   l_cves_confirmed.append(cid)
+                elif affected is None: l_cves_unverified.append(cid)
+
+        # --- summary logs ---
+        def _collect_cve_list(cve_list, level, tag=""):
+            suffix = f"  {tag}" if tag else ""
+            for cid in cve_list:
+                logs.append((f"•   \t{cid}: https://nvd.nist.gov/vuln/detail/{cid}{suffix}", level))
+
+        risk_entries.sort(key=lambda x: x[0], reverse=True)
+        top = risk_entries[:5]
+        if top and top[0][0] >= 40:
+            logs.append(("  ── Top risk CVEs (by weighted score) ──", "dim"))
+            for score, rlabel, cid in top:
+                color_level = {"CRITICAL": "error", "HIGH": "warn", "MEDIUM": "info"}.get(rlabel, "dim")
+                logs.append((f"    {score:5.1f}  [{rlabel}]  {cid}", color_level))
+
+        if exploit_cves:
+            logs.append((f"  🔓 {_plural(len(exploit_cves), 'CVE')} with public exploits available", "error"))
+            for ecid, eseverity, esources in exploit_cves:
+                logs.append((f"•   \t{ecid}  [{eseverity}] - ({esources})", "error"))
+
+        for sev_label, sev_count, confirmed_list, unverified_list, level in [
+            ("CRITICAL", critical_count, c_cves_confirmed, c_cves_unverified, "error"),
+            ("HIGH",     high_count,     h_cves_confirmed, h_cves_unverified, "warn"),
+        ]:
+            if not sev_count:
+                continue
+            confirmed  = len(confirmed_list)
+            unverified = len(unverified_list)
+            filtered   = sev_count - confirmed - unverified
+            parts = []
+            if confirmed:  parts.append(f"{confirmed} confirmed")
+            if unverified: parts.append(f"{unverified} unverified")
+            if filtered:   parts.append(f"{filtered} not applicable to v{version}")
+            detail = f" ({', '.join(parts)})" if parts else ""
+            logs.append((f"  ⚠ {_plural(sev_count, f'{sev_label} CVE')}{detail}", level))
+            _collect_cve_list(confirmed_list, level)
+            _collect_cve_list(unverified_list, level, tag="[unverified]")
+
+        if medium_count and self.show_medium:
+            confirmed_m  = len(m_cves_confirmed)
+            unverified_m = len(m_cves_unverified)
+            filtered_m   = medium_count - confirmed_m - unverified_m
+            parts_m = []
+            if confirmed_m:  parts_m.append(f"{confirmed_m} confirmed")
+            if unverified_m: parts_m.append(f"{unverified_m} unverified")
+            if filtered_m:   parts_m.append(f"{filtered_m} not applicable to v{version}")
+            logs.append((f" [!] {_plural(medium_count, 'MEDIUM CVE')} ({', '.join(parts_m)})" if parts_m
+                        else f" [!] {_plural(medium_count, 'MEDIUM CVE')}", "info"))
+            _collect_cve_list(m_cves_confirmed, "info")
+            _collect_cve_list(m_cves_unverified, "info", tag="[unverified]")
+        elif medium_count:
+            logs.append((f" [!] {_plural(medium_count, 'MEDIUM CVE')} (hidden — enable in log filters)", "dim"))
+
+        if low_count and self.show_low:
+            confirmed_l  = len(l_cves_confirmed)
+            unverified_l = len(l_cves_unverified)
+            filtered_l   = low_count - confirmed_l - unverified_l
+            parts_l = []
+            if confirmed_l:  parts_l.append(f"{confirmed_l} confirmed")
+            if unverified_l: parts_l.append(f"{unverified_l} unverified")
+            if filtered_l:   parts_l.append(f"{filtered_l} not applicable to v{version}")
+            logs.append((f" [i] {_plural(low_count, 'LOW CVE')} ({', '.join(parts_l)})" if parts_l
+                        else f" [i] {_plural(low_count, 'LOW CVE')}", "info"))
+            _collect_cve_list(l_cves_confirmed, "info")
+            _collect_cve_list(l_cves_unverified, "info", tag="[unverified]")
+        elif low_count:
+            logs.append((f" [i] {_plural(low_count, 'LOW CVE')} (hidden — enable in log filters)", "dim"))
+
+        if other_count:
+            logs.append((f" [i] {_plural(other_count, 'UNRANKED CVE')}", "dim"))
+
+        delay = 0.2 if self.api_key else RATE_LIMIT_DELAY
+        logs.append((f"Rate‑limit pause ({delay}s) …", "dim"))
+        time.sleep(delay)
+
+        return rows, logs
 
     def run(self):
         # Load CPE mapping overrides
         self.status_signal.emit("Loading CPE mappings…")
         cpe_mappings = load_cpe_mappings(self.cpe_mapping_path or None)
         if cpe_mappings:
-            self.log_signal.emit(
+            self._emit_log(
                 f"✔ CPE mapping file loaded — {len(cpe_mappings)} product overrides.", "ok",
             )
             self.status_signal.emit(f"CPE mappings loaded — {len(cpe_mappings)} overrides")
         else:
-            self.log_signal.emit(
+            self._emit_log(
                 "ℹ No CPE mapping file found — using heuristic CPE search.", "dim",
             )
 
         # Load KEV index
         self.status_signal.emit("Loading KEV catalog…")
-        kev_index = load_kev_with_fallback(self.kev_path or "", log=self.log_signal.emit)
+        kev_index = load_kev_with_fallback(self.kev_path or "", log=self._emit_log)
         kev_count = len(kev_index)
         if kev_count:
             self.status_signal.emit(f"KEV loaded — {kev_count} entries")
@@ -2335,384 +2829,84 @@ class ScanWorker(QThread):
         enrichment_dbs = load_enrichment_dbs(self.resources_dir or None)
         db_names = [k for k, v in enrichment_dbs.items() if v]
         if db_names:
-            self.log_signal.emit(
+            self._emit_log(
                 f"✔ Enrichment DBs loaded: {', '.join(db_names)}", "ok",
             )
             self.status_signal.emit(f"Enrichment DBs loaded: {', '.join(db_names)}")
         else:
-            self.log_signal.emit(
+            self._emit_log(
                 "ℹ No enrichment DBs found — using built-in mappings + D3FEND API.", "dim",
             )
-        self.log_signal.emit(
+        self._emit_log(
             "Highest Risk CVEs, CVEs with publicly available exploits, and Critical or High CVEs that match software and version will appear in log", "dim",
         )
-        self.log_signal.emit("All CVEs will appear in the output report.", "dim")
+        self._emit_log("All CVEs will appear in the output report.", "dim")
 
         all_rows: List[Dict[str, Any]] = []
         total = len(self.software)
 
-        for idx, (name, version) in enumerate(self.software, 1):
-
-            if self.isInterruptionRequested():
-                self.log_signal.emit("Scan cancelled by user", "warning")
-                self.status_signal.emit("Cancelled by user")
-                break
-
-            label = f"{name} {version}".strip()
-            self.log_signal.emit(f"[{idx}/{total}] Querying NVD for: {label}", "info")
-            self.status_signal.emit(f"Scanning: {idx} of {total} — {label}")
-            self.progress_signal.emit(idx - 1, total)  # show progress before work starts
-
-            # -----------------------------------------------------------------
-            # Retrieve CVEs
-            # -----------------------------------------------------------------
-            cves = find_cves_for_software(
-                name, version, kev_index=kev_index, cpe_mappings=cpe_mappings,
-            )
-            if not cves:
-                self.log_signal.emit("✓ No CVEs found.", "ok")
-                self.progress_signal.emit(idx, total)  # mark this item complete
-                time.sleep(RATE_LIMIT_DELAY if not self.api_key else 0.6)
-                continue
-
-            self.log_signal.emit(
-                f"Found {_plural(len(cves), 'CVE')} — enriching with EPSS & exploit data…",
-                "info",
-            )
-
-            cve_ids = [c["cve_id"] for c in cves]
-            self.status_signal.emit(f"Scanning: {idx} of {total} — {label} — Enriching: EPSS")
-            epss_map = query_epss(cve_ids)
-
-            # --- Exploit intelligence (Vulners batch lookup) ---
-            self.status_signal.emit(f"Scanning: {idx} of {total} — {label} — Enriching: Vulners")
-            self.log_signal.emit("Querying Vulners for public exploit data…", "dim")
-            vulners_map = query_exploits_vulners(cve_ids)
-            if vulners_map:
-                self.log_signal.emit(
-                    f"✔ Vulners returned exploit data for {_plural(len(vulners_map), 'CVE')}.",
-                    "ok",
+        completed = 0
+        futures_map = {}
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            for idx, (name, version) in enumerate(self.software, 1):
+                if self.isInterruptionRequested():
+                    self._emit_log("Scan cancelled by user", "warning")
+                    self.status_signal.emit("Cancelled by user")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                label = f"{name} {version}".strip()
+                self.status_signal.emit(f"Queued: {label}")
+                future = executor.submit(
+                    self._scan_software_item,
+                    idx, total, name, version,
+                    kev_index, cpe_mappings, enrichment_dbs,
                 )
+                futures_map[future] = (idx, label)
 
-            # --- Framework enrichment handled per-CVE via enrich_cve_frameworks() ---
-
-            # Severity counters
-            critical_count = 0
-            high_count = 0
-            medium_count = 0
-            low_count = 0
-            other_count = 0
-
-            # Version‑verified CVE lists
-            c_cves_confirmed: List[str] = []
-            h_cves_confirmed: List[str] = []
-            c_cves_unverified: List[str] = []
-            h_cves_unverified: List[str] = []
-            m_cves_confirmed: List[str] = []  # confirmed medium‑severity CVEs
-            m_cves_unverified: List[str] = []  # unverified medium‑severity CVEs
-            l_cves_confirmed: List[str] = []  # confirmed low‑severity CVEs
-            l_cves_unverified: List[str] = []  # unverified low‑severity CVEs
-
-            # Top‑risk CVEs for summary
-            risk_entries: List[Tuple[float, str, str]] = []
-
-            # Public exploit tracker for log output
-            exploit_cves: List[Tuple[str, str]] = []  # (cid, sources_str)
-
-            for cve in cves:
-                cid   = cve["cve_id"]
-                epss  = epss_map.get(cid, {})
-                nvd_url = f"https://nvd.nist.gov/vuln/detail/{cid}"
-                cvss_severity = str(cve.get("cvss_severity") or "").upper()
-
-                # ---- version check ----
-                affected = version_affected(version, cve.get("cpe_matches", []))
-
-                # ---- exploit intelligence merge ----
-                has_nvd_exploit = cve.get("has_public_exploit", False)
-                vulners_exploits = vulners_map.get(cid, [])
-                has_exploit = has_nvd_exploit or bool(vulners_exploits)
-
-                exploit_sources: List[str] = []
-                if has_nvd_exploit:
-                    exploit_sources.append("NVD refs")
-                if vulners_exploits:
-                    sources = set(e.get("source", "") for e in vulners_exploits)
-                    exploit_sources.extend(s for s in sources if s)
-
-                # ---- risk score ----
-                risk_score, risk_label = compute_risk_score(
-                    cve, epss, affected, has_exploit,
-                )
-
-                # Use CVSS severity when available; fall back to risk label for unscored CVEs
-                severity = cvss_severity if cvss_severity else risk_label.upper()
-
-                if severity == "CRITICAL":
-                    critical_count += 1
-                elif severity == "HIGH":
-                    high_count += 1
-                elif severity == "MEDIUM":
-                    medium_count += 1
-                elif severity == "LOW":
-                    low_count += 1
-                else:
-                    other_count += 1
-
-                # ---- Framework enrichment (unified pipeline) ----
-                cwe_ids = cve.get("cwe_ids", [])
-                self.status_signal.emit(
-                    f"Scanning: {idx} of {total} — {label} — Enriching: CVE Frameworks..."
-                )
-                fw = enrich_cve_frameworks(cwe_ids, enrichment_dbs)
-
-                attack_str = "; ".join(
-                    f"{t['technique_id']} ({t['technique_name']})" for t in fw["attack_techs"]
-                )
-                d3fend_str = "; ".join(fw["d3fend"])
-                capec_str = "; ".join(fw["capec_ids"])
-                nist_str = "; ".join(fw["nist_controls"])
-
-                all_rows.append({
-                    "Software Name": name,
-                    "Software Version": version,
-                    "CVE ID": cid,
-                    "Description": cve.get("description", ""),
-                    "CVE Date": cve.get("published", ""),
-                    "CVSS Version": cve.get("cvss_version", ""),
-                    "CVSS Base Score": cve.get("cvss_base_score", ""),
-                    "CVSS Severity": cve.get("cvss_severity", ""),
-                    "CVSS Exploitability": cve.get("cvss_exploitability", ""),
-                    "CVSS Impact": cve.get("cvss_impact", ""),
-                    "Known Exploited Vulnerability": cve.get("kev_known_exploited", "No"),
-                    "KEV Date Added": cve.get("kev_date_added", ""),
-                    "EPSS Score": epss.get("epss_score", ""),
-                    "EPSS Percentile": epss.get("epss_percentile", ""),
-                    "Public Exploit": "Yes" if has_exploit else "No",
-                    "Exploit Sources": "; ".join(exploit_sources),
-                    "Version Confirmed": (
-                        "Yes" if affected is True
-                        else "No" if affected is False
-                        else "Unverified"
-                    ),
-                    "Risk Score": risk_score,
-                    "Risk Level": risk_label,
-                    "CWE": "; ".join(fw["cwe_expanded"]),
-                    "CAPEC": capec_str,
-                    "ATT&CK Techniques": attack_str,
-                    "D3FEND Countermeasures": d3fend_str,
-                    "NIST 800-53 Controls": nist_str,
-                    "NVD URL": nvd_url,
-                })
-
-                risk_entries.append((risk_score, risk_label, cid))
-
-                # Track CVEs with public exploits
-                if has_exploit:
-                    exploit_cves.append((cid, severity, "; ".join(exploit_sources)))
-
-                # ----- version‑aware logging -----
-                if severity in ("CRITICAL", "HIGH"):
-                    if affected is True:
-                        (c_cves_confirmed if severity == "CRITICAL" else h_cves_confirmed).append(cid)
-                    elif affected is None:
-                        (c_cves_unverified if severity == "CRITICAL" else h_cves_unverified).append(cid)
-                elif severity == "MEDIUM" and self.show_medium:
-                    if affected is True:
-                        m_cves_confirmed.append(cid)
-                    elif affected is None:
-                        m_cves_unverified.append(cid)
-                elif severity == "LOW" and self.show_low:
-                    if affected is True:
-                        l_cves_confirmed.append(cid)
-                    elif affected is None:
-                        l_cves_unverified.append(cid)
-
-            # ----- Summary log lines -----
-            def _log_cve_list(cve_list: List[str], level: str, tag: str = ""):
-                suffix = f"  {tag}" if tag else ""
-                for cid in cve_list:
-                    self.log_signal.emit(
-                        f"•   \t{cid}: https://nvd.nist.gov/vuln/detail/{cid}{suffix}",
-                        level,
-                    )
-
-            # 1) Top risk scores
-            risk_entries.sort(key=lambda x: x[0], reverse=True)
-            top = risk_entries[:5]
-            if top and top[0][0] >= 40:
-                self.log_signal.emit("  ── Top risk CVEs (by weighted score) ──", "dim")
-                for score, rlabel, cid in top:
-                    color_level = {
-                        "CRITICAL": "error", "HIGH": "warn", "MEDIUM": "info",
-                    }.get(rlabel, "dim")
-                    self.log_signal.emit(
-                        f"    {score:5.1f}  [{rlabel}]  {cid}", color_level,
-                    )
-
-            # 2) Public exploits
-            if exploit_cves:
-                self.log_signal.emit(
-                    f"  🔓 {_plural(len(exploit_cves), 'CVE')} with public exploits available",
-                    "error",
-                )
-                for ecid, eseverity, esources in exploit_cves:
-                    self.log_signal.emit(
-                        f"•   \t{ecid}  [{eseverity}] - ({esources})",
-                        "error",
-                    )
-
-            # 3) Critical / High severity breakdown
-            for sev_label, sev_count, confirmed_list, unverified_list, level in [
-                ("CRITICAL", critical_count, c_cves_confirmed, c_cves_unverified, "error"),
-                ("HIGH",     high_count,     h_cves_confirmed, h_cves_unverified, "warn"),
-            ]:
-                if not sev_count:
+            for future in as_completed(futures_map):
+                if self.isInterruptionRequested():
+                    break
+                idx, label = futures_map[future]
+                try:
+                    rows, logs = future.result()
+                except Exception as exc:
+                    self._emit_log(f"❌ [{label}] skipped — {exc}", "error")
+                    completed += 1
+                    self.progress_signal.emit(completed, total)
+                    self.status_signal.emit(f"Error on {label} — continuing…")
                     continue
-                confirmed = len(confirmed_list)
-                unverified = len(unverified_list)
-                filtered = sev_count - confirmed - unverified
-                parts = []
-                if confirmed:
-                    parts.append(f"{confirmed} confirmed")
-                if unverified:
-                    parts.append(f"{unverified} unverified")
-                if filtered:
-                    parts.append(f"{filtered} not applicable to v{version}")
-                detail = f" ({', '.join(parts)})" if parts else ""
-                self.log_signal.emit(
-                    f"  ⚠ {_plural(sev_count, f'{sev_label} CVE')}{detail}",
-                    level,
-                )
-                _log_cve_list(confirmed_list, level)
-                _log_cve_list(unverified_list, level, tag="[unverified]")
-
-            # 4) Medium / Low / Unranked (gated by user preference)
-            if medium_count and self.show_medium:
-                confirmed_m = len(m_cves_confirmed)
-                unverified_m = len(m_cves_unverified)
-                filtered_m = medium_count - confirmed_m - unverified_m
-                parts_m = []
-                if confirmed_m:
-                    parts_m.append(f"{confirmed_m} confirmed")
-                if unverified_m:
-                    parts_m.append(f"{unverified_m} unverified")
-                if filtered_m:
-                    parts_m.append(f"{filtered_m} not applicable to v{version}")
-                detail_m = f" ({', '.join(parts_m)})" if parts_m else ""
-                self.log_signal.emit(f" [!] {_plural(medium_count, 'MEDIUM CVE')}{detail_m}", "info")
-                _log_cve_list(m_cves_confirmed, "info")
-                _log_cve_list(m_cves_unverified, "info", tag="[unverified]")
-            elif medium_count:
-                self.log_signal.emit(f" [!] {_plural(medium_count, 'MEDIUM CVE')} (hidden — enable in log filters)", "dim")
-
-            if low_count and self.show_low:
-                confirmed_l = len(l_cves_confirmed)
-                unverified_l = len(l_cves_unverified)
-                filtered_l = low_count - confirmed_l - unverified_l
-                parts_l = []
-                if confirmed_l:
-                    parts_l.append(f"{confirmed_l} confirmed")
-                if unverified_l:
-                    parts_l.append(f"{unverified_l} unverified")
-                if filtered_l:
-                    parts_l.append(f"{filtered_l} not applicable to v{version}")
-                detail_l = f" ({', '.join(parts_l)})" if parts_l else ""
-                self.log_signal.emit(f" [i] {_plural(low_count, 'LOW CVE')}{detail_l}", "info")
-                _log_cve_list(l_cves_confirmed, "info")
-                _log_cve_list(l_cves_unverified, "info", tag="[unverified]")
-            elif low_count:
-                self.log_signal.emit(f" [i] {_plural(low_count, 'LOW CVE')} (hidden — enable in log filters)", "dim")
-
-            if other_count:
-                self.log_signal.emit(f" [i] {_plural(other_count, 'UNRANKED CVE')}", "dim")
-
-            # Respect NVD rate limits
-            delay = 0.6 if self.api_key else RATE_LIMIT_DELAY
-            self.log_signal.emit(f"Rate‑limit pause ({delay}s) …", "dim")
-            time.sleep(delay)
-            self.progress_signal.emit(idx, total)  # mark this item complete
-
-        # Final progress — ensure bar shows 100%
-        self.progress_signal.emit(total, total)
-
-        # -----------------------------------------------------------------
-        # Write CSV — sorted by Risk Score descending
-        # -----------------------------------------------------------------
-        all_rows.sort(key=lambda r: r.get("Risk Score", 0), reverse=True)
-
-        fieldnames = [
-            "Software Name",
-            "Software Version",
-            "CVE ID",
-            "Description",
-            "Risk Score",
-            "Risk Level",
-            "CVE Date",
-            "CVSS Version",
-            "CVSS Base Score",
-            "CVSS Severity",
-            "CVSS Exploitability",
-            "CVSS Impact",
-            "Known Exploited Vulnerability",
-            "KEV Date Added",
-            "EPSS Score",
-            "EPSS Percentile",
-            "Public Exploit",
-            "Exploit Sources",
-            "Version Confirmed",
-            "CWE",
-            "CAPEC",
-            "ATT&CK Techniques",
-            "D3FEND Countermeasures",
-            "NIST 800-53 Controls",
-            "NVD URL",
-        ]
-        self.status_signal.emit("Writing CSV…")
-        try:
-            with open(self.output_path, "w", newline="", encoding="utf-8") as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(all_rows)
-            self.log_signal.emit(
-                f"✅ Done — {len(all_rows)} CVEs written to: {self.output_path}",
-                "ok",
-            )
-            if self.executive_report_path:
-                self.status_signal.emit("Writing Markdown Reports…")
-                exec_report_md = build_executive_report_markdown(
-                    all_rows,
-                    report_title="Draugr Threat Intelligence Executive Report",
-                )
-                with open(self.executive_report_path, "w", encoding="utf-8") as htmlfile:
-                    htmlfile.write(exec_report_md)
                 
-                comp_report_md = build_comprehensive_report_markdown(
-                    all_rows,
-                    report_title="Draugr Threat Intelligence Comprehensive Report",
-                )
-                with open(self.comp_report_path, "w", encoding="utf-8") as htmlfile:
-                    htmlfile.write(comp_report_md)
-                self.log_signal.emit(
-                    f"✅ Executive Report written to: {self.executive_report_path}\n✅ Comprehensive Report written to: {self.comp_report_path}",
-                    "ok",
-                )
+                finally:
+                    # ------------------------------------------------------------------
+                    # Write scan log and error log
+                    # ------------------------------------------------------------------
+                    header = (
+                        f"Draugr Scan Log — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"{'=' * 60}\n"
+                    )
+                    try:
+                        with open(self.scan_log_path, "w", encoding="utf-8") as f:
+                            f.write(header + "\n".join(self._scan_log_lines))
+                        self.log_signal.emit(f"📄 Scan log saved to: {self.scan_log_path}", "dim")
+                    except Exception as exc:
+                        self.log_signal.emit(f"⚠ Could not write scan log: {exc}", "warn")
 
-            if self.executive_report_path:
-                self.status_signal.emit(
-                    f"Complete — {len(all_rows)} CVEs across {total} products → "
-                    f"{os.path.basename(self.output_path)} + {os.path.basename(self.executive_report_path)} + {os.path.basename(self.comp_report_path)}"
+                    if self._error_log_lines:
+                        try:
+                            with open(self.error_log_path, "w", encoding="utf-8") as f:
+                                f.write(header + "\n".join(self._error_log_lines))
+                            self.log_signal.emit(f"⚠ Error log saved to: {self.error_log_path}", "warn")
+                        except Exception as exc:
+                            self.log_signal.emit(f"⚠ Could not write error log: {exc}", "warn")
 
-                )
-            else:
-                self.status_signal.emit(
-                    f"Complete — {len(all_rows)} CVEs across {total} products → {os.path.basename(self.output_path)}"
-                )
-        except Exception as exc:  # pragma: no cover
-            self.log_signal.emit(f"❌ Failed to write CSV: {exc}", "error")
-            self.status_signal.emit(f"Error — Failed to write CSV: {exc}")
-        finally:
-            self.finished_signal.emit()
+                    self.finished_signal.emit()
+                all_rows.extend(rows)
+                for msg, level in logs:
+                    self._emit_log(msg, level)
+                completed += 1
+                self.progress_signal.emit(completed, total)
+                self.status_signal.emit(f"Completed {completed} of {total} — {label}")
+            
 
 
 # ----------------------------------------------------------------------
@@ -2771,7 +2965,7 @@ class ScalingLogoLabel(QLabel):
 class CVEScannerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Draugr — Threat Intelligence System")
+        self.setWindowTitle("Draugr — Threat Intelligence Platform")
         self.setMinimumSize(860, 760)
         self.resize(920, 820)
         self.scanning = False
@@ -3225,9 +3419,8 @@ class CVEScannerWindow(QMainWindow):
         api_key = self.api_input.text().strip()
         resources_dir = self.resources_row.text()
 
-        mode_text = "with Executive Report" 
-        self._append_log(f"Starting scan of {len(software)} entries ({mode_text}) …", "info")
-        self._update_status(f"Starting scan of {len(software)} entries ({mode_text})…")
+        self._append_log(f"Starting scan of {len(software)} entries…", "info")
+        self._update_status(f"Starting scan of {len(software)} entries…")
         self.worker = ScanWorker(
             software, kev_path, api_key, out_path, cpe_path,
             show_medium=self.chk_medium.isChecked(),
@@ -3236,7 +3429,8 @@ class CVEScannerWindow(QMainWindow):
             executive_report_path=executive_report_path,
             comp_report_path=comp_report_path,
         )
-        self.worker.log_signal.connect(self._append_log) 
+        self.worker.log_signal.connect(self._append_log)
+        self.worker.error_signal.connect(lambda msg: self._append_log(f"❌ {msg}", "error"))
         self.worker.progress_signal.connect(self._update_progress)
         self.worker.status_signal.connect(self._update_status)
         self.worker.finished_signal.connect(self._scan_finished)
@@ -3389,7 +3583,7 @@ class DraugrSplash(QSplashScreen):
         p.setFont(sub_font)
         p.setPen(QColor(163, 140, 140, 180))
         p.drawText(0, int(H * 0.91), W, 30,
-                   Qt.AlignmentFlag.AlignHCenter, "THREAT INTELLIGENCE SYSTEM")
+                   Qt.AlignmentFlag.AlignHCenter, "THREAT INTELLIGENCE PLATFORM")
 
         ver_font = QFont("Courier New", 9)
         p.setFont(ver_font)
