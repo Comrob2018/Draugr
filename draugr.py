@@ -43,11 +43,13 @@ import os
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 from packaging.version import Version, InvalidVersion
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus
+from resources.mitre_attack_scenarios import TECHNIQUE_SCENARIOS as SCENARIOS, get_tactics, get_impact
+
 
 # ----------------------------------------------------------------------
 # Third‑party imports
@@ -72,12 +74,11 @@ try:
         QLabel,
         QLineEdit,
         QMainWindow,
-        QMenu,
-        QMenuBar,
         QMessageBox,
         QProgressBar,
         QPushButton,
         QSplashScreen,
+        QSizePolicy,
         QTextEdit,
         QVBoxLayout,
         QWidget,
@@ -1322,10 +1323,11 @@ class FileRow(QWidget):
         }}
     """
 
-    def __init__(self, label_text, placeholder="", is_save=False, file_filter="", parent=None):
+    def __init__(self, label_text, placeholder="", is_file=False, file_filter="",pick_folder=False, parent=None):
         super().__init__(parent)
-        self.is_save = is_save
+        self.is_save = is_file
         self.file_filter = file_filter
+        self.pick_folder = pick_folder
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1341,28 +1343,36 @@ class FileRow(QWidget):
         self.input.setPlaceholderText(placeholder)
         self.input.setStyleSheet(self.INPUT_STYLE)
         layout.addWidget(self.input, 1)
-
-        btn = QPushButton("Browse")
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setFixedWidth(80)
-        btn.setStyleSheet(self.BTN_STYLE)
-        btn.clicked.connect(self._browse)
-        layout.addWidget(btn)
+        if self.pick_folder or self.is_save:
+            btn = QPushButton("Browse")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedWidth(80)
+            btn.setStyleSheet(self.BTN_STYLE)
+            btn.clicked.connect(self._browse)
+            layout.addWidget(btn)
 
     def _browse(self):
-        if self.is_save:
-            path, _ = QFileDialog.getSaveFileName(self, "Save As", "", self.file_filter)
-        else:
-            path, _ = QFileDialog.getOpenFileName(self, "Open File", "", self.file_filter)
-        if path:
+        if self.pick_folder:
+            path= QFileDialog.getExistingDirectory(
+                self,
+                "Select Folder",
+                self.input.text() or os.getcwd(),
+                QFileDialog.Option.ShowDirsOnly
+            )
             self.input.setText(path)
+        else:
+            if self.is_save:
+                path, _ = QFileDialog.getOpenFileName(self, "Select File", "", self.file_filter)
+            else:
+                path, _ = QFileDialog.getOpenFileName(self, "Open Software List", "", self.file_filter)
+            if path:
+                self.input.setText(path)
 
     def text(self) -> str:
         return self.input.text().strip()
 
     def setText(self, text: str):
         self.input.setText(text)
-
 
 # ----------------------------------------------------------------------
 # Helper – pluralise with count
@@ -1445,146 +1455,51 @@ def _scenario_template(attack_id: str, attack_name: str, software_name: str, cve
     )
 
 
-def _format_threat_map(rows: List[Dict[str, Any]], limit: int = 0) -> str:
-    """
-    Two-tier threat map for one software item.
-
-    Tier 1 — CVE roster (one line per CVE, sorted by risk score descending):
-      Shows severity, risk score/level, version status, KEV flag, public exploit
-      flag, EPSS score, and inline CWEs so a reader can triage at a glance.
-      `limit` caps the number of CVEs shown (0 = unlimited).
-
-    Tier 2 — ATT&CK technique summary (aggregated across all CVEs in `rows`,
-      regardless of `limit`):
-      Deduplicates every mapped technique, counts how many CVEs reference it,
-      and lists its D3FEND countermeasures and NIST 800-53 controls once.
-      Sorted by CVE-count descending so the most-prevalent attack paths appear
-      first.  CAPEC IDs are shown where available.
-    """
-
-    # ------------------------------------------------------------------ #
-    # Tier 1 — per-CVE roster                                             #
-    # ------------------------------------------------------------------ #
-    tier1: List[str] = []
-    subset = rows[:limit] if limit else rows
-
-    tier1.append("### CVE Roster")
-    tier1.append(
-        "| CVE ID | Sev | Risk | Ver | KEV | Exploit | EPSS | CWEs |"
-    )
-    tier1.append("|--------|-----|------|-----|-----|---------|------|------|")
-
-    for row in subset:
-        cve_id   = row.get("CVE ID", "—")
-        sev      = str(row.get("CVSS Severity", "") or "").upper() or "—"
-        risk     = f"{row.get('Risk Score', '—')} ({row.get('Risk Level', '—')})"
-        ver      = str(row.get("Version Confirmed", "") or "Unverified")
-        kev      = "✔" if str(row.get("Known Exploited Vulnerability", "")).upper() == "YES" else "—"
-        exploit  = "✔" if str(row.get("Public Exploit", "")).upper() == "YES" else "—"
-        epss_raw = row.get("EPSS Score", "")
-        try:
-            epss = f"{float(epss_raw):.3f}"
-        except (TypeError, ValueError):
-            epss = str(epss_raw) if epss_raw else "—"
-        cwes     = _split_multi(row.get("CWE", ""))
-        cwe_str  = ", ".join(cwes[:4]) + (" …" if len(cwes) > 4 else "") if cwes else "—"
-
-        tier1.append(
-            f"| {cve_id} | {sev} | {risk} | {ver} | {kev} | {exploit} | {epss} | {cwe_str} |"
-        )
-
-    # ------------------------------------------------------------------ #
-    # Tier 2 — aggregated ATT&CK technique summary (always uses all rows) #
-    # ------------------------------------------------------------------ #
-
-    # technique_id -> { name, cve_set, d3fend_set, nist_set, capec_set }
-    tech_index: Dict[str, Dict[str, Any]] = {}
-
-    for row in rows:
-        attacks = _split_multi(row.get("ATT&CK Techniques", ""))
-        d3f     = _split_multi(row.get("D3FEND Countermeasures", ""))
-        nist    = _split_multi(row.get("NIST 800-53 Controls", ""))
-        capec   = _split_multi(row.get("CAPEC", ""))
-        cve_id  = row.get("CVE ID", "")
-
-        for entry in attacks:
-            m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", entry)
-            if m:
-                tid, tname = m.group(1), m.group(2)
-            else:
-                tid, tname = entry, entry
-
-            if tid not in tech_index:
-                tech_index[tid] = {
-                    "name":      tname,
-                    "cve_set":   set(),
-                    "d3fend":    [],
-                    "nist":      [],
-                    "capec":     [],
-                    "d3fend_seen": set(),
-                    "nist_seen":   set(),
-                    "capec_seen":  set(),
-                }
-            rec = tech_index[tid]
-            if cve_id:
-                rec["cve_set"].add(cve_id)
-            for d in d3f:
-                if d not in rec["d3fend_seen"]:
-                    rec["d3fend_seen"].add(d)
-                    rec["d3fend"].append(d)
-            for n in nist:
-                if n not in rec["nist_seen"]:
-                    rec["nist_seen"].add(n)
-                    rec["nist"].append(n)
-            for c in capec:
-                if c not in rec["capec_seen"]:
-                    rec["capec_seen"].add(c)
-                    rec["capec"].append(c)
-
-    tier2: List[str] = []
-    tier2.append("### ATT&CK Technique Summary")
-
-    if not tech_index:
-        tier2.append("- No ATT&CK techniques mapped across these CVEs.")
-    else:
-        # Sort by CVE count descending, then technique ID ascending
-        sorted_techs = sorted(
-            tech_index.items(),
-            key=lambda kv: (-len(kv[1]["cve_set"]), kv[0])
-        )
-        for tid, rec in sorted_techs:
-            count     = len(rec["cve_set"])
-            cve_label = f"{count} CVE{'s' if count != 1 else ''}"
-            capec_str = ", ".join(rec["capec"][:5]) if rec["capec"] else "—"
-            tier2.append(f"- **{tid}** — {rec['name']}  [{cve_label}]")
-            tier2.append(f"  - CAPEC: {capec_str}")
-            if rec["d3fend"]:
-                for d in rec["d3fend"][:5]:
-                    tier2.append(f"  - D3FEND: {d}")
-                if len(rec["d3fend"]) > 5:
-                    tier2.append(f"  - D3FEND: … +{len(rec['d3fend']) - 5} more")
-            else:
-                tier2.append("  - D3FEND: None mapped")
-            if rec["nist"]:
-                for n in rec["nist"][:5]:
-                    tier2.append(f"  - NIST: {n}")
-                if len(rec["nist"]) > 5:
-                    tier2.append(f"  - NIST: … +{len(rec['nist']) - 5} more")
-            else:
-                tier2.append("  - NIST: None mapped")
-            tier2.append("")
-
-    if not tier1 and not tier2:
-        return "- No mapped threats identified."
-
-    return "\n".join(tier1) + "\n\n" + "\n".join(tier2)
-
-
-def _format_top_cves(rows: List[Dict[str, Any]], limit: int = 0) -> str:
-    """Format CVE detail blocks. limit=0 means unlimited."""
+def _format_threat_map(rows: List[Dict[str, Any]]) -> str:
+    """Build an indented text threat map for one software item."""
     lines: List[str] = []
-    subset = rows[:limit] if limit else rows
-    for row in subset:
+    for row in rows[:10]:
+        cve_id = row.get("CVE ID", "")
+        risk = row.get("Risk Score", "")
+        risk_level = row.get("Risk Level", "")
+        cwes = _split_multi(row.get("CWE", ""))
+        attacks = _split_multi(row.get("ATT&CK Techniques", ""))
+        d3f = _split_multi(row.get("D3FEND Countermeasures", ""))
+        nist = _split_multi(row.get("NIST 800-53 Controls", ""))
+
+        lines.append(f"- {cve_id}  [Risk: {risk} | {risk_level}]")
+
+        if cwes:
+            for cwe in cwes[:5]:
+                lines.append(f"  - CWE: {cwe}")
+        else:
+            lines.append("  - CWE: None mapped")
+
+        if attacks:
+            for attack in attacks[:5]:
+                lines.append(f"    - ATT&CK: {attack}")
+        else:
+            lines.append("    - ATT&CK: None mapped")
+
+        if d3f:
+            for d in d3f[:5]:
+                lines.append(f"      - D3FEND: {d}")
+            else:
+                lines.append("    - D3FEND: None mapped")
+
+        if nist:
+            for n in nist[:5]:
+                lines.append(f"      - NIST: {n}")
+            else:
+                lines.append("    - NIST: None mapped")
+
+    return "\n".join(lines) if lines else "- No mapped threats identified."
+
+
+def _format_top_cves(rows: List[Dict[str, Any]], limit) -> str:
+    limit = None if limit == 0 else limit
+    lines: List[str] = []
+    for row in rows[:limit]:
         cve_id = row.get("CVE ID", "")
         desc = str(row.get("Description", "") or "").strip()
         if not desc:
@@ -1607,8 +1522,16 @@ def _format_top_cves(rows: List[Dict[str, Any]], limit: int = 0) -> str:
         lines.append("")
     return "\n".join(lines).strip()
 
+def _to_list(value):
+    """Return a list of non‑empty items from a comma‑separated string.
+    Values that are '' , None or '0' are ignored."""
+    if not value or str(value).strip() == "0":
+        return []
+    # split on commas (the original data stores several items separated by commas)
+    return [item.strip() for item in str(value).split(",") if item.strip()]
 
 def _format_scenarios(rows: List[Dict[str, Any]], software_name: str, limit) -> str:
+    limit = None if limit == 0 else limit
     lines: List[str] = []
     count = 0
 
@@ -1623,22 +1546,59 @@ def _format_scenarios(rows: List[Dict[str, Any]], software_name: str, limit) -> 
             attack_id, attack_name = match.group(1), match.group(2)
         else:
             attack_id, attack_name = first_attack, first_attack
+        
+        count += 1      
+        cve_id = row.get("CVE ID", "")
+                # --- try to get a rich description from the scenario library ------------------------
+        scenario_info = SCENARIOS.get(attack_id)
+        if scenario_info and scenario_info.get("description"):
+            # The library already contains placeholders for {cve_id} and {software_name}
+            narrative = scenario_info["description"].format(
+                cve_id=cve_id,
+                software_name=software_name,
+            )
+        else:
+            # Fallback to the original generic template (the behaviour that existed before)
+            narrative = _scenario_template(
+                attack_id, attack_name, software_name, cve_id
+            )
+        tactics_list = get_tactics(attack_id)
+        impact_text = get_impact(attack_id)
+        d3fend_vals = _to_list(row.get("D3FEND Countermeasures", ""))
+        nist_vals = _to_list(row.get("NIST 800-53 Controls", ""))
 
-        count += 1
-        lines.append(f"### Scenario {count}: {attack_name}")
+        lines.append(f"## Scenario {count}: {attack_name}")
         lines.append(f"- CVE: {row.get('CVE ID', '')}")
         lines.append(f"- ATT&CK Technique: {attack_id} ({attack_name})")
-        lines.append(f"- Narrative: {_scenario_template(attack_id, attack_name, software_name, row.get('CVE ID', ''))}")
-        lines.append(f"- Primary Mitigations:  {row.get('D3FEND Countermeasures', '') or row.get('NIST 800-53 Controls', '') or 'No mapped mitigations'}")
+        lines.append(f"- Narrative: {narrative}")
+        if tactics_list:
+            lines.append(f"- Tactics: {', '.join(tactics_list)}")
+        if impact_text:
+            lines.append(f"- Impact: {impact_text}")
+        if len(d3fend_vals) > 0 or len(nist_vals) > 0:
+            lines.append("### Primary Mitigations: ")
+            if len(d3fend_vals) > 0:
+                lines.append("# D3FEND Countermeasures")
+                for mit in d3fend_vals:
+                    lines.append(f"-   {mit}")
+            if len(nist_vals) > 0:
+                lines.append("NIST 800-53 Controls")
+                for control in nist_vals:
+                    lines.append(control)
+        else:
+            lines.append("- Primary Mitigations: No mapped mitigations or controls")
+            
         lines.append("")
+        lines.append("="*78)
 
-        if limit and count >= limit:
+        if limit is not None and count >= limit:
             break
 
     return "\n".join(lines).strip() if lines else "No ATT&CK-linked scenarios could be generated."
 
 
 def _format_mitigations(rows: List[Dict[str, Any]], limit) -> str:
+    limit = None if limit == 0 else limit
     d3f_all: List[str] = []
     nist_all: List[str] = []
 
@@ -1655,8 +1615,8 @@ def _format_mitigations(rows: List[Dict[str, Any]], limit) -> str:
                 out.append(item)
         return out
 
-    d3f_unique = unique_keep_order(d3f_all)[:limit] if limit else unique_keep_order(d3f_all)
-    nist_unique = unique_keep_order(nist_all)[:limit] if limit else unique_keep_order(nist_all)
+    d3f_unique = unique_keep_order(d3f_all)[:limit]
+    nist_unique = unique_keep_order(nist_all)[:limit]
 
     lines = ["## Recommended Mitigations", ""]
 
@@ -1675,6 +1635,265 @@ def _format_mitigations(rows: List[Dict[str, Any]], limit) -> str:
 
     return "\n".join(lines)
 
+def _top_techniques(
+    rows: List[Dict[str, Any]], top_n: int = 5
+) -> List[Tuple[str, int, Dict[str, Any]]]:
+    """
+    Return the *top_n* ATT&CK techniques that appear in ``rows``.
+    Each entry is (attack_id, count, meta) where *meta* contains:
+        - name   : technique name
+        - d3fend : list of D3FEND counter‑measures
+        - nist   : list of NIST‑800‑53 controls
+        - tactics: list of ATT&CK tactic names
+
+    Rows use CSV-column keys: "ATT&CK Techniques" is a semicolon-
+    separated string of "T1190 (Exploit Public-Facing Application)" entries.
+    """
+    technique_counter: Counter = Counter()
+    technique_meta: Dict[str, Dict[str, Any]] = {}
+
+    for r in rows:
+        attacks = _split_multi(r.get("ATT&CK Techniques", ""))
+        d3f     = _split_multi(r.get("D3FEND Countermeasures", ""))
+        nist    = _split_multi(r.get("NIST 800-53 Controls", ""))
+        tactics = _split_multi(r.get("ATT&CK Tactics", ""))
+
+        for entry in attacks:
+            m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", entry)
+            if m:
+                aid, aname = m.group(1), m.group(2)
+            else:
+                aid, aname = entry.strip(), entry.strip()
+
+            if not aid:
+                continue
+
+            technique_counter[aid] += 1
+            if aid not in technique_meta:
+                technique_meta[aid] = {
+                    "name": aname,
+                    "d3fend": list(d3f),
+                    "nist": list(nist),
+                    "tactics": list(tactics),
+                    "d3fend_seen": set(d3f),
+                    "nist_seen": set(nist),
+                }
+            else:
+                rec = technique_meta[aid]
+                for d in d3f:
+                    if d not in rec["d3fend_seen"]:
+                        rec["d3fend_seen"].add(d)
+                        rec["d3fend"].append(d)
+                for n in nist:
+                    if n not in rec["nist_seen"]:
+                        rec["nist_seen"].add(n)
+                        rec["nist"].append(n)
+
+    most_common = technique_counter.most_common(top_n)
+    return [(aid, cnt, technique_meta[aid]) for aid, cnt in most_common]
+
+def _executive_summary(rows: List[Dict[str, Any]]) -> str:
+    """
+    Build a **high‑level narrative** that lists:
+      • total CVEs, severity distribution, KEV and exploit counts,
+      • the top ATT&CK techniques with tactic context,
+      • the defend‑mitigations (D3FEND + NIST) that cover the majority of findings.
+    """
+    # ----- severity totals -------------------------------------------------
+    sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "OTHER": 0}
+    kev_total = 0
+    exploit_total = 0
+    confirmed_total = 0
+    max_risk_score = 0.0
+    software_set: set = set()
+
+    for r in rows:
+        sev = str(r.get("CVSS Severity", "") or r.get("Risk Level", "") or "").upper()
+        if sev in sev_counts:
+            sev_counts[sev] += 1
+        else:
+            sev_counts["OTHER"] += 1
+
+        if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES":
+            kev_total += 1
+        if str(r.get("Public Exploit", "")).upper() == "YES":
+            exploit_total += 1
+        if str(r.get("Version Confirmed", "")).upper() == "YES":
+            confirmed_total += 1
+
+        try:
+            rs = float(r.get("Risk Score", 0))
+            if rs > max_risk_score:
+                max_risk_score = rs
+        except (TypeError, ValueError):
+            pass
+
+        sw = str(r.get("Software Name", "")).strip()
+        if sw:
+            software_set.add(sw)
+
+    total_cves = sum(sev_counts.values())
+
+    # ----- top techniques --------------------------------------------------
+    top = _top_techniques(rows, top_n=5)
+
+    # ----- build markdown ---------------------------------------------------
+    md = ["## Executive Summary", ""]
+    md.append(
+        f"The scan identified **{total_cves}** CVEs across "
+        f"**{len(software_set)}** software {'items' if len(software_set) != 1 else 'item'}. "
+        f"Severity breakdown – Critical: **{sev_counts['CRITICAL']}**, "
+        f"High: **{sev_counts['HIGH']}**, Medium: **{sev_counts['MEDIUM']}**, "
+        f"Low: **{sev_counts['LOW']}**."
+    )
+    md.append("")
+
+    # Key risk indicators
+    risk_items: List[str] = []
+    if kev_total:
+        risk_items.append(f"**{kev_total}** {'CVEs are' if kev_total != 1 else 'CVE is'} listed in the CISA Known Exploited Vulnerabilities catalog")
+    if exploit_total:
+        risk_items.append(f"**{exploit_total}** {'have' if exploit_total != 1 else 'has'} publicly available exploit code")
+    if confirmed_total:
+        risk_items.append(f"**{confirmed_total}** {'are' if confirmed_total != 1 else 'is'} version‑confirmed against the scanned software")
+    if max_risk_score:
+        risk_items.append(f"Highest weighted risk score: **{max_risk_score:.1f}**/100")
+
+    if risk_items:
+        md.append("Key risk indicators:")
+        for item in risk_items:
+            md.append(f"- {item}")
+        md.append("")
+
+    if top:
+        md.append("The most prevalent ATT&CK techniques are:")
+        for aid, cnt, meta in top:
+            tactics_str = ", ".join(meta.get("tactics", [])) or "—"
+            mitig = ", ".join(meta["d3fend"][:3]) or "none"
+            if len(meta["d3fend"]) > 3:
+                mitig += f" (+{len(meta['d3fend']) - 3} more)"
+            nist  = ", ".join(meta["nist"][:3])   or "none"
+            if len(meta["nist"]) > 3:
+                nist += f" (+{len(meta['nist']) - 3} more)"
+            md.append(
+                f"- **{meta['name']}** ({aid}) – observed in **{cnt}** CVEs. "
+                f"Tactics: {tactics_str}. "
+                f"D3FEND mitigations: {mitig}. NIST controls: {nist}."
+            )
+    else:
+        md.append("- No ATT&CK techniques were mapped for the identified CVEs.")
+
+    md.append("")
+    md.append(
+        "Focusing remediation on the mitigations listed above will address "
+        "the majority of the attack surface revealed by this assessment."
+    )
+    md.append("")
+    return "\n".join(md)
+
+def _conclusion_section(rows: List[Dict[str, Any]]) -> str:
+    """
+    Provide a data-driven step-by-step implementation guide for the
+    mitigations surfaced by the scan.
+    """
+    top = _top_techniques(rows, top_n=5)
+
+    # Gather aggregate stats for the conclusion
+    total_cves = len(rows)
+    kev_total = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
+    exploit_total = sum(1 for r in rows if str(r.get("Public Exploit", "")).upper() == "YES")
+    confirmed_total = sum(1 for r in rows if str(r.get("Version Confirmed", "")).upper() == "YES")
+    critical_count = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "CRITICAL")
+    high_count = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "HIGH")
+
+    # Collect all unique D3FEND and NIST controls across all rows
+    all_d3fend: List[str] = []
+    all_nist: List[str] = []
+    d3_seen: set = set()
+    nist_seen: set = set()
+    for r in rows:
+        for d in _split_multi(r.get("D3FEND Countermeasures", "")):
+            if d not in d3_seen:
+                d3_seen.add(d)
+                all_d3fend.append(d)
+        for n in _split_multi(r.get("NIST 800-53 Controls", "")):
+            if n not in nist_seen:
+                nist_seen.add(n)
+                all_nist.append(n)
+
+    md = ["## Conclusion & Implementation Guidance", ""]
+
+    # Situation overview
+    md.append(
+        f"This assessment identified **{total_cves}** CVEs, of which "
+        f"**{critical_count}** are Critical and **{high_count}** are High severity."
+    )
+    if kev_total or exploit_total:
+        parts = []
+        if kev_total:
+            parts.append(f"**{kev_total}** appear in the CISA KEV catalog")
+        if exploit_total:
+            parts.append(f"**{exploit_total}** have public exploit code available")
+        md.append(f"{'; '.join(parts)}.")
+    if confirmed_total:
+        md.append(
+            f"Of these, **{confirmed_total}** are version-confirmed as affecting "
+            f"the scanned software."
+        )
+    md.append("")
+
+    # Prioritised remediation steps from top techniques
+    if top:
+        md.append(
+            "To address the highest-impact attack vectors, apply the following "
+            "actions in priority order:"
+        )
+        md.append("")
+
+        step = 1
+        for aid, cnt, meta in top:
+            tname = meta.get("name", aid)
+            tactics = ", ".join(meta.get("tactics", [])) or "Unknown"
+            md.append(
+                f"**Priority {step}: {tname} ({aid})** -- "
+                f"affects {cnt} CVE{'s' if cnt != 1 else ''} "
+                f"(Tactics: {tactics})"
+            )
+            if meta["d3fend"]:
+                for d in meta["d3fend"][:3]:
+                    md.append(f"- Deploy D3FEND counter-measure: **{d}**")
+                if len(meta["d3fend"]) > 3:
+                    md.append(f"- ... and {len(meta['d3fend']) - 3} additional D3FEND measures")
+            if meta["nist"]:
+                for n in meta["nist"][:3]:
+                    md.append(f"- Enact NIST 800-53 control: **{n}**")
+                if len(meta["nist"]) > 3:
+                    md.append(f"- ... and {len(meta['nist']) - 3} additional NIST controls")
+            if not meta["d3fend"] and not meta["nist"]:
+                md.append("- No specific D3FEND or NIST mappings available for this technique")
+            md.append("")
+            step += 1
+    else:
+        md.append("No ATT&CK techniques were mapped; remediation should focus on patching the identified CVEs directly.")
+        md.append("")
+
+    # Summary totals
+    md.append(
+        f"Across all findings, **{len(all_d3fend)}** unique D3FEND counter-measures "
+        f"and **{len(all_nist)}** unique NIST 800-53 controls were identified."
+    )
+    md.append("")
+
+    md.append(
+        "Implementation roadmap:\n"
+        "1. **Prioritise** -- Address KEV-listed and publicly-exploitable CVEs first.\n"
+        "2. **Patch** -- Apply vendor patches for all version-confirmed CVEs.\n"
+        "3. **Harden** -- Deploy the D3FEND counter-measures and NIST controls listed above.\n"
+        "4. **Validate** -- Confirm effectiveness with periodic red-team or ATT&CK-mapping tests.\n"
+        "5. **Monitor** -- Continuously scan for new CVEs and update the mitigation set."
+    )
+    md.append("")
+    return "\n".join(md)
 
 # ======================================================================
 #  HTML report helpers
@@ -1687,7 +1906,7 @@ def _load_logo_b64(script_dir: Optional[str] = None) -> str:
     The result can be dropped straight into an <img src="..."> attribute.
     """
     search_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-    logo_path = os.path.join(search_dir, "draugr_logo_small.png")
+    logo_path = os.path.join(search_dir, "draugr_logo3.png")
     if not os.path.isfile(logo_path):
         return ""
     try:
@@ -1818,34 +2037,38 @@ def _markdown_body_to_html(md: str) -> str:
 
 _REPORT_CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* --------------------------------------------------------------
+   Global page colours
+   -------------------------------------------------------------- */
 body {
-    background: #0d0505;
-    color: #d4c8c8;
+    background: #ffffff;          /* white page background */
+    color: #001f3f;               /* navy (dark blue) text */
     font-family: 'Courier New', Courier, monospace;
     font-size: 13px;
     line-height: 1.6;
-    padding: 0 0 60px 0;
+    padding: 0 40px 60px 40px;
 }
-/* ── Report header ─────────────────────────────── */
+
+/* --------------------------------------------------------------
+   Header
+   -------------------------------------------------------------- */
 .report-header {
     display: flex;
     align-items: center;
     gap: 18px;
-    background: linear-gradient(135deg, #1f0d0d 0%, #170909 100%);
-    border-bottom: 2px solid #cb322c;
+    background: #ffffff;          /* keep header white */
+    border-bottom: 2px solid #001f3f;
     padding: 22px 36px;
 }
-.report-header img {
-    height: 52px;
-    width: auto;
-    flex-shrink: 0;
-}
+.report-header img { height: 96px; width: 96px; }
 .report-header-text { display: flex; flex-direction: column; gap: 4px; }
+
 .report-header h1 {
     font-size: 22px;
     font-weight: bold;
     letter-spacing: 4px;
-    color: #cb322c;
+    color: #001f3f;
     text-transform: uppercase;
     border: none;
     padding: 0;
@@ -1854,44 +2077,114 @@ body {
 .report-header .subtitle {
     font-size: 11px;
     letter-spacing: 2px;
-    color: #7a5a5a;
+    color: #555555;
     text-transform: uppercase;
 }
-/* ── Body content ──────────────────────────────── */
-.content { padding: 32px 36px; }
-h1 { font-size: 17px; color: #cb322c; border-bottom: 1px solid #3a1a1a;
-     padding-bottom: 6px; margin: 32px 0 12px; letter-spacing: 2px; text-transform: uppercase; }
-h2 { font-size: 14px; color: #a07070; border-left: 3px solid #cb322c;
-     padding-left: 10px; margin: 24px 0 10px; letter-spacing: 1px; }
-h3 { font-size: 13px; color: #c09080; margin: 16px 0 6px; }
-p  { margin: 6px 0; color: #b0a0a0; }
-hr { border: none; border-top: 1px solid #2a1212; margin: 28px 0; }
+
+/* --------------------------------------------------------------
+   Content headings
+   -------------------------------------------------------------- */
+h1, h2, h3, p { margin: 6px 0; }
+h1 {
+    font-size: 17px;
+    color: #001f3f;
+    border-bottom: 1px solid #ccc;
+    padding-bottom: 6px;
+    margin: 32px 0 12px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+}
+h2 {
+    font-size: 14px;
+    color: #003366;
+    border-left: 3px solid #001f3f;
+    padding-left: 10px;
+    margin: 24px 0 10px;
+    letter-spacing: 1px;
+}
+h3 {
+    font-size: 13px;
+    color: #004080;
+    margin: 16px 0 6px;
+}
+p { color: #001f3f; }
+
+/* --------------------------------------------------------------
+   Lists
+   -------------------------------------------------------------- */
 ul { list-style: none; padding-left: 0; margin: 4px 0 10px; }
-li { padding: 2px 0 2px 14px; position: relative; color: #c8b8b8; }
-li::before { content: "›"; position: absolute; left: 0; color: #cb322c; }
-a  { color: #e07060; text-decoration: none; }
+li {
+    padding: 2px 0 2px 14px;
+    position: relative;
+    color: #001f3f;
+}
+li::before {
+    content: "›";
+    position: absolute;
+    left: 0;
+    color: #001f3f;
+}
+
+/* --------------------------------------------------------------
+   Links / strong
+   -------------------------------------------------------------- */
+a   { color: #004080; text-decoration: none; }
 a:hover { text-decoration: underline; }
-strong { color: #e0c8c0; }
-/* ── Tables ────────────────────────────────────── */
+strong { color: #001f3f; }
+
+/* --------------------------------------------------------------
+   Table styling – zebra striping
+   -------------------------------------------------------------- */
 table {
     width: 100%;
     border-collapse: collapse;
     margin: 10px 0 18px;
     font-size: 12px;
 }
-thead tr { background: #1f0d0d; }
-thead td {
-    color: #cb322c;
-    font-weight: bold;
-    letter-spacing: 1px;
-    padding: 7px 10px;
-    border-bottom: 1px solid #3a1a1a;
-    text-transform: uppercase;
-    font-size: 11px;
+thead tr {
+    background: #e0e0e0;          /* light‑gray header */
 }
-tbody tr { border-bottom: 1px solid #1e0e0e; }
-tbody tr:hover { background: #180a0a; }
-tbody td { padding: 6px 10px; color: #c8b8b8; vertical-align: top; }
+thead th, thead td {
+    color: #001f3f;
+    font-weight: bold;
+    padding: 6px 10px;
+    text-align: left;
+}
+tbody tr:nth-child(even) {
+    background: #ffffff;          /* white rows */
+}
+tbody tr:nth-child(odd) {
+    background: #f2f2f2;          /* light‑gray rows */
+}
+tbody td {
+    color: #001f3f;
+    padding: 6px 10px;
+    vertical-align: top;
+}
+tbody tr:hover {
+    background: #d9d9d9;          /* slightly darker on hover */
+}
+
+.executive-summary,
+.conclusion {
+    margin-top: 2rem;
+    padding: 1rem;
+    background: #f9f9f9;   /* light gray background */
+    border-left: 4px solid #001f3f;  /* navy accent */
+}
+.executive-summary h2,
+.conclusion h2 {
+    color: #001f3f;
+}
+.content {
+    max-width: 900px;      /* 800‑1000 px is a good range for a professional look */
+    margin: 0 auto;        /* centre the block horizontally */
+    padding: 0 20px;       /* optional inner padding */
+}
+/* --------------------------------------------------------------
+   Miscellaneous
+   -------------------------------------------------------------- */
+hr { border: none; border-top: 1px solid #ccc; margin: 28px 0; }
 """
 
 
@@ -1902,49 +2195,34 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     alongside the report title.
     """
     escaped_title = html.escape(title)
-    logo_tag = (
-        f'<img src="{logo_b64}" alt="Draugr logo">'
-        if logo_b64 else
-        ""
-    )
+    logo_tag = '<img src="C:\\Users\\P09816\\OneDrive - NGC\\Desktop\\Coding\\cve_scanner\\draugr_logo.png" alt="Draugr logo">'
     sub_tag = (
         f'<span class="subtitle">{html.escape(subtitle)}</span>'
         if subtitle else ""
     )
 
     body_html = _markdown_body_to_html(body_md)
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{escaped_title}</title>
-<style>
-{_REPORT_CSS}
-</style>
-</head>
-<body>
-<div class="report-header">
-  {logo_tag}
-  <div class="report-header-text">
-    <h1>{escaped_title}</h1>
-    {sub_tag}
-  </div>
-</div>
-<div class="content">
-{body_html}
-</div>
-</body>
-</html>
-"""
+     # assemble final page
+    full_html = f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>{escaped_title}</title>
+        <style>{_REPORT_CSS}</style>
+    </head>
+    <body>
+    <div class="report-header">{logo_tag}<div class="report-header-text"><h1>{escaped_title}</h1>{sub_tag}</div></div>
+    <div class="content">
+        {body_html}
+    </div>
+    </body>
+    </html>"""
+    return full_html
 
 
-def build_executive_report_markdown(all_rows: List[Dict[str, Any]], report_title: str = "Draugr Threat Intelligence Executive Report") -> str:
+def build_executive_report_markdown(all_rows: List[Dict[str, Any]], report_title: str = "Draugr Excutive Threat Intelligence Report") -> str:
     """
-    Build a concise executive report grouped by software.
-    Only includes version-confirmed CVEs. Focuses on top threats.
-    Returns a self-contained HTML document with the Draugr logo header.
+    Build a markdown executive report grouped by software.
     Expects the flattened rows created by ScanWorker.
     """
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
@@ -1952,92 +2230,12 @@ def build_executive_report_markdown(all_rows: List[Dict[str, Any]], report_title
         key = (str(row.get("Software Name", "")).strip(), str(row.get("Software Version", "")).strip())
         grouped[key].append(row)
 
-    # Body markdown (title is in the HTML header, not here)
-    lines: List[str] = []
-    lines.append("This report summarises the highest-priority, version-confirmed threats per software item. For the full findings see the Comprehensive Report.")
-    lines.append("")
-
-    for (software_name, software_version), all_sw_rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
-        all_sw_rows.sort(key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
-
-        # Executive report: version-confirmed CVEs only
-        rows = [r for r in all_sw_rows if str(r.get("Version Confirmed", "")).strip().upper() == "YES"]
-        if not rows:
-            continue
-
-        total_cves = len(rows)
-        critical = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "CRITICAL")
-        high = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "HIGH")
-        medium = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "MEDIUM")
-        low = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "LOW")
-        kev_count = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
-        exploit_count = sum(1 for r in rows if str(r.get("Public Exploit", "")).upper() == "YES")
-        overall_risk = rows[0].get("Risk Level", "INFO")
-        max_risk = rows[0].get("Risk Score", 0)
-
-        lines.append(f"# {software_name} {software_version}".strip())
-        lines.append("")
-        lines.append("## Software Summary")
-        lines.append(f"- Software: {software_name}")
-        lines.append(f"- Version: {software_version or 'Not provided'}")
-        lines.append(f"- Version-Confirmed CVEs: {total_cves}")
-        lines.append(f"- Critical: {critical} | High: {high} | Medium: {medium} | Low: {low}")
-        lines.append(f"- Known Exploited: {kev_count}")
-        lines.append(f"- Public Exploits Available: {exploit_count}")
-        lines.append(f"- Overall Risk Rating: {overall_risk} ({max_risk})")
-        lines.append(f"- Highest Risk CVE Score: {max_risk}")
-        lines.append(f"- Total KEV Hits: {kev_count}")
-        lines.append(f"- Total CVEs with Public Exploits: {exploit_count}")
-        lines.append("")
-
-        lines.append("## Threat Map")
-        lines.append(_format_threat_map(rows, limit=5))
-        lines.append("")
-
-        lines.append("## Top CVEs by Risk Score")
-        lines.append(_format_top_cves(rows, limit=5))
-        lines.append("")
-
-        lines.append("## Threat Scenarios")
-        lines.append(_format_scenarios(rows, software_name, limit=3))
-        lines.append("")
-
-        lines.append(_format_mitigations(rows, limit=5))
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-
-    body_md = "\n".join(lines).strip()
-    logo_b64 = _load_logo_b64()
-    return _wrap_html_report(
-        title=report_title,
-        body_md=body_md,
-        logo_b64=logo_b64,
-        subtitle="Executive Report  //  Version-Confirmed Threats Only",
-    )
-
-def build_comprehensive_report_markdown(all_rows: List[Dict[str, Any]], report_title: str = "Draugr Threat Intelligence Comprehensive Report") -> str:
-    """
-    Build a full comprehensive report grouped by software.
-    Includes every CVE found (version-confirmed and unconfirmed).
-    All sections are unlimited.
-    Returns a self-contained HTML document with the Draugr logo header.
-    Expects the flattened rows created by ScanWorker.
-    """
-    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
-    for row in all_rows:
-        key = (str(row.get("Software Name", "")).strip(), str(row.get("Software Version", "")).strip())
-        grouped[key].append(row)
-
-    lines: List[str] = []
-    lines.append("This report contains the complete findings for every scanned software item, including all CVEs, threat mappings, scenarios, and mitigations.")
-    lines.append("")
+    lines: List[str] = [""]
 
     for (software_name, software_version), rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
         rows.sort(key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
 
         total_cves = len(rows)
-        confirmed = sum(1 for r in rows if str(r.get("Version Confirmed", "")).strip().upper() == "YES")
         critical = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "CRITICAL")
         high = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "HIGH")
         medium = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "MEDIUM")
@@ -2050,24 +2248,86 @@ def build_comprehensive_report_markdown(all_rows: List[Dict[str, Any]], report_t
         lines.append(f"# {software_name} {software_version}".strip())
         lines.append("")
         lines.append("## Software Summary")
-        lines.append(f"- Software: {software_name}")
-        lines.append(f"- Version: {software_version or 'Not provided'}")
         lines.append(f"- Total CVEs: {total_cves}")
-        lines.append(f"- Version Confirmed: {confirmed}")
         lines.append(f"- Critical: {critical} | High: {high} | Medium: {medium} | Low: {low}")
-        lines.append(f"- Known Exploited: {kev_count}")
+        lines.append(f"- Known Exploited Vulnerabilities: {kev_count}")
         lines.append(f"- Public Exploits Available: {exploit_count}")
-        lines.append(f"- Overall Risk Rating: {overall_risk} ({max_risk})")
         lines.append(f"- Highest Risk CVE Score: {max_risk}")
-        lines.append(f"- Total KEV Hits: {kev_count}")
-        lines.append(f"- Total CVEs with Public Exploits: {exploit_count}")
+        lines.append(f"- Overall Risk Rating: {overall_risk}")
         lines.append("")
 
         lines.append("## Threat Map")
-        lines.append(_format_threat_map(rows, limit=0))
+        lines.append(_format_threat_map(rows))
         lines.append("")
 
-        lines.append("## All CVEs by Risk Score")
+        lines.append("## Top CVEs by Risk Score")
+        lines.append(_format_top_cves(rows, limit=10))
+        lines.append("")
+
+        lines.append("## Threat Scenarios")
+        lines.append(_format_scenarios(rows, software_name, limit=5))
+        lines.append("")
+
+        lines.append("## Mitigations")
+        lines.append(_format_mitigations(rows, limit=10))
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    exec_line = "This report groups findings by software and highlights the highest-risk CVEs, mapped threats, likely scenarios, and recommended mitigations."
+    exec_md = _executive_summary(all_rows)
+    conc_md = _conclusion_section(all_rows)
+    body_md = "\n".join(lines).strip() + "\n"
+    full_md = f"{exec_line}\n{exec_md}\n{body_md}\n{conc_md}"
+    logo_b64 = _load_logo_b64()
+
+    return _wrap_html_report(
+        title=report_title,
+        body_md=full_md,
+        logo_b64=logo_b64,
+    )
+
+def build_technical_report_markdown(all_rows: List[Dict[str, Any]], report_title: str = "Draugr Technical Threat Intelligence Report") -> str:
+    """
+    Build a markdown technical report grouped by software.
+    Expects the flattened rows created by ScanWorker.
+    """
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in all_rows:
+        key = (str(row.get("Software Name", "")).strip(), str(row.get("Software Version", "")).strip())
+        grouped[key].append(row)
+
+    lines: List[str] = [""]
+
+    for (software_name, software_version), rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
+        rows.sort(key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
+
+        total_cves = len(rows)
+        critical = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "CRITICAL")
+        high = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "HIGH")
+        medium = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "MEDIUM")
+        low = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "LOW")
+        kev_count = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
+        exploit_count = sum(1 for r in rows if str(r.get("Public Exploit", "")).upper() == "YES")
+        overall_risk = rows[0].get("Risk Level", "INFO")
+        max_risk = rows[0].get("Risk Score", 0)
+
+        lines.append(f"# {software_name} {software_version}".strip())
+        lines.append("")
+        lines.append("## Software Summary")
+        lines.append(f"- Total CVEs: {total_cves}")
+        lines.append(f"- Critical: {critical} | High: {high} | Medium: {medium} | Low: {low}")
+        lines.append(f"- Known Exploited: {kev_count}")
+        lines.append(f"- Public Exploits Available: {exploit_count}")
+        lines.append(f"- Highest Risk CVE Score: {max_risk}")
+        lines.append(f"- Overall Risk Rating: {overall_risk}")
+        lines.append("")
+
+        lines.append("## Threat Map")
+        lines.append(_format_threat_map(rows))
+        lines.append("")
+
+        lines.append("## Top CVEs by Risk Score")
         lines.append(_format_top_cves(rows, limit=0))
         lines.append("")
 
@@ -2075,18 +2335,23 @@ def build_comprehensive_report_markdown(all_rows: List[Dict[str, Any]], report_t
         lines.append(_format_scenarios(rows, software_name, limit=0))
         lines.append("")
 
+        lines.append("## Mitigations")
         lines.append(_format_mitigations(rows, limit=0))
         lines.append("")
         lines.append("---")
         lines.append("")
 
-    body_md = "\n".join(lines).strip()
+    body_md = "\n".join(lines).strip() + "\n"
+    exec_md = _executive_summary(all_rows)   # optional top section
+    conc_md = _conclusion_section(all_rows)
+
+    full_md = f"{exec_md}\n{body_md}\n{conc_md}"
     logo_b64 = _load_logo_b64()
     return _wrap_html_report(
         title=report_title,
-        body_md=body_md,
+        body_md=full_md,
         logo_b64=logo_b64,
-        subtitle="Comprehensive Report  //  All Findings",
+        subtitle="All Vulnerability Findings",
     )
 # ----------------------------------------------------------------------
 # Worker thread – performs the heavy lifting
@@ -2096,9 +2361,11 @@ class ScanWorker(QThread):
     progress_signal = pyqtSignal(int, int)   # current, total
     status_signal = pyqtSignal(str)          # status bar text
     finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str) 
 
     def __init__(self, software, kev_path, api_key, output_path, cpe_mapping_path="",
-                 show_medium=True, show_low=True, resources_dir="", executive_report_path="", comp_report_path=""):
+                 show_medium=True, show_low=True, resources_dir="", executive_report_path="", comp_report_path="",
+                 error_log_path="", scan_log_path=""):
         super().__init__()
         self.software = software
         self.kev_path = kev_path
@@ -2110,24 +2377,53 @@ class ScanWorker(QThread):
         self.resources_dir = resources_dir
         self.executive_report_path = executive_report_path
         self.comp_report_path = comp_report_path
+        self.scan_log_path  = scan_log_path
+        self.error_log_path = error_log_path
+        self._scan_log_lines:  List[str] = []
+        self._error_log_lines: List[str] = []
+
+    def _emit_log(self, msg: str, level: str = "info"):
+        """Emit to UI and buffer for scan log. Errors also go to the error buffer."""
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] [{level.upper():7}] {msg}"
+        self._scan_log_lines.append(line)
+        if level == "error":
+            self._error_log_lines.append(line)
+            self.error_signal.emit(msg)
+        self.log_signal.emit(msg, level)
+
+    def _write_logs(self) -> None:
+        """Write the accumulated log buffers to their files."""
+        try:
+            # Write the regular scan log
+            with open(self.scan_log_path, "w", encoding="utf-8") as f:
+                f.writelines(line + "\n" for line in self._scan_log_lines)
+
+            # Write the error‑only log (only lines that were marked as errors)
+            with open(self.error_log_path, "w", encoding="utf-8") as f:
+                f.writelines(line + "\n" for line in self._error_log_lines)
+        except Exception as exc:
+            # If writing fails, emit a warning so the UI can show it
+            self.log_signal.emit(f"Failed to write logs: {exc}", "error")
 
     def run(self):
         # Load CPE mapping overrides
         self.status_signal.emit("Loading CPE mappings…")
         cpe_mappings = load_cpe_mappings(self.cpe_mapping_path or None)
         if cpe_mappings:
-            self.log_signal.emit(
+            self._emit_log(
                 f"✔ CPE mapping file loaded — {len(cpe_mappings)} product overrides.", "ok",
             )
             self.status_signal.emit(f"CPE mappings loaded — {len(cpe_mappings)} overrides")
         else:
-            self.log_signal.emit(
+            self._emit_log(
                 "ℹ No CPE mapping file found — using heuristic CPE search.", "dim",
             )
 
         # Load KEV index
         self.status_signal.emit("Loading KEV catalog…")
-        kev_index = load_kev_with_fallback(self.kev_path or "", log=self.log_signal.emit)
+        kev_index = load_kev_with_fallback(self.kev_path or "", log=self._emit_log)
         kev_count = len(kev_index)
         if kev_count:
             self.status_signal.emit(f"KEV loaded — {kev_count} entries")
@@ -2137,18 +2433,18 @@ class ScanWorker(QThread):
         enrichment_dbs = load_enrichment_dbs(self.resources_dir or None)
         db_names = [k for k, v in enrichment_dbs.items() if v]
         if db_names:
-            self.log_signal.emit(
+            self._emit_log(
                 f"✔ Enrichment DBs loaded: {', '.join(db_names)}", "ok",
             )
             self.status_signal.emit(f"Enrichment DBs loaded: {', '.join(db_names)}")
         else:
-            self.log_signal.emit(
+            self._emit_log(
                 "ℹ No enrichment DBs found — using built-in mappings + D3FEND API.", "dim",
             )
-        self.log_signal.emit(
+        self._emit_log(
             "Highest Risk CVEs, CVEs with publicly available exploits, and Critical or High CVEs that match software and version will appear in log", "dim",
         )
-        self.log_signal.emit("All CVEs will appear in the output report.", "dim")
+        self._emit_log("All CVEs will appear in the output report.", "dim")
 
         all_rows: List[Dict[str, Any]] = []
         total = len(self.software)
@@ -2156,12 +2452,12 @@ class ScanWorker(QThread):
         for idx, (name, version) in enumerate(self.software, 1):
 
             if self.isInterruptionRequested():
-                self.log_signal.emit("Scan cancelled by user", "warning")
+                self._emit_log("Scan cancelled by user", "warning")
                 self.status_signal.emit("Cancelled by user")
                 break
 
             label = f"{name} {version}".strip()
-            self.log_signal.emit(f"[{idx}/{total}] Querying NVD for: {label}", "info")
+            self._emit_log(f"[{idx}/{total}] Querying NVD for: {label}", "info")
             self.status_signal.emit(f"Scanning: {idx} of {total} — {label}")
             self.progress_signal.emit(idx - 1, total)  # show progress before work starts
 
@@ -2172,12 +2468,12 @@ class ScanWorker(QThread):
                 name, version, kev_index=kev_index, cpe_mappings=cpe_mappings,
             )
             if not cves:
-                self.log_signal.emit("✓ No CVEs found.", "ok")
+                self._emit_log("✓ No CVEs found.", "ok")
                 self.progress_signal.emit(idx, total)  # mark this item complete
                 time.sleep(RATE_LIMIT_DELAY if not self.api_key else 0.6)
                 continue
 
-            self.log_signal.emit(
+            self._emit_log(
                 f"Found {_plural(len(cves), 'CVE')} — enriching with EPSS & exploit data…",
                 "info",
             )
@@ -2188,10 +2484,10 @@ class ScanWorker(QThread):
 
             # --- Exploit intelligence (Vulners batch lookup) ---
             self.status_signal.emit(f"Scanning: {idx} of {total} — {label} — Enriching: Vulners")
-            self.log_signal.emit("Querying Vulners for public exploit data…", "dim")
+            self._emit_log("Querying Vulners for public exploit data…", "dim")
             vulners_map = query_exploits_vulners(cve_ids)
             if vulners_map:
-                self.log_signal.emit(
+                self._emit_log(
                     f"✔ Vulners returned exploit data for {_plural(len(vulners_map), 'CVE')}.",
                     "ok",
                 )
@@ -2334,7 +2630,7 @@ class ScanWorker(QThread):
             def _log_cve_list(cve_list: List[str], level: str, tag: str = ""):
                 suffix = f"  {tag}" if tag else ""
                 for cid in cve_list:
-                    self.log_signal.emit(
+                    self._emit_log(
                         f"•   \t{cid}: https://nvd.nist.gov/vuln/detail/{cid}{suffix}",
                         level,
                     )
@@ -2343,23 +2639,23 @@ class ScanWorker(QThread):
             risk_entries.sort(key=lambda x: x[0], reverse=True)
             top = risk_entries[:5]
             if top and top[0][0] >= 40:
-                self.log_signal.emit("  ── Top risk CVEs (by weighted score) ──", "dim")
+                self._emit_log("  ── Top risk CVEs (by weighted score) ──", "dim")
                 for score, rlabel, cid in top:
                     color_level = {
                         "CRITICAL": "error", "HIGH": "warn", "MEDIUM": "info",
                     }.get(rlabel, "dim")
-                    self.log_signal.emit(
+                    self._emit_log(
                         f"    {score:5.1f}  [{rlabel}]  {cid}", color_level,
                     )
 
             # 2) Public exploits
             if exploit_cves:
-                self.log_signal.emit(
+                self._emit_log(
                     f"  🔓 {_plural(len(exploit_cves), 'CVE')} with public exploits available",
                     "error",
                 )
                 for ecid, eseverity, esources in exploit_cves:
-                    self.log_signal.emit(
+                    self._emit_log(
                         f"•   \t{ecid}  [{eseverity}] - ({esources})",
                         "error",
                     )
@@ -2382,7 +2678,7 @@ class ScanWorker(QThread):
                 if filtered:
                     parts.append(f"{filtered} not applicable to v{version}")
                 detail = f" ({', '.join(parts)})" if parts else ""
-                self.log_signal.emit(
+                self._emit_log(
                     f"  ⚠ {_plural(sev_count, f'{sev_label} CVE')}{detail}",
                     level,
                 )
@@ -2402,11 +2698,11 @@ class ScanWorker(QThread):
                 if filtered_m:
                     parts_m.append(f"{filtered_m} not applicable to v{version}")
                 detail_m = f" ({', '.join(parts_m)})" if parts_m else ""
-                self.log_signal.emit(f" [!] {_plural(medium_count, 'MEDIUM CVE')}{detail_m}", "info")
+                self._emit_log(f" [!] {_plural(medium_count, 'MEDIUM CVE')}{detail_m}", "info")
                 _log_cve_list(m_cves_confirmed, "info")
                 _log_cve_list(m_cves_unverified, "info", tag="[unverified]")
             elif medium_count:
-                self.log_signal.emit(f" [!] {_plural(medium_count, 'MEDIUM CVE')} (hidden — enable in log filters)", "dim")
+                self._emit_log(f" [!] {_plural(medium_count, 'MEDIUM CVE')} (hidden — enable in log filters)", "dim")
 
             if low_count and self.show_low:
                 confirmed_l = len(l_cves_confirmed)
@@ -2420,18 +2716,18 @@ class ScanWorker(QThread):
                 if filtered_l:
                     parts_l.append(f"{filtered_l} not applicable to v{version}")
                 detail_l = f" ({', '.join(parts_l)})" if parts_l else ""
-                self.log_signal.emit(f" [i] {_plural(low_count, 'LOW CVE')}{detail_l}", "info")
+                self._emit_log(f" [i] {_plural(low_count, 'LOW CVE')}{detail_l}", "info")
                 _log_cve_list(l_cves_confirmed, "info")
                 _log_cve_list(l_cves_unverified, "info", tag="[unverified]")
             elif low_count:
-                self.log_signal.emit(f" [i] {_plural(low_count, 'LOW CVE')} (hidden — enable in log filters)", "dim")
+                self._emit_log(f" [i] {_plural(low_count, 'LOW CVE')} (hidden — enable in log filters)", "dim")
 
             if other_count:
-                self.log_signal.emit(f" [i] {_plural(other_count, 'UNRANKED CVE')}", "dim")
+                self._emit_log(f" [i] {_plural(other_count, 'UNRANKED CVE')}", "dim")
 
             # Respect NVD rate limits
             delay = 0.6 if self.api_key else RATE_LIMIT_DELAY
-            self.log_signal.emit(f"Rate‑limit pause ({delay}s) …", "dim")
+            self._emit_log(f"Rate‑limit pause ({delay}s) …", "dim")
             time.sleep(delay)
             self.progress_signal.emit(idx, total)  # mark this item complete
 
@@ -2476,27 +2772,27 @@ class ScanWorker(QThread):
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(all_rows)
-            self.log_signal.emit(
+            self._emit_log(
                 f"✅ Done — {len(all_rows)} CVEs written to: {self.output_path}",
                 "ok",
             )
             if self.executive_report_path:
-                self.status_signal.emit("Writing Markdown Reports…")
+                self.status_signal.emit("Writing Reports…")
                 exec_report_md = build_executive_report_markdown(
                     all_rows,
                     report_title="Draugr Threat Intelligence Executive Report",
                 )
-                with open(self.executive_report_path, "w", encoding="utf-8") as htmlfile:
-                    htmlfile.write(exec_report_md)
+                with open(self.executive_report_path, "w", encoding="utf-8") as mdfile:
+                    mdfile.write(exec_report_md)
                 
-                comp_report_md = build_comprehensive_report_markdown(
+                comp_report_md = build_technical_report_markdown(
                     all_rows,
-                    report_title="Draugr Threat Intelligence Comprehensive Report",
+                    report_title="Draugr Threat Intelligence Technical Report",
                 )
-                with open(self.comp_report_path, "w", encoding="utf-8") as htmlfile:
-                    htmlfile.write(comp_report_md)
-                self.log_signal.emit(
-                    f"✅ Executive Report written to: {self.executive_report_path}\n✅ Comprehensive Report written to: {self.comp_report_path}",
+                with open(self.comp_report_path, "w", encoding="utf-8") as mdfile:
+                    mdfile.write(comp_report_md)
+                self._emit_log(
+                    f"✅ Executive Report written to: {self.executive_report_path}\n✅ Technical Report written to: {self.comp_report_path}",
                     "ok",
                 )
 
@@ -2511,65 +2807,16 @@ class ScanWorker(QThread):
                     f"Complete — {len(all_rows)} CVEs across {total} products → {os.path.basename(self.output_path)}"
                 )
         except Exception as exc:  # pragma: no cover
-            self.log_signal.emit(f"❌ Failed to write CSV: {exc}", "error")
+            self._emit_log(f"❌ Failed to write CSV: {exc}", "error")
             self.status_signal.emit(f"Error — Failed to write CSV: {exc}")
         finally:
+            self._write_logs()
             self.finished_signal.emit()
 
 
 # ----------------------------------------------------------------------
 # Main window
 # ----------------------------------------------------------------------
-class ScalingLogoLabel(QLabel):
-    """
-    A QLabel that holds a logo pixmap and rescales it smoothly whenever
-    the widget is resized — capped at a max height so it never overwhelms
-    the UI, and never upscales beyond the image's native resolution.
-    """
-    MIN_H = 60      # px — smallest the logo will shrink to
-    MAX_H = 180     # px — tallest it will grow to (maximised window)
-    MAX_W_FRAC = 0.72  # never wider than this fraction of the window width
-
-    def __init__(self, pixmap: QPixmap, parent=None):
-        super().__init__(parent)
-        self._source = pixmap           # original full-res pixmap
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet("background: transparent; padding-bottom: 4px;")
-        self.setMinimumHeight(self.MIN_H)
-        self.setSizePolicy(
-            # expand horizontally, preferred vertically
-            __import__("PyQt6.QtWidgets", fromlist=["QSizePolicy"]).QSizePolicy.Policy.Expanding,
-            __import__("PyQt6.QtWidgets", fromlist=["QSizePolicy"]).QSizePolicy.Policy.Preferred,
-        )
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._rescale()
-
-    def _rescale(self):
-        if self._source.isNull():
-            return
-        available_w = self.width()
-        available_h = self.height()
-
-        # Target height: clamp between MIN_H and MAX_H
-        target_h = max(self.MIN_H, min(self.MAX_H, available_h))
-        # Also respect a max-width fraction so logo doesn't overflow on narrow windows
-        max_w = int(available_w * self.MAX_W_FRAC)
-
-        scaled = self._source.scaledToHeight(
-            target_h,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        # If still too wide, constrain by width instead
-        if scaled.width() > max_w:
-            scaled = self._source.scaledToWidth(
-                max_w,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        self.setPixmap(scaled)
-
-
 class CVEScannerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2589,18 +2836,11 @@ class CVEScannerWindow(QMainWindow):
         root.setContentsMargins(28, 20, 28, 20)
         root.setSpacing(0)
 
-        # --- Logo header (dynamically scaled) ---
-        logo_path = Path(__file__).with_name("draugr_logo.png")
-        logo_pixmap = QPixmap(str(logo_path)) if logo_path.exists() else QPixmap()
-        if not logo_pixmap.isNull():
-            header = ScalingLogoLabel(logo_pixmap)
-        else:
-            # Fallback to text if image not found
-            header = QLabel("DRAUGR")
-            header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            header.setStyleSheet(
-                f"color: {C.ACCENT}; font-size: 26px; font-weight: 700; letter-spacing: 4px;"
-            )
+        header = QLabel("DRAUGR")
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header.setStyleSheet(
+            f"color: {C.ACCENT}; font-size: 64px; font-weight: 700; letter-spacing: 4px;"
+        )
         root.addWidget(header)
 
         subtitle = QLabel("THREAT    INTELLIGENCE    SYSTEM") #  ·  
@@ -2632,29 +2872,28 @@ class CVEScannerWindow(QMainWindow):
         card_layout.addWidget(section)
 
         self.sw_row = FileRow(
-            "Software List", "Path to file …",
-            file_filter="CSV and Text files (*.csv *.txt);;All files (*)",
+            "Software List ", "Path to file …",
+            is_file=True,file_filter="CSV and Text files (*.csv *.txt);;All files (*)",
         )
         card_layout.addWidget(self.sw_row)
 
         self.out_row = FileRow(
-            "Output CSV", "cve_report.csv",
-            is_save=True, file_filter="CSV files (*.csv)",
+            "Output Directory ", "Enter folder name …",
+            file_filter="",
         )
-        self.out_row.setText("cve_report.csv")
         card_layout.addWidget(self.out_row)
 
         # --- Optional fields (hidden by default, toggled via Settings menu) ---
         self.kev_row = FileRow(
-            "KEV JSON", "Optional — json file for KEV check",
-            file_filter="JSON files (*.json);;All files (*)",
+            "KEV JSON ", "Optional — json file for KEV check",
+            is_file=True,file_filter="JSON files (*.json);;All files (*)",
         )
         self.kev_row.setVisible(False)
         card_layout.addWidget(self.kev_row)
 
         self.cpe_row = FileRow(
-            "CPE Mappings", "Optional — cpe_mappings.json",
-            file_filter="JSON files (*.json);;All files (*)",
+            "CPE Mappings ", "Optional — cpe_mappings.json",
+            is_file=True,file_filter="JSON files (*.json);;All files (*)",
         )
         if os.path.isfile(CPE_MAPPING_DEFAULT):
             self.cpe_row.setText(CPE_MAPPING_DEFAULT)
@@ -2662,8 +2901,8 @@ class CVEScannerWindow(QMainWindow):
         card_layout.addWidget(self.cpe_row)
 
         self.resources_row = FileRow(
-            "Resources Dir", "Optional — folder with cwe_db.json, capec_db.json, etc.",
-            file_filter="",
+            "Resources Dir ", "Optional — folder with cwe_db.json, capec_db.json, etc.",
+            file_filter="", pick_folder=True
         )
         if os.path.isdir(_RESOURCES_DIR):
             self.resources_row.setText(_RESOURCES_DIR)
@@ -2676,7 +2915,7 @@ class CVEScannerWindow(QMainWindow):
         api_layout.setContentsMargins(0, 0, 0, 0)
         api_layout.setSpacing(8)
 
-        api_label = QLabel("NVD API Key")
+        api_label = QLabel("NVD API Key ")
         api_label.setFixedWidth(120)
         api_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         api_label.setStyleSheet(f"color: {C.FG_DIM}; font-size: 12px; border: none;")
@@ -2982,6 +3221,7 @@ class CVEScannerWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.scan_btn.setText("▶   Start Scan")
+        self.worker._write_logs()
         # Keep the final status from the worker (Complete / Error / Cancelled)
         self.worker = None
 
@@ -2995,16 +3235,22 @@ class CVEScannerWindow(QMainWindow):
             return
         out_path = self.out_row.text()
         if not out_path:
-            QMessageBox.critical(self, "Error", "Please specify an output CSV path.")
+            QMessageBox.critical(self, "Error", "Please specify an output path.")
             return
 
+        output_dir = Path(out_path).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)          # <-- creates the folder
+        # Use a fixed CSV name inside the folder (you can change it later)
+        
         executive_report_path = ""
         comp_report_path = ""
         if generate_executive_report:
             out_base = Path(out_path)
-            executive_report_path = str(out_base.with_name(f"{out_base.stem}_executive_report.html"))
-            comp_report_path = str(out_base.with_name(f"{out_base.stem}_comprehensive_report.html"))
-
+            csv_path = output_dir /str(out_base.with_name(f"{out_base.stem}.csv"))
+            executive_report_path = output_dir /str(out_base.with_name(f"{out_base.stem}_executive_report.html"))
+            comp_report_path = output_dir /str(out_base.with_name(f"{out_base.stem}_technical_report.html"))
+            error_log_path = output_dir /str(out_base.with_name(f"{out_base.stem}_error.log"))
+            scan_log_path = output_dir /str(out_base.with_name(f"{out_base.stem}_scan.log"))
         try:
             software = parse_software_list(sw_path)
         except Exception as exc:
@@ -3025,17 +3271,18 @@ class CVEScannerWindow(QMainWindow):
         cpe_path = self.cpe_row.text()
         api_key = self.api_input.text().strip()
         resources_dir = self.resources_row.text()
-
-        mode_text = "with Executive Report" 
-        self._append_log(f"Starting scan of {len(software)} entries ({mode_text}) …", "info")
-        self._update_status(f"Starting scan of {len(software)} entries ({mode_text})…")
+ 
+        self._append_log(f"Starting scan of {len(software)} entries …", "info")
+        self._update_status(f"Starting scan of {len(software)} entries …")
         self.worker = ScanWorker(
-            software, kev_path, api_key, out_path, cpe_path,
+            software, kev_path, api_key, csv_path, cpe_path,
             show_medium=self.chk_medium.isChecked(),
             show_low=self.chk_low.isChecked(),
             resources_dir=resources_dir,
             executive_report_path=executive_report_path,
-            comp_report_path=comp_report_path,
+            comp_report_path=comp_report_path, 
+            error_log_path=error_log_path, 
+            scan_log_path=scan_log_path
         )
         self.worker.log_signal.connect(self._append_log) 
         self.worker.progress_signal.connect(self._update_progress)
@@ -3196,7 +3443,7 @@ class DraugrSplash(QSplashScreen):
         p.setFont(ver_font)
         p.setPen(QColor(85, 30, 30, 200))
         p.drawText(0, H - 22, W - 12, 20,
-                   Qt.AlignmentFlag.AlignRight, "v1.0  //  INTERNAL USE ONLY")
+                   Qt.AlignmentFlag.AlignRight, "v2.8.2  //  INTERNAL USE ONLY")
 
     def _overlay_text(self, pm: QPixmap) -> QPixmap:
         W, H = pm.width(), pm.height()
