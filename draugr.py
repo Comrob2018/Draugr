@@ -93,6 +93,7 @@ except ImportError:  # pragma: no cover
 NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 NVD_CPE_URL = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
 NVD_API_KEY = "19f1852b-0f76-41af-99d2-61f6d8c2bd41"
+OTX_API_KEY = "dd6ce4f928bbbe4c578d30a5696f124a5279621d2e7fb77f6dbbcc9b6ca886e9"
 KEV_FEED_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
@@ -929,18 +930,149 @@ def batch_d3fend_lookup(
 
 
 # ------------------------------------------------------------------
-# 6) ATT&CK → NIST 800-53 mapping (offline DB)
+# 6) ATT&CK → NIST 800-53 mapping (offline DB + built-in fallback)
 # ------------------------------------------------------------------
+
+# Built-in ATT&CK technique → NIST SP 800-53 Rev 5 control mapping.
+# Covers every technique ID that CWE_TO_ATTACK can produce plus the
+# most common additional techniques found in NVD data.
+# Controls are listed most-specific first.
+ATTACK_TO_NIST: Dict[str, List[str]] = {
+    # --- Initial Access / Public-Facing Exploitation ---
+    "T1190": ["SI-2 Flaw Remediation", "SI-10 Information Input Validation",
+              "SC-7 Boundary Protection", "RA-5 Vulnerability Monitoring and Scanning",
+              "SA-11 Developer Testing and Evaluation", "CM-7 Least Functionality"],
+    "T1189": ["SC-7 Boundary Protection", "SI-3 Malicious Code Protection",
+              "SI-4 System Monitoring", "CM-7 Least Functionality"],
+    "T1133": ["AC-17 Remote Access", "IA-2 Identification and Authentication",
+              "SC-7 Boundary Protection", "AC-3 Access Enforcement"],
+    "T1078": ["IA-2 Identification and Authentication", "AC-2 Account Management",
+              "AC-3 Access Enforcement", "AU-2 Event Logging",
+              "IA-5 Authenticator Management"],
+    "T1078.001": ["CM-6 Configuration Settings", "CM-7 Least Functionality",
+                  "IA-5 Authenticator Management", "AC-2 Account Management"],
+    # --- Execution ---
+    "T1059": ["CM-7 Least Functionality", "SI-3 Malicious Code Protection",
+              "AC-3 Access Enforcement", "AU-2 Event Logging",
+              "SI-4 System Monitoring"],
+    "T1059.007": ["CM-7 Least Functionality", "SI-10 Information Input Validation",
+                  "SC-7 Boundary Protection", "SI-3 Malicious Code Protection"],
+    "T1203": ["SI-2 Flaw Remediation", "SI-3 Malicious Code Protection",
+              "CM-7 Least Functionality", "SC-7 Boundary Protection",
+              "RA-5 Vulnerability Monitoring and Scanning"],
+    "T1106": ["CM-7 Least Functionality", "AC-3 Access Enforcement",
+              "SI-4 System Monitoring", "AU-2 Event Logging"],
+    "T1053": ["AC-3 Access Enforcement", "CM-7 Least Functionality",
+              "AU-2 Event Logging", "SI-4 System Monitoring"],
+    # --- Persistence ---
+    "T1547": ["CM-7 Least Functionality", "SI-4 System Monitoring",
+              "AC-3 Access Enforcement", "AU-2 Event Logging"],
+    "T1543": ["AC-3 Access Enforcement", "CM-7 Least Functionality",
+              "AU-2 Event Logging", "SI-4 System Monitoring"],
+    "T1574": ["CM-7 Least Functionality", "SI-7 Software Integrity",
+              "AC-3 Access Enforcement", "AU-2 Event Logging"],
+    # --- Privilege Escalation ---
+    "T1068": ["SI-2 Flaw Remediation", "AC-6 Least Privilege",
+              "CM-6 Configuration Settings", "RA-5 Vulnerability Monitoring and Scanning",
+              "AU-2 Event Logging", "SI-4 System Monitoring"],
+    "T1548": ["AC-6 Least Privilege", "AC-3 Access Enforcement",
+              "CM-6 Configuration Settings", "AU-2 Event Logging",
+              "SI-4 System Monitoring"],
+    "T1134": ["AC-6 Least Privilege", "AC-3 Access Enforcement",
+              "AU-2 Event Logging", "SI-4 System Monitoring"],
+    # --- Defense Evasion ---
+    "T1222": ["AC-3 Access Enforcement", "AC-6 Least Privilege",
+              "AU-2 Event Logging", "SI-7 Software Integrity"],
+    "T1562": ["AU-9 Protection of Audit Information", "AU-2 Event Logging",
+              "CM-7 Least Functionality", "SI-4 System Monitoring"],
+    "T1070": ["AU-9 Protection of Audit Information", "AU-2 Event Logging",
+              "SI-7 Software Integrity"],
+    "T1036": ["SI-3 Malicious Code Protection", "SI-7 Software Integrity",
+              "AU-2 Event Logging"],
+    # --- Credential Access ---
+    "T1110": ["AC-7 Unsuccessful Login Attempts", "IA-2 Identification and Authentication",
+              "IA-5 Authenticator Management", "AU-2 Event Logging",
+              "SI-4 System Monitoring"],
+    "T1552": ["IA-5 Authenticator Management", "SC-28 Protection of Information at Rest",
+              "AC-3 Access Enforcement", "AU-2 Event Logging"],
+    "T1552.004": ["SC-28 Protection of Information at Rest", "IA-5 Authenticator Management",
+                  "AC-3 Access Enforcement"],
+    "T1557": ["SC-8 Transmission Confidentiality and Integrity", "SC-7 Boundary Protection",
+              "IA-3 Device Identification and Authentication", "SI-4 System Monitoring"],
+    "T1040": ["SC-8 Transmission Confidentiality and Integrity",
+              "SC-7 Boundary Protection", "SI-4 System Monitoring"],
+    "T1003": ["AC-6 Least Privilege", "SC-28 Protection of Information at Rest",
+              "IA-5 Authenticator Management", "AU-2 Event Logging"],
+    # --- Discovery ---
+    "T1083": ["AC-3 Access Enforcement", "AC-6 Least Privilege",
+              "AU-2 Event Logging", "SI-4 System Monitoring"],
+    "T1082": ["AC-3 Access Enforcement", "CM-8 System Component Inventory",
+              "SI-4 System Monitoring", "AU-2 Event Logging"],
+    "T1046": ["SC-7 Boundary Protection", "CM-7 Least Functionality",
+              "SI-4 System Monitoring", "AU-2 Event Logging"],
+    # --- Lateral Movement ---
+    "T1021": ["AC-17 Remote Access", "AC-3 Access Enforcement",
+              "IA-2 Identification and Authentication", "SC-7 Boundary Protection",
+              "AU-2 Event Logging"],
+    "T1210": ["SI-2 Flaw Remediation", "SC-7 Boundary Protection",
+              "RA-5 Vulnerability Monitoring and Scanning", "CM-7 Least Functionality"],
+    # --- Collection ---
+    "T1005": ["AC-3 Access Enforcement", "AC-6 Least Privilege",
+              "SC-28 Protection of Information at Rest", "AU-2 Event Logging",
+              "SI-4 System Monitoring"],
+    "T1213": ["AC-3 Access Enforcement", "AC-6 Least Privilege",
+              "AU-2 Event Logging", "SI-4 System Monitoring"],
+    # --- Exfiltration ---
+    "T1041": ["SC-7 Boundary Protection", "SI-4 System Monitoring",
+              "AU-2 Event Logging", "CA-7 Continuous Monitoring"],
+    "T1048": ["SC-7 Boundary Protection", "SI-4 System Monitoring",
+              "AU-2 Event Logging"],
+    # --- Command and Control ---
+    "T1090": ["SC-7 Boundary Protection", "SI-4 System Monitoring",
+              "AU-2 Event Logging", "CA-7 Continuous Monitoring"],
+    "T1071": ["SC-7 Boundary Protection", "SI-4 System Monitoring",
+              "AU-2 Event Logging"],
+    "T1105": ["SC-7 Boundary Protection", "SI-3 Malicious Code Protection",
+              "SI-4 System Monitoring", "CM-7 Least Functionality"],
+    # --- Impact ---
+    "T1499": ["SC-5 Denial-of-Service Protection", "SI-4 System Monitoring",
+              "SC-7 Boundary Protection", "IR-4 Incident Handling",
+              "CA-7 Continuous Monitoring"],
+    "T1485": ["CP-9 System Backup", "SI-7 Software Integrity",
+              "AC-3 Access Enforcement", "AU-2 Event Logging"],
+    "T1486": ["CP-9 System Backup", "SC-28 Protection of Information at Rest",
+              "SI-3 Malicious Code Protection", "IR-4 Incident Handling"],
+    "T1490": ["CP-9 System Backup", "AC-3 Access Enforcement",
+              "SI-7 Software Integrity", "IR-4 Incident Handling"],
+}
+
+
 def map_nist_controls(
     technique_ids: List[str],
     nist_db: Dict[str, Any],
 ) -> List[str]:
-    """Map ATT&CK technique IDs to NIST 800-53 controls using offline DB."""
-    if not nist_db:
-        return []
+    """
+    Map ATT&CK technique IDs to NIST 800-53 controls.
+    Uses the offline nist_db when available; falls back to the built-in
+    ATTACK_TO_NIST table so controls are always populated.
+    """
     controls: set = set()
-    for tid in technique_ids:
-        controls.update(nist_db.get(tid, {}).get("nist_controls", []))
+
+    if nist_db:
+        # Offline DB path
+        for tid in technique_ids:
+            controls.update(nist_db.get(tid, {}).get("nist_controls", []))
+
+    if not controls:
+        # Built-in fallback — also fills gaps for techniques not in the DB
+        for tid in technique_ids:
+            # Exact match first, then try parent technique (strip sub-technique suffix)
+            matches = ATTACK_TO_NIST.get(tid, [])
+            if not matches and "." in tid:
+                parent = tid.split(".")[0]
+                matches = ATTACK_TO_NIST.get(parent, [])
+            controls.update(matches)
+
     return sorted(controls)
 
 
@@ -1076,6 +1208,251 @@ def query_exploits_vulners(cve_ids: List[str]) -> Dict[str, List[Dict[str, str]]
         except Exception:
             continue
     return mapping
+
+
+# ======================================================================
+#  Threat Intelligence — CIRCL CVE Search + GreyNoise Community
+#
+#  Replaces the former AlienVault OTX integration which suffered from
+#  persistent timeouts and reliability issues on the free tier.
+#
+#  Sources used (both free, no API key required):
+#    • CIRCL CVE Search  — https://cve.circl.lu/api/
+#      Per-CVE enrichment: references, vendor/product, CWE, CAPEC links.
+#    • GreyNoise Community API — https://api.greynoise.io/v3/
+#      Per-CVE exploitation activity: whether the CVE is being actively
+#      exploited in the wild by IPs observed by GreyNoise sensors.
+#
+#  The public functions (query_otx_for_software / query_otx_for_cves /
+#  _format_otx_intel) keep their original signatures so the rest of the
+#  codebase requires no changes.
+# ======================================================================
+
+CIRCL_CVE_URL   = "https://cve.circl.lu/api/cve"
+GREYNOISE_URL   = "https://api.greynoise.io/v3/community"
+
+
+# ----------------------------------------------------------------------
+# CIRCL helpers
+# ----------------------------------------------------------------------
+
+def _query_circl_cve(cve_id: str, timeout: int = 15) -> Dict[str, Any]:
+    """Fetch enrichment data for a single CVE from CIRCL CVE Search."""
+    try:
+        resp = requests.get(
+            f"{CIRCL_CVE_URL}/{cve_id}",
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            return resp.json() or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _query_greynoise_cve(cve_id: str, timeout: int = 10) -> Dict[str, Any]:
+    """
+    Query the GreyNoise Community API for exploitation activity on a CVE.
+    Returns a dict with keys: status, noise, riot, message, exploitation_stats.
+    No API key needed for the community endpoint.
+    """
+    try:
+        resp = requests.get(
+            f"{GREYNOISE_URL}/{cve_id}",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            return resp.json() or {}
+        if resp.status_code == 404:
+            # 404 means GreyNoise has no data for this CVE — not an error
+            return {"status": "no_data"}
+    except Exception:
+        pass
+    return {"status": "error"}
+
+
+# ----------------------------------------------------------------------
+# Public API — same signatures as the former OTX functions
+# ----------------------------------------------------------------------
+
+def query_otx_for_software(
+    name: str,
+    version: str,
+    api_key: str,          # kept for signature compatibility; unused
+    max_pulses: int = 5,
+) -> Dict[str, Any]:
+    """
+    Formerly queried AlienVault OTX for threat pulses.
+    Now returns a lightweight stub — per-software intelligence is assembled
+    from per-CVE CIRCL/GreyNoise data in query_otx_for_cves() instead.
+
+    Returns the same dict shape the rest of the code expects:
+        { pulse_count, pulses, error }
+    """
+    return {"pulse_count": 0, "pulses": [], "error": None}
+
+
+def query_otx_for_cves(
+    cve_ids: List[str],
+    api_key: str,          # kept for signature compatibility; unused
+) -> Dict[str, int]:
+    """
+    For each CVE ID, fetch threat intelligence from CIRCL and GreyNoise.
+
+    Returns { cve_id: activity_score } where activity_score is a simple
+    integer that approximates the former OTX "pulse count":
+        • +1  if CIRCL has enrichment data (references, CAPEC, etc.)
+        • +2  if GreyNoise reports active exploitation noise
+        • +1  if GreyNoise reports RIOT (known benign scanner) context
+
+    This keeps the table in the report populated with meaningful signal
+    without requiring any API key.
+    """
+    if not cve_ids:
+        return {}
+
+    scores: Dict[str, int] = {}
+
+    for cve_id in cve_ids:
+        score = 0
+
+        # --- CIRCL ---
+        circl_data = _query_circl_cve(cve_id)
+        if circl_data:
+            # Any enrichment counts as at least 1
+            score += 1
+            # Extra weight if there are CAPEC attack patterns linked
+            if circl_data.get("capec"):
+                score += len(circl_data["capec"])
+
+        # --- GreyNoise ---
+        gn_data = _query_greynoise_cve(cve_id)
+        if gn_data.get("noise"):
+            score += 2   # actively scanned/exploited in the wild
+        if gn_data.get("riot"):
+            score += 1   # known scanner context
+
+        if score > 0:
+            scores[cve_id] = score
+
+        time.sleep(0.2)   # be polite to free-tier endpoints
+
+    return scores
+
+
+# ----------------------------------------------------------------------
+# Enrichment cache — so CIRCL/GN data gathered in query_otx_for_cves
+# can be re-used when formatting the report without a second round-trip.
+# ----------------------------------------------------------------------
+_THREAT_INTEL_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_cached_intel(cve_id: str) -> Dict[str, Any]:
+    """Return combined CIRCL + GreyNoise data for a CVE, using cache."""
+    if cve_id not in _THREAT_INTEL_CACHE:
+        _THREAT_INTEL_CACHE[cve_id] = {
+            "circl":      _query_circl_cve(cve_id),
+            "greynoise":  _query_greynoise_cve(cve_id),
+        }
+    return _THREAT_INTEL_CACHE[cve_id]
+
+
+def _format_otx_intel(
+    software_name: str,
+    software_version: str,
+    otx_result: Dict[str, Any],      # stub from query_otx_for_software
+    cve_pulse_counts: Dict[str, int], # scores from query_otx_for_cves
+    top_cves: List[Dict[str, Any]],
+) -> str:
+    """
+    Format threat intelligence (CIRCL + GreyNoise) into markdown for the
+    executive report.  Formerly formatted AlienVault OTX pulse data.
+    """
+    lines: List[str] = ["## Threat Intelligence (CIRCL / GreyNoise)", ""]
+
+    if not cve_pulse_counts:
+        lines.append(
+            f"- No external threat activity found for **{software_name} {software_version}** "
+            "via CIRCL CVE Search or GreyNoise."
+        )
+        return "\n".join(lines)
+
+    active_count = sum(1 for s in cve_pulse_counts.values() if s >= 3)
+    lines.append(
+        f"Threat intelligence enrichment found activity data for "
+        f"**{len(cve_pulse_counts)}** CVE(s) in **{software_name} {software_version}**"
+        + (f", of which **{active_count}** show active in-the-wild exploitation signals." if active_count else ".")
+    )
+    lines.append("")
+
+    # --- CVE activity table ---
+    lines.append("### CVE Threat Activity Summary")
+    lines.append("| CVE ID | Activity Score | GreyNoise | Risk Score | CVSS Severity |")
+    lines.append("|---|---|---|---|---|")
+    cve_risk_map = {r.get("CVE ID", ""): r for r in top_cves}
+    sorted_cves = sorted(cve_pulse_counts.items(), key=lambda x: x[1], reverse=True)
+
+    for cve_id, score in sorted_cves[:10]:
+        row  = cve_risk_map.get(cve_id, {})
+        risk = row.get("Risk Score", "—")
+        sev  = row.get("CVSS Severity", "—")
+
+        # Pull GreyNoise signal from cache if available
+        cached = _THREAT_INTEL_CACHE.get(cve_id, {})
+        gn     = cached.get("greynoise", {})
+        if gn.get("noise"):
+            gn_label = "⚠ Active"
+        elif gn.get("status") == "no_data":
+            gn_label = "No data"
+        elif gn.get("riot"):
+            gn_label = "Known scanner"
+        else:
+            gn_label = "—"
+
+        lines.append(f"| {cve_id} | {score} | {gn_label} | {risk} | {sev} |")
+
+    lines.append("")
+
+    # --- CIRCL enrichment highlights for top CVEs ---
+    lines.append("### CVE Enrichment Details (CIRCL)")
+    shown = 0
+    for cve_id, _ in sorted_cves[:5]:
+        cached = _THREAT_INTEL_CACHE.get(cve_id, {})
+        circl  = cached.get("circl", {})
+        if not circl:
+            continue
+        shown += 1
+        lines.append(f"#### {cve_id}")
+        if circl.get("summary"):
+            lines.append(f"- **Summary:** {str(circl['summary'])[:300]}")
+        vendors = [
+            f"{p.get('vendor', '')} {p.get('product', '')}".strip()
+            for p in (circl.get("vulnerable_product") or [])[:4]
+        ]
+        if vendors:
+            lines.append(f"- **Affected Products:** {', '.join(vendors)}")
+        capecs = circl.get("capec") or []
+        if capecs:
+            capec_str = ", ".join(
+                f"CAPEC-{c.get('id', '')} ({c.get('name', '')})" for c in capecs[:3]
+            )
+            lines.append(f"- **Attack Patterns:** {capec_str}")
+        refs = (circl.get("references") or [])[:3]
+        for ref in refs:
+            lines.append(f"- **Ref:** {ref}")
+        gn = cached.get("greynoise", {})
+        if gn.get("noise"):
+            lines.append("- **GreyNoise:** ⚠ Active exploitation traffic observed in the wild")
+        elif gn.get("message"):
+            lines.append(f"- **GreyNoise:** {gn['message']}")
+        lines.append("")
+
+    if shown == 0:
+        lines.append("- No additional CIRCL enrichment data available for top CVEs.")
+
+    return "\n".join(lines).strip()
 
 
 # ======================================================================
@@ -1283,7 +1660,7 @@ class C:
     BLUE = "#7a8fa3"        # info — desaturated steel blue
     YELLOW = "#c4935a"      # warning — warm amber-orange
     RED = "#cb322c"         # error/critical — same as accent crimson
-    ORANGE = "#a3433b"      # high severity — deep burnt orange-red
+    ORANGE = "#d4722a"      # critical/exploit highlight — vivid burnt orange
 
 
 # ----------------------------------------------------------------------
@@ -1412,6 +1789,18 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _epss_float(value: Any, default: float = 0.0) -> float:
+    """Parse an EPSS value stored as '7.23%' (fmt_pct output) or raw '0.0723'."""
+    try:
+        s = str(value).strip().rstrip("%")
+        f = float(s)
+        # fmt_pct multiplies by 100 before storing, e.g. 0.0723 → '7.23%'
+        # Normalise back to 0–1 so display is consistent.
+        return f / 100.0 if f > 1.0 else f
+    except Exception:
+        return default
+
+
 def _scenario_template(attack_id: str, attack_name: str, software_name: str, cve_id: str) -> str:
     """Return a short scenario narrative tied to ATT&CK technique."""
     aid = (attack_id or "").upper()
@@ -1472,26 +1861,18 @@ def _format_threat_map(rows: List[Dict[str, Any]]) -> str:
         if cwes:
             for cwe in cwes[:5]:
                 lines.append(f"  - CWE: {cwe}")
-        else:
-            lines.append("  - CWE: None mapped")
 
         if attacks:
             for attack in attacks[:5]:
                 lines.append(f"    - ATT&CK: {attack}")
-        else:
-            lines.append("    - ATT&CK: None mapped")
 
         if d3f:
             for d in d3f[:5]:
                 lines.append(f"      - D3FEND: {d}")
-            else:
-                lines.append("    - D3FEND: None mapped")
 
         if nist:
             for n in nist[:5]:
                 lines.append(f"      - NIST: {n}")
-            else:
-                lines.append("    - NIST: None mapped")
 
     return "\n".join(lines) if lines else "- No mapped threats identified."
 
@@ -1518,6 +1899,22 @@ def _format_top_cves(rows: List[Dict[str, Any]], limit) -> str:
         lines.append(f"- ATT&CK Techniques: {row.get('ATT&CK Techniques', '') or 'None'}")
         lines.append(f"- D3FEND Countermeasures: {row.get("D3FEND Countermeasures", '') or 'None'}")
         lines.append(f"- NIST 800-53 Controls: {row.get("NIST 800-53 Controls", "") or 'None'}")
+        # --- Threat intelligence enrichment from CIRCL / GreyNoise ---
+        cve_id = row.get("CVE ID", "")
+        if cve_id:
+            cached = _THREAT_INTEL_CACHE.get(cve_id, {})
+            gn     = cached.get("greynoise", {})
+            circl  = cached.get("circl", {})
+            if gn.get("noise"):
+                lines.append("- GreyNoise: ⚠ Active exploitation traffic observed in the wild")
+            elif gn.get("riot"):
+                lines.append("- GreyNoise: Known scanner/researcher activity observed")
+            capecs = circl.get("capec") or []
+            if capecs:
+                capec_str = "; ".join(
+                    f"CAPEC-{c.get('id','')} {c.get('name','')}" for c in capecs[:3]
+                )
+                lines.append(f"- Attack Patterns (CAPEC): {capec_str}")
         lines.append(f"- NVD: {row.get('NVD URL', '')}")
         lines.append("")
     return "\n".join(lines).strip()
@@ -1906,7 +2303,7 @@ def _load_logo_b64(script_dir: Optional[str] = None) -> str:
     The result can be dropped straight into an <img src="..."> attribute.
     """
     search_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-    logo_path = os.path.join(search_dir, "draugr_logo3.png")
+    logo_path = os.path.join(search_dir, "draugr_logo_small.png")
     if not os.path.isfile(logo_path):
         return ""
     try:
@@ -1932,7 +2329,10 @@ def _markdown_body_to_html(md: str) -> str:
     h = html  # alias for html.escape
 
     def escape(s: str) -> str:
-        return h.escape(s)
+        result = h.escape(s)
+        # Restore intentional & in known security framework names
+        result = result.replace("ATT&amp;CK", "ATT&CK")
+        return result
 
     def inline(s: str) -> str:
         """Apply inline transforms: **bold**, and URL auto-linking."""
@@ -2195,7 +2595,7 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     alongside the report title.
     """
     escaped_title = html.escape(title)
-    logo_tag = '<img src="C:\\Users\\P09816\\OneDrive - NGC\\Desktop\\Coding\\cve_scanner\\draugr_logo.png" alt="Draugr logo">'
+    logo_tag = '<img src="C:\\Users\\comro\\Desktop\\Rob\\cyber\\programs\\draugr\\draugr_logo_small.png" alt="Draugr logo">'
     sub_tag = (
         f'<span class="subtitle">{html.escape(subtitle)}</span>'
         if subtitle else ""
@@ -2220,16 +2620,22 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     return full_html
 
 
-def build_executive_report_markdown(all_rows: List[Dict[str, Any]], report_title: str = "Draugr Excutive Threat Intelligence Report") -> str:
+def build_executive_report_markdown(
+    all_rows: List[Dict[str, Any]],
+    report_title: str = "Executive Threat Intelligence Report",
+    otx_results: Optional[Dict[str, Any]] = None,
+) -> str:
     """
     Build a markdown executive report grouped by software.
     Expects the flattened rows created by ScanWorker.
+    otx_results: { "name version": {pulse_count, pulses, cve_pulse_counts, error} }
     """
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in all_rows:
         key = (str(row.get("Software Name", "")).strip(), str(row.get("Software Version", "")).strip())
         grouped[key].append(row)
 
+    otx_results = otx_results or {}
     lines: List[str] = [""]
 
     for (software_name, software_version), rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
@@ -2256,6 +2662,30 @@ def build_executive_report_markdown(all_rows: List[Dict[str, Any]], report_title
         lines.append(f"- Overall Risk Rating: {overall_risk}")
         lines.append("")
 
+        # Threat intelligence — concise summary stat for executive audience
+        otx_key = f"{software_name} {software_version}".strip()
+        if otx_key in otx_results:
+            otx_data    = otx_results[otx_key]
+            cve_counts  = otx_data.get("cve_pulse_counts", {})
+            active_cves = [cid for cid in cve_counts
+                           if _THREAT_INTEL_CACHE.get(cid, {}).get("greynoise", {}).get("noise")]
+            enriched    = len(cve_counts)
+            if enriched or active_cves:
+                lines.append("## Threat Intelligence")
+                lines.append("")
+                if active_cves:
+                    lines.append(
+                        f"⚠ **{len(active_cves)}** CVE(s) for **{software_name} {software_version}** "
+                        "show active in-the-wild exploitation traffic (GreyNoise). "
+                        "See the Technical Report for per-CVE detail."
+                    )
+                elif enriched:
+                    lines.append(
+                        f"CIRCL CVE Search returned enrichment data for **{enriched}** CVE(s). "
+                        "No active GreyNoise exploitation signals detected at time of scan."
+                    )
+                lines.append("")
+
         lines.append("## Threat Map")
         lines.append(_format_threat_map(rows))
         lines.append("")
@@ -2268,7 +2698,6 @@ def build_executive_report_markdown(all_rows: List[Dict[str, Any]], report_title
         lines.append(_format_scenarios(rows, software_name, limit=5))
         lines.append("")
 
-        lines.append("## Mitigations")
         lines.append(_format_mitigations(rows, limit=10))
         lines.append("")
         lines.append("---")
@@ -2287,7 +2716,7 @@ def build_executive_report_markdown(all_rows: List[Dict[str, Any]], report_title
         logo_b64=logo_b64,
     )
 
-def build_technical_report_markdown(all_rows: List[Dict[str, Any]], report_title: str = "Draugr Technical Threat Intelligence Report") -> str:
+def build_technical_report_markdown(all_rows: List[Dict[str, Any]], report_title: str = "Technical Threat Intelligence Report") -> str:
     """
     Build a markdown technical report grouped by software.
     Expects the flattened rows created by ScanWorker.
@@ -2335,7 +2764,6 @@ def build_technical_report_markdown(all_rows: List[Dict[str, Any]], report_title
         lines.append(_format_scenarios(rows, software_name, limit=0))
         lines.append("")
 
-        lines.append("## Mitigations")
         lines.append(_format_mitigations(rows, limit=0))
         lines.append("")
         lines.append("---")
@@ -2353,6 +2781,1000 @@ def build_technical_report_markdown(all_rows: List[Dict[str, Any]], report_title
         logo_b64=logo_b64,
         subtitle="All Vulnerability Findings",
     )
+# ======================================================================
+#  DEFENSIVE REPORT  – SOC / IT implementation guide
+# ======================================================================
+
+# Step-by-step implementation guidance for common D3FEND countermeasures
+_D3FEND_IMPL: Dict[str, List[str]] = {
+    "Application Hardening": [
+        "Audit all installed application versions against the vendor's supported-version matrix.",
+        "Apply vendor security patches within the SLA defined in your patch management policy (recommended: Critical ≤ 24 h, High ≤ 72 h).",
+        "Enable compiler/linker hardening flags (DEP, ASLR, stack canaries) where vendor build options permit.",
+        "Disable unused features, modules, and services within the application.",
+        "Review and restrict application file-system and network permissions to the minimum required.",
+    ],
+    "Network Traffic Filtering": [
+        "Review firewall / ACL rules and ensure the affected service is not reachable from untrusted networks.",
+        "Implement egress filtering to prevent outbound C2 connections from the affected host.",
+        "Deploy or update IDS/IPS signatures for CVEs identified in this scan.",
+        "Segment the network so the affected service sits in a dedicated VLAN with limited lateral-movement paths.",
+        "Enable logging on all perimeter and internal firewall rules touching the affected service.",
+    ],
+    "Credential Hardening": [
+        "Rotate all service-account and administrative credentials for affected software.",
+        "Enforce multi-factor authentication on all privileged accounts that access the affected service.",
+        "Audit and remove stale, default, or shared credentials from the affected system.",
+        "Implement a privileged access workstation (PAW) policy for administrative access.",
+        "Store secrets in a vault solution (e.g., HashiCorp Vault, CyberArk) rather than config files.",
+    ],
+    "Execution Isolation": [
+        "Run the affected service in a dedicated container or VM to limit blast radius.",
+        "Apply AppArmor / SELinux mandatory-access-control profiles to the service process.",
+        "Restrict script interpreter access (PowerShell, bash, Python) on the host to authorised users only.",
+        "Implement application-whitelisting so only signed binaries may execute on the affected host.",
+        "Review and tighten OS-level user rights assignments for the service account.",
+    ],
+    "File Analysis": [
+        "Deploy endpoint detection and response (EDR) with memory-scanning and behavioural analysis on the affected host.",
+        "Enable file-integrity monitoring (FIM) on directories written to by the affected service.",
+        "Configure real-time anti-malware scanning for all paths the service reads from or writes to.",
+        "Review recently modified files in service directories for signs of webshells or backdoors.",
+        "Set up automated daily hash-comparison of critical application binaries.",
+    ],
+    "System Call Analysis": [
+        "Enable kernel-level audit logging (auditd / Windows Event Forwarding) for the service process.",
+        "Deploy a host-based IDS with syscall-level monitoring (e.g., Falco, Sysdig).",
+        "Alert on anomalous process-creation chains (e.g., web server spawning cmd.exe or bash).",
+        "Review seccomp profiles for containerised workloads and restrict unnecessary syscalls.",
+        "Correlate syscall alerts with SIEM to detect exploitation attempts in near-real-time.",
+    ],
+    "User Behavior Analysis": [
+        "Baseline normal login times and source IPs for accounts that access the affected service.",
+        "Alert on off-hours or geographically anomalous logins.",
+        "Enable UEBA / SIEM correlation rules for privilege escalation patterns.",
+        "Audit group-membership changes for privileged groups related to the service.",
+        "Implement session recording for all privileged access to the affected system.",
+    ],
+    "Software Update": [
+        "Subscribe to the vendor's security advisory mailing list / RSS feed for the affected product.",
+        "Test the latest vendor patch in a staging environment before production deployment.",
+        "Deploy the patch using your organisation's change-management process; document rollback steps.",
+        "Verify the patched version is active post-deployment (check binary version or package metadata).",
+        "Re-run this CVE scan against the patched version to confirm remediation.",
+    ],
+    "Decoy Environment": [
+        "Deploy a honeypot instance of the affected service to detect active exploitation attempts.",
+        "Instrument the honeypot with alerting to a SIEM channel monitored 24/7.",
+        "Use deception tokens (fake credentials, API keys) in configuration files to detect data theft.",
+        "Review honeypot logs weekly for reconnaissance or exploitation traffic patterns.",
+    ],
+    "Platform Monitoring": [
+        "Ensure the affected host forwards all security-relevant events to your SIEM.",
+        "Create detection rules for indicators of compromise (IoCs) associated with the CVEs in this report.",
+        "Review platform monitoring coverage gaps identified by the MITRE ATT&CK coverage assessment.",
+        "Schedule quarterly threat-hunt exercises targeting the ATT&CK techniques in this report.",
+        "Integrate CVE threat-intel feeds so new exploit publications auto-create SIEM alerts.",
+    ],
+}
+
+# Fallback generic steps when a D3FEND term has no specific guidance
+_D3FEND_GENERIC = [
+    "Review the D3FEND knowledge base at https://d3fend.mitre.org for implementation detail.",
+    "Work with your security team to assess applicability and deployment complexity.",
+    "Pilot the control in a non-production environment before broad rollout.",
+    "Document the control in your security baseline and track compliance.",
+]
+
+# Concise implementation notes for NIST SP 800-53 controls relevant to CVEs
+_NIST_IMPL: Dict[str, str] = {
+    "SI-2":  "Flaw Remediation — establish a patch SLA, track open CVEs in your ITSM tool, and verify remediation.",
+    "SI-3":  "Malicious Code Protection — deploy and maintain EDR/AV on all affected hosts; enable real-time scanning.",
+    "SI-4":  "System Monitoring — forward host and application logs to SIEM; create detection rules for this CVE set.",
+    "SI-5":  "Security Alerts — subscribe to vendor advisories; integrate CVE feeds into your ticketing workflow.",
+    "SI-7":  "Software, Firmware, and Information Integrity — enable FIM; verify signatures on software updates.",
+    "SI-10": "Information Input Validation — enforce input sanitisation at all entry points exposed by the affected service.",
+    "SC-5":  "Denial-of-Service Protection — rate-limit APIs; use a WAF or load-balancer with DDoS mitigation.",
+    "SC-7":  "Boundary Protection — review firewall rules; ensure the affected service is not exposed beyond its required boundary.",
+    "SC-8":  "Transmission Confidentiality and Integrity — enforce TLS 1.2+ on all connections to the affected service.",
+    "SC-28": "Protection of Information at Rest — encrypt sensitive data at rest on the affected host.",
+    "AC-3":  "Access Enforcement — enforce least-privilege on all accounts accessing the affected service.",
+    "AC-6":  "Least Privilege — audit and trim service-account permissions; remove admin rights where unnecessary.",
+    "AC-17": "Remote Access — restrict remote-access paths to the affected service; require MFA.",
+    "IA-2":  "Identification and Authentication — enforce MFA for all privileged accounts; disable shared accounts.",
+    "IA-5":  "Authenticator Management — rotate credentials; enforce complexity and expiry policies.",
+    "AU-2":  "Event Logging — confirm all relevant audit events are enabled and forwarded to your SIEM.",
+    "AU-9":  "Protection of Audit Information — restrict write access to audit logs; alert on log tampering.",
+    "CM-6":  "Configuration Settings — apply CIS Benchmark hardening for the affected software/OS.",
+    "CM-7":  "Least Functionality — disable unused services, ports, and features on the affected host.",
+    "CM-8":  "System Component Inventory — update your CMDB to reflect the affected software and current version.",
+    "RA-5":  "Vulnerability Monitoring and Scanning — schedule recurring scans against the affected system; track findings in ITSM.",
+    "CA-7":  "Continuous Monitoring — integrate this asset into your continuous-monitoring programme.",
+    "IR-4":  "Incident Handling — ensure runbooks exist for exploitation of the CVE types found in this scan.",
+    "SA-11": "Developer Testing and Evaluation — include CVE regression tests in your CI/CD pipeline for this software.",
+}
+
+
+def _defensive_patch_table(rows: List[Dict[str, Any]]) -> str:
+    """Build a patch-tracking table: one row per unique software item."""
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        key = (str(r.get("Software Name", "")).strip(), str(r.get("Software Version", "")).strip())
+        grouped[key].append(r)
+
+    lines = [
+        "| Software | Version | Critical | High | KEV | Public Exploit | Overall Risk | Action |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for (name, ver), sw_rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
+        crit  = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+        high  = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+        kev   = sum(1 for r in sw_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+        expl  = sum(1 for r in sw_rows if str(r.get("Public Exploit","")).upper() == "YES")
+        max_rs = max((_to_float(r.get("Risk Score", 0)) for r in sw_rows), default=0.0)
+        risk_level = sw_rows[0].get("Risk Level", "INFO") if sw_rows else "INFO"
+        action = "PATCH IMMEDIATELY" if (kev or crit) else ("PATCH URGENTLY" if high else "SCHEDULE PATCH")
+        lines.append(f"| {name} | {ver} | {crit} | {high} | {kev} | {expl} | {max_rs:.1f} ({risk_level}) | {action} |")
+    return "\n".join(lines)
+
+
+def _defensive_immediate_actions(rows: List[Dict[str, Any]]) -> str:
+    """
+    List CVEs needing immediate attention: KEV-listed, public exploits, or
+    actively observed in the wild via GreyNoise threat intelligence.
+    """
+    def _is_greynoise_active(cve_id: str) -> bool:
+        return _THREAT_INTEL_CACHE.get(cve_id, {}).get("greynoise", {}).get("noise", False)
+
+    urgent = [
+        r for r in rows
+        if str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+        or str(r.get("Public Exploit","")).upper() == "YES"
+        or _is_greynoise_active(r.get("CVE ID",""))
+    ]
+    urgent.sort(key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
+
+    if not urgent:
+        return "No CVEs in this scan are currently listed in the CISA KEV catalog, have confirmed public exploit code, or show active in-the-wild exploitation signals."
+
+    lines: List[str] = []
+    for r in urgent[:20]:
+        cid   = r.get("CVE ID", "")
+        name  = r.get("Software Name", "")
+        ver   = r.get("Software Version", "")
+        kev   = str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+        expl  = str(r.get("Public Exploit","")).upper() == "YES"
+        gn_active = _is_greynoise_active(cid)
+        score = r.get("CVSS Base Score", "N/A")
+        sev   = r.get("CVSS Severity", "")
+        flags = []
+        if kev:       flags.append("**KEV-LISTED**")
+        if expl:      flags.append("**PUBLIC EXPLOIT**")
+        if gn_active: flags.append("**ACTIVE IN-THE-WILD (GreyNoise)**")
+        lines.append(f"### {cid}  —  {name} {ver}")
+        lines.append(f"- CVSS: {score} ({sev})  |  Flags: {', '.join(flags)}")
+        lines.append(f"- Exploit Sources: {r.get('Exploit Sources','') or 'See NVD'}")
+        if gn_active:
+            lines.append("- GreyNoise: Active exploitation traffic observed — treat as confirmed in-the-wild risk")
+        lines.append(f"- NVD: {r.get('NVD URL','')}")
+        lines.append("")
+        lines.append("**Required actions (complete within 24–72 hours):**")
+        lines.append("1. Confirm whether this software version is deployed in production.")
+        lines.append("2. Apply the vendor patch — check the NVD link above for vendor advisory.")
+        lines.append("3. If a patch is unavailable, apply compensating controls (WAF rule, network isolation, or disable the feature).")
+        lines.append("4. Verify remediation by re-scanning or reviewing the patched version string.")
+        lines.append("5. File an incident ticket and document the remediation timeline.")
+        if kev:
+            lines.append("6. CISA BOD 22-01 mandates federal agencies remediate KEV entries — confirm your organisation's compliance deadline.")
+        if gn_active and not kev:
+            lines.append("6. Although not KEV-listed, GreyNoise confirms active exploitation traffic — escalate priority to match KEV-level urgency.")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _defensive_control_implementation(rows: List[Dict[str, Any]]) -> str:
+    """
+    For each unique ATT&CK technique found, produce step-by-step
+    implementation guidance covering D3FEND countermeasures and NIST controls.
+    """
+    top = _top_techniques(rows, top_n=10)
+    if not top:
+        return "No ATT&CK technique mappings were found in this scan. Apply vendor patches and refer to the patch table above."
+
+    lines: List[str] = []
+    for rank, (aid, cnt, meta) in enumerate(top, 1):
+        tname   = meta.get("name", aid)
+        tactics = ", ".join(meta.get("tactics", [])) or "Unknown"
+        d3fend  = meta.get("d3fend", [])
+        nist    = meta.get("nist", [])
+
+        lines.append(f"## {rank}. {tname} ({aid})")
+        lines.append(f"- **Observed in:** {cnt} CVE{'s' if cnt != 1 else ''} in this scan")
+        lines.append(f"- **ATT&CK Tactics:** {tactics}")
+        lines.append(f"- **ATT&CK Reference:** https://attack.mitre.org/techniques/{aid.replace('.','/')}/")
+        lines.append("")
+
+        # D3FEND implementation steps
+        if d3fend:
+            lines.append("### D3FEND Countermeasures — Implementation Steps")
+            for cm in d3fend:
+                steps = _D3FEND_IMPL.get(cm)
+                if not steps:
+                    # Try partial / case-insensitive match
+                    for key, val in _D3FEND_IMPL.items():
+                        if key.lower() in cm.lower() or cm.lower() in key.lower():
+                            steps = val
+                            break
+                if not steps:
+                    steps = _D3FEND_GENERIC
+                lines.append(f"**{cm}**")
+                for i, step in enumerate(steps, 1):
+                    lines.append(f"{i}. {step}")
+                lines.append(f"- D3FEND reference: https://d3fend.mitre.org/technique/d3f:{cm.replace(' ','-')}/")
+                lines.append("")
+        else:
+            lines.append("### D3FEND Countermeasures")
+            lines.append("- No specific D3FEND mappings available for this technique. Refer to https://d3fend.mitre.org for manual lookup.")
+            lines.append("")
+
+        # NIST control implementation notes
+        if nist:
+            lines.append("### NIST SP 800-53 Control Implementation")
+            lines.append("| Control | Description | Implementation Note |")
+            lines.append("|---|---|---|")
+            for ctrl in nist:
+                # Extract control family (e.g. "SI-2" from "SI-2 Flaw Remediation")
+                ctrl_id = ctrl.split()[0] if ctrl.split() else ctrl
+                note = _NIST_IMPL.get(ctrl_id, "Review NIST SP 800-53 Rev 5 for full implementation guidance.")
+                lines.append(f"| {ctrl_id} | {ctrl} | {note} |")
+            lines.append("")
+        else:
+            lines.append("### NIST SP 800-53 Controls")
+            lines.append("- No NIST control mappings available for this technique.")
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _defensive_monitoring_checklist(rows: List[Dict[str, Any]]) -> str:
+    """Generate a SOC monitoring and validation checklist."""
+    techniques = {t for r in rows for t in _split_multi(r.get("ATT&CK Techniques",""))}
+    kev_count  = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+    expl_count = sum(1 for r in rows if str(r.get("Public Exploit","")).upper() == "YES")
+
+    lines = [
+        "The following checklist should be completed by the SOC and IT security team after applying the controls above.",
+        "",
+        "**Patch Verification**",
+        "- [ ] All PATCH IMMEDIATELY items in the patch table have been remediated.",
+        "- [ ] All PATCH URGENTLY items have been scheduled with a defined completion date.",
+        "- [ ] Patched versions have been re-scanned or version strings verified.",
+        "- [ ] CMDB / asset inventory updated to reflect new software versions.",
+        "",
+        "**Detection Engineering**",
+        "- [ ] SIEM rules created or updated to detect exploitation of CVEs in this report.",
+        "- [ ] IDS/IPS signatures updated with CVE-specific indicators.",
+        "- [ ] EDR policies reviewed and exclusions audited for affected host paths.",
+    ]
+
+    if kev_count:
+        lines += [
+            "",
+            "**CISA KEV Compliance**",
+            f"- [ ] All {kev_count} KEV-listed CVE(s) confirmed remediated.",
+            "- [ ] Remediation evidence (ticket number / change record) filed for compliance records.",
+            "- [ ] CISA BOD 22-01 deadline confirmed with CISO (federal organisations).",
+        ]
+
+    if expl_count:
+        lines += [
+            "",
+            "**Active Exploitation Monitoring**",
+            f"- [ ] Threat-hunt exercise completed targeting the {expl_count} CVE(s) with public exploits.",
+            "- [ ] Logs reviewed for IoCs associated with the exploit code identified in this report.",
+            "- [ ] Incident response runbook updated or created for the exploit scenarios above.",
+        ]
+
+    lines += [
+        "",
+        "**Access & Credential Hygiene**",
+        "- [ ] Service-account credentials rotated for all affected software.",
+        "- [ ] Privileged-account access audited and excess permissions removed.",
+        "- [ ] MFA enforced on all administrative interfaces for affected systems.",
+        "",
+        "**Ongoing Programme**",
+        "- [ ] Next scheduled vulnerability scan date confirmed.",
+        "- [ ] Vendor advisory subscription confirmed for all software in this scan.",
+        "- [ ] ATT&CK-mapped detection coverage reviewed in your SIEM/SOAR platform.",
+        "- [ ] Red-team / purple-team exercise scheduled to validate control effectiveness.",
+    ]
+
+    if techniques:
+        lines += ["", "**ATT&CK Coverage Validation**"]
+        for t in sorted(techniques)[:10]:
+            lines.append(f"- [ ] Detection rule validated for: {t}")
+
+    return "\n".join(lines)
+
+
+def build_defensive_report(
+    all_rows: List[Dict[str, Any]],
+    report_title: str = "Defensive Implementation Report",
+) -> str:
+    """
+    Build a SOC/IT-ready defensive report with step-by-step control
+    implementation guidance derived from the scan findings.
+    """
+    logo_b64 = _load_logo_b64()
+
+    # Date header
+    import datetime
+    scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Aggregate stats
+    total_cves = len(all_rows)
+    software_set = {str(r.get("Software Name","")).strip() for r in all_rows if r.get("Software Name")}
+    kev_total  = sum(1 for r in all_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+    expl_total = sum(1 for r in all_rows if str(r.get("Public Exploit","")).upper() == "YES")
+    crit_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+    high_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+
+    lines: List[str] = [
+        "## Defensive Report — Purpose and Scope",
+        "",
+        "This report is intended for SOC analysts, IT security engineers, and system administrators. "
+        "It translates the raw vulnerability data from this Draugr scan into actionable, prioritised "
+        "implementation steps. Each section maps directly to the ATT&CK techniques, D3FEND countermeasures, "
+        "and NIST SP 800-53 controls identified during the scan.",
+        "",
+        f"- Scan date: {scan_date}",
+        f"- Software items scanned: {len(software_set)}",
+        f"- Total CVEs identified: {total_cves}",
+        f"- Critical: {crit_total}  |  High: {high_total}",
+        f"- CISA KEV-listed: {kev_total}",
+        f"- CVEs with public exploit code: {expl_total}",
+        "",
+        "---",
+        "",
+        "# Section 1 — Immediate Actions Required",
+        "",
+        "The following CVEs require remediation within 24–72 hours. They are either listed in the "
+        "CISA Known Exploited Vulnerabilities (KEV) catalog, have publicly available exploit code, or both.",
+        "",
+        _defensive_immediate_actions(all_rows),
+        "",
+        "---",
+        "",
+        "# Section 2 — Patch Tracking Table",
+        "",
+        "Use this table to track patch status across all scanned software. Assign each row as a ticket "
+        "in your ITSM system and update status as patches are applied.",
+        "",
+        _defensive_patch_table(all_rows),
+        "",
+        "---",
+        "",
+        "# Section 3 — Control Implementation Guide",
+        "",
+        "The following section provides step-by-step implementation guidance for each ATT&CK technique "
+        "identified in this scan, ranked by frequency of occurrence. Each entry includes D3FEND "
+        "countermeasure implementation steps and NIST SP 800-53 control notes.",
+        "",
+        _defensive_control_implementation(all_rows),
+        "",
+        "---",
+        "",
+        "# Section 4 — SOC Monitoring and Validation Checklist",
+        "",
+        "Complete this checklist after applying the controls above. Use it as evidence of remediation "
+        "for audit, compliance, or incident response purposes.",
+        "",
+        _defensive_monitoring_checklist(all_rows),
+        "",
+    ]
+
+    body_md = "\n".join(lines)
+    return _wrap_html_report(
+        title=report_title,
+        body_md=body_md,
+        logo_b64=logo_b64,
+        subtitle="SOC & IT Implementation Guide",
+    )
+
+
+# ======================================================================
+#  RED TEAM REPORT  – Target prioritisation and exploitation paths
+# ======================================================================
+
+def _redteam_target_score(sw_rows: List[Dict[str, Any]]) -> float:
+    """
+    Compute a composite 'target attractiveness' score for a software item.
+
+    Model: best single CVE risk score as the base, then software-level
+    bonuses for exploitation readiness and severity depth.
+
+    Base (0–100):
+        Highest individual CVE risk score.
+
+    Flat bonuses:
+        +25  any KEV-listed CVE (active exploitation documented)
+        +22  any CVE has active GreyNoise exploitation traffic (confirmed live threat)
+        +20  any CVE has public exploit code
+        +15  any version-confirmed Critical CVE exists
+        +10  any version-confirmed High CVE exists (if no confirmed Critical)
+        +5   per additional KEV beyond the first (capped at 3 extras → +15 max)
+        +3   per additional GreyNoise-active CVE beyond the first (capped at +9 max)
+
+    EPSS bonus (0–15):
+        Highest single EPSS score × 15
+
+    Critical/High count bonus (capped at +10):
+        +1 per Critical CVE, +0.5 per High CVE, max 10 points
+
+    Rationale for GreyNoise placement:
+        GreyNoise active (+22) sits between KEV (+25) and public exploit (+20).
+        KEV is the gold standard — it requires CISA confirmation of active exploitation.
+        GreyNoise active is real observed traffic but not formally catalogued, so it
+        ranks just below KEV. A public exploit sitting on ExploitDB but not yet being
+        fired in the wild is ranked lower than both.
+    """
+    if not sw_rows:
+        return 0.0
+
+    # --- Base: highest single CVE risk score ---
+    base = max(_to_float(r.get("Risk Score", 0)) for r in sw_rows)
+
+    # --- Software-level flags ---
+    kev_count  = sum(1 for r in sw_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+    has_exploit = any(str(r.get("Public Exploit","")).upper() == "YES" for r in sw_rows)
+    crit_confirmed = any(
+        str(r.get("CVSS Severity","")).upper() == "CRITICAL"
+        and str(r.get("Version Confirmed","")).upper() == "YES"
+        for r in sw_rows
+    )
+    high_confirmed = any(
+        str(r.get("CVSS Severity","")).upper() == "HIGH"
+        and str(r.get("Version Confirmed","")).upper() == "YES"
+        for r in sw_rows
+    )
+    best_epss  = max((_epss_float(r.get("EPSS Score", 0)) for r in sw_rows), default=0.0)
+    crit_count = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+    high_count = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+
+    # --- GreyNoise active exploitation count ---
+    gn_active_count = sum(
+        1 for r in sw_rows
+        if _THREAT_INTEL_CACHE.get(r.get("CVE ID",""), {}).get("greynoise", {}).get("noise")
+    )
+
+    # --- Bonuses ---
+    bonus = 0.0
+    if kev_count:
+        bonus += 25
+        bonus += min((kev_count - 1) * 5, 15)      # +5 per extra KEV, capped at +15
+    if gn_active_count:
+        bonus += 22
+        bonus += min((gn_active_count - 1) * 3, 9) # +3 per extra GN-active, capped at +9
+    if has_exploit:
+        bonus += 20
+    if crit_confirmed:
+        bonus += 15
+    elif high_confirmed:
+        bonus += 10
+    bonus += best_epss * 15
+    bonus += min(crit_count * 1.0 + high_count * 0.5, 10)
+
+    return round(base + bonus, 1)
+
+
+def _redteam_target_table(all_rows: List[Dict[str, Any]]) -> str:
+    """Ranked table of software targets by exploitability score."""
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for r in all_rows:
+        key = (str(r.get("Software Name","")).strip(), str(r.get("Software Version","")).strip())
+        grouped[key].append(r)
+
+    ranked = sorted(
+        grouped.items(),
+        key=lambda kv: _redteam_target_score(kv[1]),
+        reverse=True,
+    )
+
+    lines = [
+        "| Rank | Software | Version | Target Score | CVEs | Critical | KEV | GN Active | Public Exploits | Highest EPSS | Confirmed |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for rank, ((name, ver), sw_rows) in enumerate(ranked, 1):
+        ts    = _redteam_target_score(sw_rows)
+        total = len(sw_rows)
+        crit  = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+        kev   = sum(1 for r in sw_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+        expl  = sum(1 for r in sw_rows if str(r.get("Public Exploit","")).upper() == "YES")
+        conf  = sum(1 for r in sw_rows if str(r.get("Version Confirmed","")).upper() == "YES")
+        epss  = max((_epss_float(r.get("EPSS Score", 0)) for r in sw_rows), default=0.0)
+        gn    = sum(1 for r in sw_rows
+                    if _THREAT_INTEL_CACHE.get(r.get("CVE ID",""), {}).get("greynoise", {}).get("noise"))
+        gn_str = f"⚠ {gn}" if gn else "—"
+        lines.append(f"| {rank} | {name} | {ver} | {ts:.1f} | {total} | {crit} | {kev} | {gn_str} | {expl} | {epss:.3f} | {conf} |")
+    return "\n".join(lines)
+
+
+def _redteam_attack_chains(all_rows: List[Dict[str, Any]], otx_results: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Per-target: entry vectors, ATT&CK kill-chain mapping, OTX intel,
+    and recommended exploitation approach.
+    """
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for r in all_rows:
+        key = (str(r.get("Software Name","")).strip(), str(r.get("Software Version","")).strip())
+        grouped[key].append(r)
+
+    ranked = sorted(
+        grouped.items(),
+        key=lambda kv: _redteam_target_score(kv[1]),
+        reverse=True,
+    )
+
+    lines: List[str] = []
+    for rank, ((name, ver), sw_rows) in enumerate(ranked, 1):
+        sw_rows_sorted = sorted(sw_rows, key=lambda r: _to_float(r.get("Risk Score",0)), reverse=True)
+        ts     = _redteam_target_score(sw_rows)
+        crit   = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+        high   = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+        kev    = sum(1 for r in sw_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+        expl_rows = [r for r in sw_rows if str(r.get("Public Exploit","")).upper() == "YES"]
+
+        lines.append(f"## Target {rank}: {name} {ver}  (Score: {ts:.1f})")
+        lines.append("")
+        lines.append(f"- **Total CVEs:** {len(sw_rows)}  |  Critical: {crit}  |  High: {high}")
+        lines.append(f"- **KEV-listed CVEs:** {kev}")
+        lines.append(f"- **CVEs with public exploit code:** {len(expl_rows)}")
+        lines.append("")
+
+        # Entry vectors — highest-risk CVEs with exploits or KEV
+        priority_cves = [
+            r for r in sw_rows_sorted
+            if str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+            or str(r.get("Public Exploit","")).upper() == "YES"
+        ][:5]
+        if not priority_cves:
+            priority_cves = sw_rows_sorted[:3]
+
+        lines.append("### Recommended Entry Vectors")
+        for r in priority_cves:
+            cid   = r.get("CVE ID","")
+            score = r.get("CVSS Base Score","N/A")
+            sev   = r.get("CVSS Severity","")
+            rs    = r.get("Risk Score","")
+            conf  = r.get("Version Confirmed","")
+            kev_f = str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+            expl_f= str(r.get("Public Exploit","")).upper() == "YES"
+            epss  = _epss_float(r.get("EPSS Score", 0))
+            src   = r.get("Exploit Sources","") or "None identified"
+            desc  = str(r.get("Description","") or "").strip()
+            flags = []
+            if kev_f:  flags.append("KEV")
+            if expl_f: flags.append("PUBLIC EXPLOIT")
+            if conf.upper() == "YES": flags.append("VERSION CONFIRMED")
+            flag_str = " | ".join(flags) if flags else "Standard CVE"
+
+            lines.append(f"#### {cid}  [{flag_str}]")
+            lines.append(f"- CVSS: {score} ({sev})  |  Risk Score: {rs}  |  EPSS: {epss:.3f}")
+            lines.append(f"- Exploit Sources: {src}")
+            lines.append(f"- Brief: {desc}")
+            lines.append(f"- NVD: {r.get('NVD URL','')}")
+            lines.append("")
+
+        # ATT&CK kill-chain summary for this target
+        technique_counter: Counter = Counter()
+        tactic_set: set = set()
+        for r in sw_rows:
+            for t in _split_multi(r.get("ATT&CK Techniques","")):
+                technique_counter[t] += 1
+            for tac in _split_multi(r.get("ATT&CK Tactics","")):
+                tactic_set.add(tac)
+
+        if technique_counter:
+            lines.append("### ATT&CK Kill-Chain Coverage")
+            if tactic_set:
+                lines.append(f"- **Tactics covered:** {', '.join(sorted(tactic_set))}")
+            lines.append("")
+            lines.append("| Technique | Count | ATT&CK Link |")
+            lines.append("|---|---|---|")
+            for tech, cnt in technique_counter.most_common(10):
+                m = re.match(r"^([A-Z0-9.]+)", tech)
+                tid = m.group(1) if m else ""
+                url = f"https://attack.mitre.org/techniques/{tid.replace('.','/')}/" if tid else ""
+                lines.append(f"| {tech} | {cnt} | {url} |")
+            lines.append("")
+
+        # CWE exposure classes
+        cwe_counter: Counter = Counter()
+        for r in sw_rows:
+            for c in _split_multi(r.get("CWE","")):
+                cwe_counter[c] += 1
+        if cwe_counter:
+            lines.append("### Vulnerability Classes (CWE)")
+            for cwe, cnt in cwe_counter.most_common(5):
+                lines.append(f"- {cwe}  ({cnt} CVEs)")
+            lines.append("")
+
+        # Exploitation notes
+        lines.append("### Operator Notes")
+        if kev:
+            lines.append(f"- This target has **{kev} KEV-listed CVE(s)** — active exploitation in the wild is documented. Existing weaponised tools likely available.")
+        if expl_rows:
+            lines.append(f"- **{len(expl_rows)} CVE(s)** have confirmed public exploit code — check Metasploit, ExploitDB, and Vulners for ready-made modules.")
+        if crit:
+            lines.append(f"- **{crit} Critical CVE(s)** identified — these represent the highest-impact exploitation paths.")
+
+        # OTX per-target block
+        if otx_results:
+            otx_block = _redteam_otx_target_block(name, ver, otx_results, sw_rows_sorted)
+            if otx_block:
+                lines.append("")
+                lines.append(otx_block)
+
+        lines.append("- Review exploit sources in the entry vectors above; confirm applicability to the exact version in scope.")
+        lines.append("- Cross-reference with threat-intelligence for any APT or ransomware group known to target this product.")
+        lines.append(f"- ATT&CK Navigator layer recommended: map the techniques above to assess detection gaps before engagement.")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+
+def _redteam_otx_target_block(
+    software_name: str,
+    software_version: str,
+    otx_results: Dict[str, Any],
+    sw_rows: List[Dict[str, Any]],
+) -> str:
+    """
+    Threat intelligence block for a single red team target (Section 2).
+    Draws from CIRCL CVE Search and GreyNoise Community data stored in
+    _THREAT_INTEL_CACHE, cross-referenced with the scan risk scores.
+    """
+    key = f"{software_name} {software_version}".strip()
+    data = otx_results.get(key)
+    if not data:
+        return ""
+
+    cve_counts = data.get("cve_pulse_counts", {})
+    if not cve_counts:
+        return ""
+
+    lines: List[str] = ["### Threat Intelligence (CIRCL / GreyNoise)"]
+
+    active_cves = {cid: s for cid, s in cve_counts.items()
+                   if _THREAT_INTEL_CACHE.get(cid, {}).get("greynoise", {}).get("noise")}
+
+    if active_cves:
+        lines.append(
+            f"\u26a0 **{len(active_cves)} CVE(s)** affecting **{software_name} {software_version}** "
+            "show active in-the-wild exploitation traffic (GreyNoise)."
+        )
+    lines.append(
+        f"CIRCL CVE Search returned enrichment data for **{len(cve_counts)}** CVE(s) in this target."
+    )
+    lines.append("")
+
+    cve_risk_map = {r.get("CVE ID", ""): r for r in sw_rows}
+    sorted_cves  = sorted(cve_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    lines.append("**CVE Threat Activity (sorted by enrichment score):**")
+    lines.append("")
+    lines.append("| CVE ID | Activity Score | GreyNoise | Risk Score | CVSS | Public Exploit |")
+    lines.append("|---|---|---|---|---|---|")
+    for cve_id, score in sorted_cves:
+        row      = cve_risk_map.get(cve_id, {})
+        rs       = row.get("Risk Score", "\u2014")
+        cvss     = row.get("CVSS Base Score", "\u2014")
+        expl     = "Yes" if str(row.get("Public Exploit","")).upper() == "YES" else "No"
+        gn       = _THREAT_INTEL_CACHE.get(cve_id, {}).get("greynoise", {})
+        gn_label = "\u26a0 Active" if gn.get("noise") else ("Known scanner" if gn.get("riot") else "\u2014")
+        lines.append(f"| {cve_id} | {score} | {gn_label} | {rs} | {cvss} | {expl} |")
+    lines.append("")
+
+    capec_seen: set = set()
+    capec_lines: List[str] = []
+    for cve_id, _ in sorted_cves[:5]:
+        circl = _THREAT_INTEL_CACHE.get(cve_id, {}).get("circl", {})
+        for c in (circl.get("capec") or [])[:2]:
+            cid_str = f"CAPEC-{c.get('id','')} {c.get('name','')}".strip()
+            if cid_str not in capec_seen:
+                capec_seen.add(cid_str)
+                capec_lines.append(f"  - {cid_str} (via {cve_id})")
+    if capec_lines:
+        lines.append("**CAPEC Attack Patterns (from CIRCL enrichment):**")
+        lines.extend(capec_lines)
+        lines.append("")
+
+    if active_cves:
+        lines.append(
+            "> GreyNoise-active CVEs have confirmed scanning/exploitation traffic. "
+            "Weaponised tooling is likely available or in active use — prioritise these as "
+            "primary entry vectors regardless of CVSS score."
+        )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _redteam_otx_environment_summary(
+    all_rows: List[Dict[str, Any]],
+    otx_results: Dict[str, Any],
+) -> str:
+    """
+    Environment-level threat intelligence summary for Section 4 of the red team report.
+    Draws from CIRCL / GreyNoise data collected during the scan.
+    """
+    if not otx_results:
+        return "Threat intelligence was not collected for this scan."
+
+    # Aggregate all CVE enrichment scores across targets
+    all_cve_counts: Dict[str, int] = {}
+    for data in otx_results.values():
+        for cve_id, cnt in data.get("cve_pulse_counts", {}).items():
+            all_cve_counts[cve_id] = all_cve_counts.get(cve_id, 0) + cnt
+
+    if not all_cve_counts:
+        return "No CVE enrichment data was returned from CIRCL or GreyNoise for this scan."
+
+    total_enriched = len(all_cve_counts)
+    active_cves    = [cid for cid in all_cve_counts
+                      if _THREAT_INTEL_CACHE.get(cid, {}).get("greynoise", {}).get("noise")]
+    targets_hit    = len(otx_results)
+
+    lines: List[str] = []
+    lines.append(
+        f"Threat intelligence enrichment covers **{total_enriched}** CVE(s) across "
+        f"**{targets_hit}** scanned software item(s)."
+    )
+    if active_cves:
+        lines.append(
+            f"\u26a0 **{len(active_cves)}** CVE(s) show active in-the-wild exploitation "
+            "traffic via GreyNoise — these are confirmed live threats."
+        )
+    lines.append("")
+
+    # Per-target summary table
+    lines.append("### Software Targets by Threat Activity")
+    lines.append("| Software | CVEs Enriched | GreyNoise Active | Top CVE |")
+    lines.append("|---|---|---|---|")
+    for key, data in sorted(otx_results.items()):
+        cvc = data.get("cve_pulse_counts", {})
+        if not cvc:
+            continue
+        active = sum(1 for cid in cvc
+                     if _THREAT_INTEL_CACHE.get(cid, {}).get("greynoise", {}).get("noise"))
+        top    = max(cvc, key=cvc.get) if cvc else "—"
+        lines.append(f"| {key} | {len(cvc)} | {active} | {top} |")
+    lines.append("")
+
+    # Cross-environment CVE table
+    cve_risk_map  = {r.get("CVE ID", ""): r for r in all_rows}
+    sorted_cves   = sorted(all_cve_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+    lines.append("### Highest-Activity CVEs Across All Targets")
+    lines.append("| CVE ID | Software | Activity Score | GreyNoise | Risk Score | CVSS | KEV | Public Exploit |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for cve_id, score in sorted_cves:
+        row      = cve_risk_map.get(cve_id, {})
+        name     = row.get("Software Name", "\u2014")
+        rs       = row.get("Risk Score", "\u2014")
+        cvss     = row.get("CVSS Base Score", "\u2014")
+        kev      = "Yes" if str(row.get("Known Exploited Vulnerability","")).upper() == "YES" else "No"
+        expl     = "Yes" if str(row.get("Public Exploit","")).upper() == "YES" else "No"
+        gn       = _THREAT_INTEL_CACHE.get(cve_id, {}).get("greynoise", {})
+        gn_label = "\u26a0 Active" if gn.get("noise") else ("Scanner" if gn.get("riot") else "\u2014")
+        lines.append(f"| {cve_id} | {name} | {score} | {gn_label} | {rs} | {cvss} | {kev} | {expl} |")
+    lines.append("")
+    lines.append(
+        "> CVEs with active GreyNoise signals or high enrichment scores represent confirmed "
+        "threat-actor interest. Prioritise these as primary entry vectors — exploitation "
+        "infrastructure may already be deployed in the wild."
+    )
+    lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _redteam_exploit_inventory(all_rows: List[Dict[str, Any]]) -> str:
+    """Consolidated table of all CVEs with confirmed exploit code or KEV status."""
+    exploit_rows = [
+        r for r in all_rows
+        if str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+        or str(r.get("Public Exploit","")).upper() == "YES"
+    ]
+    exploit_rows.sort(key=lambda r: _to_float(r.get("Risk Score",0)), reverse=True)
+
+    if not exploit_rows:
+        return "No CVEs with confirmed public exploit code or KEV status were found in this scan."
+
+    lines = [
+        "| CVE ID | Software | Ver | CVSS | EPSS | KEV | Exploit Sources | Risk Score | Confirmed |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in exploit_rows:
+        cid   = r.get("CVE ID","")
+        name  = r.get("Software Name","")
+        ver   = r.get("Software Version","")
+        cvss  = r.get("CVSS Base Score","")
+        epss  = f"{_epss_float(r.get('EPSS Score',0)):.3f}"
+        kev   = "YES" if str(r.get("Known Exploited Vulnerability","")).upper() == "YES" else "No"
+        src   = r.get("Exploit Sources","") or "NVD refs"
+        rs    = r.get("Risk Score","")
+        conf  = r.get("Version Confirmed","")
+        lines.append(f"| {cid} | {name} | {ver} | {cvss} | {epss} | {kev} | {src} | {rs} | {conf} |")
+    return "\n".join(lines)
+
+
+def _redteam_high_epss(all_rows: List[Dict[str, Any]]) -> str:
+    """Surface CVEs with the highest EPSS scores — statistically most likely to be exploited."""
+    scored = [r for r in all_rows if _epss_float(r.get("EPSS Score", 0)) > 0]
+    scored.sort(key=lambda r: _epss_float(r.get("EPSS Score", 0)), reverse=True)
+    top = scored[:15]
+
+    if not top:
+        return "No EPSS scores were returned for CVEs in this scan."
+
+    lines = [
+        "EPSS (Exploit Prediction Scoring System) estimates the probability that a CVE will be exploited in the wild within the next 30 days. "
+        "CVEs below have the highest exploitation probability in this scan.",
+        "",
+        "| CVE ID | Software | EPSS Score | EPSS %ile | CVSS | KEV | Public Exploit | NVD |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for r in top:
+        cid   = r.get("CVE ID","")
+        name  = r.get("Software Name","")
+        epss  = _epss_float(r.get("EPSS Score", 0))
+        pctl  = r.get("EPSS Percentile","")
+        cvss  = r.get("CVSS Base Score","")
+        kev   = "YES" if str(r.get("Known Exploited Vulnerability","")).upper() == "YES" else "No"
+        expl  = "YES" if str(r.get("Public Exploit","")).upper() == "YES" else "No"
+        url   = r.get("NVD URL","")
+        lines.append(f"| {cid} | {name} | {epss:.4f} | {pctl} | {cvss} | {kev} | {expl} | {url} |")
+    return "\n".join(lines)
+
+
+def build_redteam_report(
+    all_rows: List[Dict[str, Any]],
+    report_title: str = "Red Team Target Report",
+    otx_results: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Build a red-team-focused report ranking targets by exploitability,
+    mapping ATT&CK kill chains, and inventorying available exploit code.
+    """
+    logo_b64 = _load_logo_b64()
+    otx_results = otx_results or {}
+
+    import datetime
+    scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    software_set = {str(r.get("Software Name","")).strip() for r in all_rows if r.get("Software Name")}
+    kev_total  = sum(1 for r in all_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+    expl_total = sum(1 for r in all_rows if str(r.get("Public Exploit","")).upper() == "YES")
+    crit_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+    high_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+
+    # OTX environment-level stats for header
+    total_otx_pulses = sum(
+        d.get("pulse_count", 0) for d in otx_results.values() if not d.get("error")
+    )
+
+    # Determine overall threat level for the environment
+    if kev_total >= 5 or crit_total >= 10:
+        threat_level = "CRITICAL — Active exploitation risk; multiple high-value targets present."
+    elif kev_total > 0 or expl_total >= 5:
+        threat_level = "HIGH — Confirmed weaponised CVEs present; environment is a viable target."
+    elif crit_total > 0 or high_total >= 5:
+        threat_level = "ELEVATED — Significant attack surface; no confirmed active exploitation."
+    else:
+        threat_level = "MODERATE — Limited exploit exposure identified."
+
+    lines: List[str] = [
+        "# Red Team Report — Purpose and Scope",
+        "",
+        "This report is intended for red team operators, penetration testers, and threat-intelligence "
+        "analysts. It identifies the most attractive targets in the scanned environment, ranks them by "
+        "exploitability, and maps available attack paths using the MITRE ATT&CK framework.",
+        "",
+        "> **HANDLING: RESTRICTED** — This report contains information about exploitable vulnerabilities "
+        "in production systems. Distribute only to authorised personnel.",
+        "",
+        f"- Scan date: {scan_date}",
+        f"- Software items assessed: {len(software_set)}",
+        f"- Total CVEs: {len(all_rows)}  |  Critical: {crit_total}  |  High: {high_total}",
+        f"- KEV-listed (active exploitation documented): {kev_total}",
+        f"- CVEs with public exploit code: {expl_total}",
+        f"- OTX pulses across all targets: {total_otx_pulses}" if otx_results else "",
+        f"- **Overall environment threat level: {threat_level}**",
+        "",
+        "---",
+        "",
+        "# Section 1 — Target Priority Ranking",
+        "",
+        "Targets are ranked by a composite score using the highest single CVE risk score "
+        "as the base, with flat bonuses for KEV status, public exploit availability, "
+        "version-confirmed severity, and EPSS exploitation probability. Volume of CVEs "
+        "does not inflate the score — a target with one KEV-listed critical CVE will "
+        "outscore a target with hundreds of low-quality CVEs.",
+        "",
+        "**Scoring breakdown:** Base = highest CVE risk score (0–100) · +25 any KEV · "
+        "+5 per additional KEV (cap +15) · +20 any public exploit · +15 version-confirmed "
+        "Critical · +10 version-confirmed High · EPSS best × 15 · severity depth bonus (cap +10).",
+        "",
+        _redteam_target_table(all_rows),
+        "",
+        "---",
+        "",
+        "# Section 2 — Per-Target Attack Profiles",
+        "",
+        "Each target is profiled with recommended entry vectors, ATT&CK kill-chain coverage, "
+        "OTX threat intelligence, vulnerability class breakdown, and operator notes.",
+        "",
+        _redteam_attack_chains(all_rows, otx_results=otx_results),
+        "",
+        "---",
+        "",
+        "# Section 3 — Exploit Inventory",
+        "",
+        "All CVEs in this scan that have confirmed public exploit code or are listed in the CISA KEV "
+        "catalog. These represent the most immediately actionable exploitation opportunities.",
+        "",
+        _redteam_exploit_inventory(all_rows),
+        "",
+        "---",
+        "",
+        "# Section 4 — Threat Intelligence Summary",
+        "",
+        "Environment-level view of threat activity from CIRCL CVE Search and GreyNoise Community. "
+        "CVEs with active GreyNoise signals represent confirmed in-the-wild exploitation — "
+        "treat these as highest-priority entry vectors for the engagement.",
+        "",
+        _redteam_otx_environment_summary(all_rows, otx_results),
+        "",
+        "---",
+        "",
+        "# Section 5 — Highest EPSS Probability CVEs",
+        "",
+        _redteam_high_epss(all_rows),
+        "",
+        "---",
+        "",
+        "# Section 6 — Engagement Recommendations",
+        "",
+        "Based on the findings above, the following engagement priorities are recommended:",
+        "",
+        "1. **Begin with KEV-listed and public-exploit CVEs** — these have the lowest technical barrier and highest confidence of exploitation success.",
+        "2. **Target the highest-scoring software items first** (see Section 1) — they offer the best risk/return for initial access.",
+        "3. **Cross-reference OTX pulse data** (Sections 2 and 4) — CVEs and products with high pulse counts have established adversary tooling; these are the most battle-tested entry points.",
+        "4. **Map the ATT&CK techniques identified** in Section 2 to your toolset; look for gaps in defender coverage to exploit.",
+        "5. **Chain vulnerabilities where possible** — privilege-escalation CVEs (T1068) after initial-access CVEs (T1190) are a common and effective pattern.",
+        "6. **Cross-reference with CTI** — search VirusTotal, Shodan, and threat-intel feeds for IoCs related to the KEV entries; determine if the environment is already compromised.",
+        "7. **Validate EPSS top-10 CVEs** (Section 5) — high EPSS scores indicate adversary attention; these may have undisclosed or newly published PoC code.",
+        "8. **Document all findings** in your engagement management platform and align with the Rules of Engagement before exploitation.",
+        "",
+    ]
+
+    body_md = "\n".join(lines)
+    return _wrap_html_report(
+        title=report_title,
+        body_md=body_md,
+        logo_b64=logo_b64,
+        subtitle="Target Prioritization & Attack Path Analysis",
+    )
+
+
 # ----------------------------------------------------------------------
 # Worker thread – performs the heavy lifting
 # ----------------------------------------------------------------------
@@ -2365,7 +3787,8 @@ class ScanWorker(QThread):
 
     def __init__(self, software, kev_path, api_key, output_path, cpe_mapping_path="",
                  show_medium=True, show_low=True, resources_dir="", executive_report_path="", comp_report_path="",
-                 error_log_path="", scan_log_path=""):
+                 error_log_path="", scan_log_path="", write_logs=True,
+                 defensive_report_path="", redteam_report_path="", otx_api_key=""):
         super().__init__()
         self.software = software
         self.kev_path = kev_path
@@ -2379,6 +3802,10 @@ class ScanWorker(QThread):
         self.comp_report_path = comp_report_path
         self.scan_log_path  = scan_log_path
         self.error_log_path = error_log_path
+        self.write_logs = write_logs
+        self.defensive_report_path = defensive_report_path
+        self.redteam_report_path = redteam_report_path
+        self.otx_api_key = otx_api_key
         self._scan_log_lines:  List[str] = []
         self._error_log_lines: List[str] = []
 
@@ -2394,7 +3821,9 @@ class ScanWorker(QThread):
         self.log_signal.emit(msg, level)
 
     def _write_logs(self) -> None:
-        """Write the accumulated log buffers to their files."""
+        """Write the accumulated log buffers to their files (only if write_logs is enabled)."""
+        if not self.write_logs:
+            return
         try:
             # Write the regular scan log
             with open(self.scan_log_path, "w", encoding="utf-8") as f:
@@ -2408,6 +3837,17 @@ class ScanWorker(QThread):
             self.log_signal.emit(f"Failed to write logs: {exc}", "error")
 
     def run(self):
+        # --- API key status ---
+        self._emit_log("── API Key Status ──────────────────────────────", "dim")
+        if self.api_key and self.api_key != NVD_API_KEY:
+            self._emit_log("✔ NVD API Key detected — using manually entered key", "ok")
+        elif NVD_API_KEY:
+            self._emit_log("✔ NVD API Key detected — using key from configuration", "ok")
+        else:
+            self._emit_log("⚠ NVD API Key not set — requests may be rate limited", "warn")
+        self._emit_log("✔ Threat intelligence enabled — CIRCL CVE Search + GreyNoise Community (no key required)", "ok")
+        self._emit_log("────────────────────────────────────────────────", "dim")
+
         # Load CPE mapping overrides
         self.status_signal.emit("Loading CPE mappings…")
         cpe_mappings = load_cpe_mappings(self.cpe_mapping_path or None)
@@ -2447,6 +3887,7 @@ class ScanWorker(QThread):
         self._emit_log("All CVEs will appear in the output report.", "dim")
 
         all_rows: List[Dict[str, Any]] = []
+        otx_intel_results: Dict[str, Any] = {}
         total = len(self.software)
 
         for idx, (name, version) in enumerate(self.software, 1):
@@ -2491,6 +3932,24 @@ class ScanWorker(QThread):
                     f"✔ Vulners returned exploit data for {_plural(len(vulners_map), 'CVE')}.",
                     "ok",
                 )
+
+            # --- Threat intelligence: CIRCL CVE Search + GreyNoise Community ---
+            self.status_signal.emit(f"Scanning: {idx} of {total} — {label} — Enriching: Threat Intel")
+            self._emit_log("Querying CIRCL / GreyNoise for threat intelligence…", "dim")
+            otx_result = query_otx_for_software(name, version, "")
+            otx_cve_counts = query_otx_for_cves(cve_ids[:20], "")
+            otx_result["cve_pulse_counts"] = otx_cve_counts
+            otx_intel_results[f"{name} {version}".strip()] = otx_result
+            active = sum(1 for s in otx_cve_counts.values() if s >= 3)
+            if otx_cve_counts:
+                self._emit_log(
+                    f"✔ Threat intel: {len(otx_cve_counts)} CVE(s) enriched"
+                    + (f", {active} with active exploitation signals" if active else "")
+                    + f" for {label}",
+                    "ok",
+                )
+            else:
+                self._emit_log(f"Threat intel: no enrichment data found for {label}", "dim")
 
             # --- Framework enrichment handled per-CVE via enrich_cve_frameworks() ---
 
@@ -2605,9 +4064,9 @@ class ScanWorker(QThread):
 
                 risk_entries.append((risk_score, risk_label, cid))
 
-                # Track CVEs with public exploits
+                # Track CVEs with public exploits — tag with risk_label, not CVSS severity
                 if has_exploit:
-                    exploit_cves.append((cid, severity, "; ".join(exploit_sources)))
+                    exploit_cves.append((risk_score, cid, risk_label, "; ".join(exploit_sources)))
 
                 # ----- version‑aware logging -----
                 if severity in ("CRITICAL", "HIGH"):
@@ -2642,7 +4101,7 @@ class ScanWorker(QThread):
                 self._emit_log("  ── Top risk CVEs (by weighted score) ──", "dim")
                 for score, rlabel, cid in top:
                     color_level = {
-                        "CRITICAL": "error", "HIGH": "warn", "MEDIUM": "info",
+                        "CRITICAL": "orange", "HIGH": "warn", "MEDIUM": "info",
                     }.get(rlabel, "dim")
                     self._emit_log(
                         f"    {score:5.1f}  [{rlabel}]  {cid}", color_level,
@@ -2650,19 +4109,20 @@ class ScanWorker(QThread):
 
             # 2) Public exploits
             if exploit_cves:
+                exploit_cves.sort(key=lambda x: x[0], reverse=True)
                 self._emit_log(
                     f"  🔓 {_plural(len(exploit_cves), 'CVE')} with public exploits available",
-                    "error",
+                    "orange",
                 )
-                for ecid, eseverity, esources in exploit_cves:
+                for erscore, ecid, erlabel, esources in exploit_cves:
                     self._emit_log(
-                        f"•   \t{ecid}  [{eseverity}] - ({esources})",
-                        "error",
+                        f"•   \t{ecid}  [{erlabel}] - ({esources})",
+                        "orange",
                     )
 
             # 3) Critical / High severity breakdown
             for sev_label, sev_count, confirmed_list, unverified_list, level in [
-                ("CRITICAL", critical_count, c_cves_confirmed, c_cves_unverified, "error"),
+                ("CRITICAL", critical_count, c_cves_confirmed, c_cves_unverified, "orange"),
                 ("HIGH",     high_count,     h_cves_confirmed, h_cves_unverified, "warn"),
             ]:
                 if not sev_count:
@@ -2780,27 +4240,56 @@ class ScanWorker(QThread):
                 self.status_signal.emit("Writing Reports…")
                 exec_report_md = build_executive_report_markdown(
                     all_rows,
-                    report_title="Draugr Threat Intelligence Executive Report",
+                    report_title="Executive Threat Intelligence Report",
+                    otx_results=otx_intel_results,
                 )
                 with open(self.executive_report_path, "w", encoding="utf-8") as mdfile:
                     mdfile.write(exec_report_md)
                 
                 comp_report_md = build_technical_report_markdown(
                     all_rows,
-                    report_title="Draugr Threat Intelligence Technical Report",
+                    report_title="Technical Threat Intelligence Report",
                 )
                 with open(self.comp_report_path, "w", encoding="utf-8") as mdfile:
                     mdfile.write(comp_report_md)
-                self._emit_log(
-                    f"✅ Executive Report written to: {self.executive_report_path}\n✅ Technical Report written to: {self.comp_report_path}",
-                    "ok",
-                )
+
+                if self.defensive_report_path:
+                    defensive_html = build_defensive_report(
+                        all_rows,
+                        report_title="Defensive Implementation Report",
+                    )
+                    with open(self.defensive_report_path, "w", encoding="utf-8") as f:
+                        f.write(defensive_html)
+
+                if self.redteam_report_path:
+                    redteam_html = build_redteam_report(
+                        all_rows,
+                        report_title="Red Team Target Report",
+                        otx_results=otx_intel_results,
+                    )
+                    with open(self.redteam_report_path, "w", encoding="utf-8") as f:
+                        f.write(redteam_html)
+
+                written = [
+                    f"✅ Executive Report → {self.executive_report_path}",
+                    f"✅ Technical Report → {self.comp_report_path}",
+                ]
+                if self.defensive_report_path:
+                    written.append(f"✅ Defensive Report → {self.defensive_report_path}")
+                if self.redteam_report_path:
+                    written.append(f"✅ Red Team Report  → {self.redteam_report_path}")
+                self._emit_log("\n".join(written), "ok")
 
             if self.executive_report_path:
+                report_names = " + ".join(filter(None, [
+                    os.path.basename(self.output_path),
+                    os.path.basename(self.executive_report_path),
+                    os.path.basename(self.comp_report_path),
+                    os.path.basename(self.defensive_report_path) if self.defensive_report_path else "",
+                    os.path.basename(self.redteam_report_path) if self.redteam_report_path else "",
+                ]))
                 self.status_signal.emit(
-                    f"Complete — {len(all_rows)} CVEs across {total} products → "
-                    f"{os.path.basename(self.output_path)} + {os.path.basename(self.executive_report_path)} + {os.path.basename(self.comp_report_path)}"
-
+                    f"Complete — {len(all_rows)} CVEs across {total} products → {report_names}"
                 )
             else:
                 self.status_signal.emit(
@@ -2820,11 +4309,12 @@ class ScanWorker(QThread):
 class CVEScannerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Draugr — Threat Intelligence System")
+        self.setWindowTitle("Draugr — Threat Intelligence Platform")
         self.setMinimumSize(860, 760)
         self.resize(920, 820)
         self.scanning = False
         self.worker = None
+        self.logging = False
         self._build_ui()
 
     def _build_ui(self):
@@ -2843,7 +4333,7 @@ class CVEScannerWindow(QMainWindow):
         )
         root.addWidget(header)
 
-        subtitle = QLabel("THREAT    INTELLIGENCE    SYSTEM") #  ·  
+        subtitle = QLabel("THREAT  -  INTELLIGENCE  -  PLATFORM") #  ·  
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet(
             f"color: {C.FG_DIM}; font-size: 12px; letter-spacing: 3px; padding-bottom: 16px;"
@@ -2922,13 +4412,19 @@ class CVEScannerWindow(QMainWindow):
         api_layout.addWidget(api_label)
 
         self.api_input = QLineEdit()
-        self.api_input.setPlaceholderText("Optional — will use instead of default key")
+        self.api_input.setPlaceholderText("Optional — will help speed up scans")
         self.api_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_input.setStyleSheet(FileRow.INPUT_STYLE)
         api_layout.addWidget(self.api_input, 1)
 
         self.api_widget.setVisible(False)
         card_layout.addWidget(self.api_widget)
+
+        # OTX API key entry (hidden by default)
+        self.otx_widget = QWidget()
+        otx_layout = QHBoxLayout(self.otx_widget)
+        otx_layout.setContentsMargins(0, 0, 0, 0)
+        otx_layout.setSpacing(8)
 
         root.addWidget(card)
 
@@ -3183,6 +4679,12 @@ class CVEScannerWindow(QMainWindow):
         self._act_api.toggled.connect(lambda on: self.api_widget.setVisible(on))
         settings_menu.addAction(self._act_api)
 
+        self._act_otx = QAction("OTX API Key", self)
+        self._act_otx.setCheckable(True)
+        self._act_otx.setChecked(False)
+        self._act_otx.toggled.connect(lambda on: self.otx_widget.setVisible(on))
+        settings_menu.addAction(self._act_otx)
+
         settings_menu.addSeparator()
 
         self._act_resources = QAction("Enrichment DBs Folder", self)
@@ -3190,6 +4692,13 @@ class CVEScannerWindow(QMainWindow):
         self._act_resources.setChecked(False)
         self._act_resources.toggled.connect(lambda on: self.resources_row.setVisible(on))
         settings_menu.addAction(self._act_resources)
+
+        settings_menu.addSeparator()
+
+        self._act_write_logs = QAction("Write Logs to File", self)
+        self._act_write_logs.setCheckable(True)
+        self._act_write_logs.setChecked(True)
+        settings_menu.addAction(self._act_write_logs)
 
     # --------------------------------------------------------------
     # Helper slots
@@ -3201,6 +4710,7 @@ class CVEScannerWindow(QMainWindow):
             "error": C.RED,
             "info": C.BLUE,
             "dim": C.FG_DIM,
+            "orange": C.ORANGE,
         }
         color = colors.get(level, C.FG)
         safe_msg = html.escape(msg).replace("\n", "<br>")
@@ -3240,18 +4750,31 @@ class CVEScannerWindow(QMainWindow):
         base_dir = Path("results")
         user_dir = Path(self.out_row.text())
         output_dir = Path(base_dir / user_dir).expanduser().resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)          # <-- creates the folder
+        report_dir = Path(output_dir / "reports")
+        log_dir = Path(output_dir / "logs")
+        output_dir.mkdir(parents=True, exist_ok=True)          # <-- creates the parent directory folder
+        report_dir.mkdir(parents=True, exist_ok=True)          # <-- creates reports directory
+        write_logs = self._act_write_logs.isChecked()
+        if write_logs:
+            log_dir.mkdir(parents=True, exist_ok=True)         # <-- creates logging directory
         # Use a fixed CSV name inside the folder (you can change it later)
         
         executive_report_path = ""
         comp_report_path = ""
+        defensive_report_path = ""
+        redteam_report_path = ""
+        error_log_path = ""
+        scan_log_path = ""
         if generate_executive_report:
             out_base = Path(out_path)
-            csv_path = output_dir /str(out_base.with_name(f"{out_base.stem}.csv"))
-            executive_report_path = output_dir /str(out_base.with_name(f"{out_base.stem}_executive_report.html"))
-            comp_report_path = output_dir /str(out_base.with_name(f"{out_base.stem}_technical_report.html"))
-            error_log_path = output_dir /str(out_base.with_name(f"{out_base.stem}_error.log"))
-            scan_log_path = output_dir /str(out_base.with_name(f"{out_base.stem}_scan.log"))
+            csv_path = report_dir /str(out_base.with_name(f"{out_base.stem}.csv"))
+            executive_report_path = report_dir /str(out_base.with_name(f"{out_base.stem}_executive_report.html"))
+            comp_report_path = report_dir /str(out_base.with_name(f"{out_base.stem}_technical_report.html"))
+            defensive_report_path = report_dir /str(out_base.with_name(f"{out_base.stem}_defensive_report.html"))
+            redteam_report_path = report_dir /str(out_base.with_name(f"{out_base.stem}_redteam_report.html"))
+            if write_logs:
+                error_log_path = log_dir /str(out_base.with_name(f"{out_base.stem}_error.log"))
+                scan_log_path = log_dir /str(out_base.with_name(f"{out_base.stem}_scan.log"))
         try:
             software = parse_software_list(sw_path)
         except Exception as exc:
@@ -3271,6 +4794,7 @@ class CVEScannerWindow(QMainWindow):
         kev_path = self.kev_row.text()
         cpe_path = self.cpe_row.text()
         api_key = self.api_input.text().strip()
+        otx_api_key = self.otx_input.text().strip()
         resources_dir = self.resources_row.text()
  
         self._append_log(f"Starting scan of {len(software)} entries …", "info")
@@ -3281,9 +4805,13 @@ class CVEScannerWindow(QMainWindow):
             show_low=self.chk_low.isChecked(),
             resources_dir=resources_dir,
             executive_report_path=executive_report_path,
-            comp_report_path=comp_report_path, 
-            error_log_path=error_log_path, 
-            scan_log_path=scan_log_path
+            comp_report_path=comp_report_path,
+            error_log_path=error_log_path,
+            scan_log_path=scan_log_path,
+            write_logs=write_logs,
+            defensive_report_path=defensive_report_path,
+            redteam_report_path=redteam_report_path,
+            otx_api_key=otx_api_key,
         )
         self.worker.log_signal.connect(self._append_log) 
         self.worker.progress_signal.connect(self._update_progress)
@@ -3438,13 +4966,13 @@ class DraugrSplash(QSplashScreen):
         p.setFont(sub_font)
         p.setPen(QColor(163, 140, 140, 180))
         p.drawText(0, int(H * 0.91), W, 30,
-                   Qt.AlignmentFlag.AlignHCenter, "THREAT INTELLIGENCE SYSTEM")
+                   Qt.AlignmentFlag.AlignHCenter, "THREAT INTELLIGENCE PLATFORM")
 
         ver_font = QFont("Courier New", 9)
         p.setFont(ver_font)
         p.setPen(QColor(85, 30, 30, 200))
         p.drawText(0, H - 22, W - 12, 20,
-                   Qt.AlignmentFlag.AlignRight, "v2.8.2  //  INTERNAL USE ONLY")
+                   Qt.AlignmentFlag.AlignRight, "v3.0.0  //  INTERNAL USE ONLY")
 
     def _overlay_text(self, pm: QPixmap) -> QPixmap:
         W, H = pm.width(), pm.height()
