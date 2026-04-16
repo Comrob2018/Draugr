@@ -3682,7 +3682,7 @@ def build_redteam_report(
         threat_level = "MODERATE — Limited exploit exposure identified."
 
     lines: List[str] = [
-        "# Red Team Report — Purpose and Scope",
+        "## Red Team Report — Purpose and Scope",
         "",
         "This report is intended for red team operators, penetration testers, and threat-intelligence "
         "analysts. It identifies the most attractive targets in the scanned environment, ranks them by "
@@ -3771,7 +3771,7 @@ def build_redteam_report(
         title=report_title,
         body_md=body_md,
         logo_b64=logo_b64,
-        subtitle="Target Prioritization & Attack Path Analysis",
+        subtitle="Target Prioritisation & Attack Path Analysis",
     )
 
 
@@ -4309,7 +4309,7 @@ class ScanWorker(QThread):
 class CVEScannerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Draugr — Threat Intelligence Platform")
+        self.setWindowTitle("Draugr — Threat Intelligence System")
         self.setMinimumSize(860, 760)
         self.resize(920, 820)
         self.scanning = False
@@ -4333,7 +4333,7 @@ class CVEScannerWindow(QMainWindow):
         )
         root.addWidget(header)
 
-        subtitle = QLabel("THREAT  -  INTELLIGENCE  -  PLATFORM") #  ·  
+        subtitle = QLabel("THREAT    INTELLIGENCE    SYSTEM") #  ·  
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet(
             f"color: {C.FG_DIM}; font-size: 12px; letter-spacing: 3px; padding-bottom: 16px;"
@@ -4412,7 +4412,7 @@ class CVEScannerWindow(QMainWindow):
         api_layout.addWidget(api_label)
 
         self.api_input = QLineEdit()
-        self.api_input.setPlaceholderText("Optional — will help speed up scans")
+        self.api_input.setPlaceholderText("Optional — will use instead of default key")
         self.api_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_input.setStyleSheet(FileRow.INPUT_STYLE)
         api_layout.addWidget(self.api_input, 1)
@@ -4425,6 +4425,23 @@ class CVEScannerWindow(QMainWindow):
         otx_layout = QHBoxLayout(self.otx_widget)
         otx_layout.setContentsMargins(0, 0, 0, 0)
         otx_layout.setSpacing(8)
+
+        otx_label = QLabel("OTX API Key ")
+        otx_label.setFixedWidth(120)
+        otx_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        otx_label.setStyleSheet(f"color: {C.FG_DIM}; font-size: 12px; border: none;")
+        otx_layout.addWidget(otx_label)
+
+        self.otx_input = QLineEdit()
+        self.otx_input.setPlaceholderText("Optional — AlienVault OTX API key for threat intelligence")
+        self.otx_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.otx_input.setStyleSheet(FileRow.INPUT_STYLE)
+        if OTX_API_KEY:
+            self.otx_input.setText(OTX_API_KEY)
+        otx_layout.addWidget(self.otx_input, 1)
+
+        self.otx_widget.setVisible(False)
+        card_layout.addWidget(self.otx_widget)
 
         root.addWidget(card)
 
@@ -4966,13 +4983,13 @@ class DraugrSplash(QSplashScreen):
         p.setFont(sub_font)
         p.setPen(QColor(163, 140, 140, 180))
         p.drawText(0, int(H * 0.91), W, 30,
-                   Qt.AlignmentFlag.AlignHCenter, "THREAT INTELLIGENCE PLATFORM")
+                   Qt.AlignmentFlag.AlignHCenter, "THREAT INTELLIGENCE SYSTEM")
 
         ver_font = QFont("Courier New", 9)
         p.setFont(ver_font)
         p.setPen(QColor(85, 30, 30, 200))
         p.drawText(0, H - 22, W - 12, 20,
-                   Qt.AlignmentFlag.AlignRight, "v3.0.0  //  INTERNAL USE ONLY")
+                   Qt.AlignmentFlag.AlignRight, "v2.8.2  //  INTERNAL USE ONLY")
 
     def _overlay_text(self, pm: QPixmap) -> QPixmap:
         W, H = pm.width(), pm.height()
