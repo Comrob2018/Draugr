@@ -2330,18 +2330,18 @@ def _markdown_body_to_html(md: str) -> str:
 
     def escape(s: str) -> str:
         result = h.escape(s)
-        # Restore intentional & in known security framework names
-        result = result.replace("ATT&amp;CK", "ATT&CK")
+        # ATT&CK should display as "ATT&CK" — keep &amp; so it renders correctly in HTML
+        # (html.escape correctly converts & → &amp;, which browsers render as &)
         return result
 
     def inline(s: str) -> str:
         """Apply inline transforms: **bold**, and URL auto-linking."""
         # bold
         s = re.sub(r"\*\*(.+?)\*\*", lambda m: f"<strong>{escape(m.group(1))}</strong>", s)
-        # bare URLs → clickable links
+        # bare URLs → clickable links (open in new tab)
         s = re.sub(
             r"(?<![\"'=])(https?://[^\s<>\"']+)",
-            lambda m: f'<a href="{m.group(1)}">{m.group(1)}</a>',
+            lambda m: f'<a href="{m.group(1)}" target="_blank" rel="noopener noreferrer">{m.group(1)}</a>',
             s,
         )
         return s
@@ -2375,7 +2375,9 @@ def _markdown_body_to_html(md: str) -> str:
             close_table()
             level = len(m.group(1))
             text = escape(m.group(2))
-            out.append(f"<h{level}>{text}</h{level}>")
+            # Build a slug for anchor linking
+            slug = re.sub(r"[^a-z0-9]+", "-", m.group(2).lower()).strip("-")
+            out.append(f'<h{level} id="{slug}">{text}</h{level}>')
             continue
 
         # --- Horizontal rule ---
@@ -2588,11 +2590,12 @@ hr { border: none; border-top: 1px solid #ccc; margin: 28px 0; }
 """
 
 
-def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: str = "") -> str:
+def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: str = "", toc_html: str = "") -> str:
     """
     Convert a markdown report body to a fully self-contained HTML document.
     The logo (if provided as a base64 data URI) is embedded in the page header
     alongside the report title.
+    toc_html: optional pre-built table-of-contents block inserted before body.
     """
     escaped_title = html.escape(title)
     logo_tag = '<img src="C:\\Users\\comro\\Desktop\\Rob\\cyber\\programs\\draugr\\draugr_logo_small.png" alt="Draugr logo">'
@@ -2602,17 +2605,55 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     )
 
     body_html = _markdown_body_to_html(body_md)
+    toc_block = f'<nav class="toc">{toc_html}</nav>' if toc_html else ""
      # assemble final page
     full_html = f"""<!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <title>{escaped_title}</title>
-        <style>{_REPORT_CSS}</style>
+        <style>{_REPORT_CSS}
+.toc {{
+    background: #f0f4f8;
+    border: 1px solid #c0ccd8;
+    border-radius: 4px;
+    padding: 16px 24px;
+    margin: 20px 0 32px;
+    font-size: 12px;
+}}
+.toc h2 {{
+    font-size: 13px;
+    margin-bottom: 10px;
+    border-left: none;
+    padding-left: 0;
+    color: #001f3f;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}}
+.toc ol {{
+    padding-left: 20px;
+    margin: 0;
+}}
+.toc li {{
+    padding: 2px 0;
+    list-style: decimal;
+}}
+.toc li::before {{
+    content: none;
+}}
+.toc a {{
+    color: #004080;
+    text-decoration: none;
+}}
+.toc a:hover {{
+    text-decoration: underline;
+}}
+</style>
     </head>
     <body>
     <div class="report-header">{logo_tag}<div class="report-header-text"><h1>{escaped_title}</h1>{sub_tag}</div></div>
     <div class="content">
+        {toc_block}
         {body_html}
     </div>
     </body>
@@ -2626,9 +2667,9 @@ def build_executive_report_markdown(
     otx_results: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Build a markdown executive report grouped by software.
-    Expects the flattened rows created by ScanWorker.
-    otx_results: { "name version": {pulse_count, pulses, cve_pulse_counts, error} }
+    Executive report: leads with conclusion and implementation guidance,
+    then provides the why (findings summary). Minimal technical detail.
+    All references link to ATT&CK, D3FEND, NIST, NVD.
     """
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in all_rows:
@@ -2636,84 +2677,195 @@ def build_executive_report_markdown(
         grouped[key].append(row)
 
     otx_results = otx_results or {}
-    lines: List[str] = [""]
 
+    # Aggregate stats for the opening conclusion
+    total_cves = len(all_rows)
+    sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for r in all_rows:
+        sev = str(r.get("CVSS Severity","") or "").upper()
+        if sev in sev_counts:
+            sev_counts[sev] += 1
+    kev_total   = sum(1 for r in all_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+    expl_total  = sum(1 for r in all_rows if str(r.get("Public Exploit","")).upper() == "YES")
+    max_risk    = max((_to_float(r.get("Risk Score",0)) for r in all_rows), default=0.0)
+    software_names = sorted({str(r.get("Software Name","")).strip() for r in all_rows if r.get("Software Name")})
+
+    # Top techniques for way-forward section
+    top = _top_techniques(all_rows, top_n=5)
+
+    # TOC
+    sw_toc = "".join(
+        f'<li><a href="#{re.sub(chr(32)+chr(43)+chr(63)+"[^a-z0-9]+", "-", f"{n} {v}".lower()).strip("-")}">'
+        f'{html.escape(n)} {html.escape(v)}</a></li>'
+        for (n, v) in sorted(grouped.keys(), key=lambda x: x[0].lower())
+    )
+    toc_html = (
+        '<h2>Contents</h2><ol>'
+        '<li><a href="#conclusion-and-way-forward">Conclusion &amp; Way Forward</a></li>'
+        '<li><a href="#immediate-implementation-guidance">Immediate Implementation Guidance</a></li>'
+        '<li><a href="#findings-summary-the-why">Findings Summary — The Why</a></li>'
+        f'<li><a href="#software-risk-overview">Software Risk Overview</a><ol>{sw_toc}</ol></li>'
+        '</ol>'
+    )
+
+    lines: List[str] = []
+
+    # ── 1. CONCLUSION & WAY FORWARD (lead) ──────────────────────────────
+    lines += [
+        "## Conclusion and Way Forward",
+        "",
+        f"The vulnerability assessment of **{len(software_names)}** software {'items' if len(software_names) != 1 else 'item'} "
+        f"identified **{total_cves} CVEs**, including "
+        f"**{sev_counts['CRITICAL']} Critical** and **{sev_counts['HIGH']} High** severity findings.",
+    ]
+    if kev_total:
+        lines.append(
+            f"**{kev_total} CVE{'s are' if kev_total != 1 else ' is'} listed in the "
+            f"[CISA Known Exploited Vulnerabilities catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)** "
+            "— these have confirmed active exploitation in the wild and require immediate action."
+        )
+    if expl_total:
+        lines.append(
+            f"**{expl_total} CVE{'s have' if expl_total != 1 else ' has'} publicly available exploit code**, "
+            "meaning the barrier to attack is minimal."
+        )
+    lines += [
+        "",
+        "**What needs to happen:**",
+        "",
+        "1. **Patch immediately** — Apply vendor patches for all KEV-listed CVEs within 24–72 hours.",
+        "2. **Patch urgently** — Address all Critical and High severity CVEs within your patch SLA.",
+        "3. **Harden** — Deploy the defensive controls identified below to reduce residual risk.",
+        "4. **Monitor** — Ensure detection coverage exists for the attack techniques identified.",
+        "5. **Validate** — Re-scan after patching to confirm remediation effectiveness.",
+        "",
+        "---",
+        "",
+    ]
+
+    # ── 2. IMMEDIATE IMPLEMENTATION GUIDANCE ────────────────────────────
+    lines += [
+        "## Immediate Implementation Guidance",
+        "",
+        "The following defensive priorities address the highest-impact attack vectors:",
+        "",
+    ]
+    if top:
+        step = 1
+        for aid, cnt, meta in top:
+            tname   = meta.get("name", aid)
+            atk_url = f"https://attack.mitre.org/techniques/{aid.replace('.','/')}/"
+            d3fend  = meta.get("d3fend", [])
+            nist    = meta.get("nist", [])
+            lines.append(
+                f"**Priority {step}: [{tname}]({atk_url}) ({aid})** — affects {cnt} CVE{'s' if cnt != 1 else ''}"
+            )
+            if d3fend:
+                d3_links = ", ".join(
+                    f"[{cm}](https://d3fend.mitre.org/technique/d3f:{cm.replace(' ','')}/ \"D3FEND\")"
+                    for cm in d3fend[:3]
+                )
+                lines.append(f"- D3FEND controls: {d3_links}")
+            if nist:
+                nist_links = ", ".join(
+                    f"[{ctrl.split()[0]}](https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl.split()[0]} \"NIST SP 800-53\") — {ctrl}"
+                    for ctrl in nist[:3]
+                )
+                lines.append(f"- NIST 800-53: {nist_links}")
+            lines.append("")
+            step += 1
+    else:
+        lines.append("No ATT&CK technique mappings were resolved. Focus on patching identified CVEs directly.")
+        lines.append("")
+
+    lines += [
+        "---",
+        "",
+        "## Findings Summary — The Why",
+        "",
+        f"The scan covered **{len(software_names)}** software items: {', '.join(software_names)}.",
+        "",
+        f"Severity breakdown: Critical **{sev_counts['CRITICAL']}** | High **{sev_counts['HIGH']}** | "
+        f"Medium **{sev_counts['MEDIUM']}** | Low **{sev_counts['LOW']}**.",
+        "",
+    ]
+    if max_risk:
+        lines.append(f"Highest weighted risk score: **{max_risk:.1f}**/100.")
+        lines.append("")
+
+    if top:
+        lines.append("The most prevalent attack techniques observed:")
+        for aid, cnt, meta in top:
+            tactics_str = ", ".join(meta.get("tactics", [])) or "—"
+            atk_url = f"https://attack.mitre.org/techniques/{aid.replace('.','/')}/"
+            lines.append(f"- **[{meta['name']}]({atk_url})** ({aid}) — {cnt} CVE{'s' if cnt != 1 else ''}, Tactics: {tactics_str}")
+        lines.append("")
+
+    lines += [
+        "---",
+        "",
+        "## Software Risk Overview",
+        "",
+    ]
+
+    # Per-software summary (high-level only — no raw CVE lists)
     for (software_name, software_version), rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
         rows.sort(key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
 
-        total_cves = len(rows)
-        critical = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "CRITICAL")
-        high = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "HIGH")
-        medium = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "MEDIUM")
-        low = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "LOW")
-        kev_count = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
-        exploit_count = sum(1 for r in rows if str(r.get("Public Exploit", "")).upper() == "YES")
-        overall_risk = rows[0].get("Risk Level", "INFO")
-        max_risk = rows[0].get("Risk Score", 0)
+        total   = len(rows)
+        crit    = sum(1 for r in rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+        high    = sum(1 for r in rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+        kev_c   = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+        expl_c  = sum(1 for r in rows if str(r.get("Public Exploit","")).upper() == "YES")
+        max_rs  = rows[0].get("Risk Score", 0)
+        rl      = rows[0].get("Risk Level", "INFO")
 
-        lines.append(f"# {software_name} {software_version}".strip())
+        lines.append(f"# {software_name} {software_version}")
         lines.append("")
-        lines.append("## Software Summary")
-        lines.append(f"- Total CVEs: {total_cves}")
-        lines.append(f"- Critical: {critical} | High: {high} | Medium: {medium} | Low: {low}")
-        lines.append(f"- Known Exploited Vulnerabilities: {kev_count}")
-        lines.append(f"- Public Exploits Available: {exploit_count}")
-        lines.append(f"- Highest Risk CVE Score: {max_risk}")
-        lines.append(f"- Overall Risk Rating: {overall_risk}")
-        lines.append("")
+        lines.append(f"- Overall Risk: **{rl}** (score {max_rs})  |  CVEs: {total}  |  Critical: {crit}  |  High: {high}")
+        if kev_c:
+            lines.append(f"- ⚠ **{kev_c} KEV-listed CVE{'s' if kev_c != 1 else ''}** — active exploitation documented")
+        if expl_c:
+            lines.append(f"- **{expl_c} CVE{'s have' if expl_c != 1 else ' has'} public exploit code** available")
 
-        # Threat intelligence — concise summary stat for executive audience
+        # Threat intelligence summary
         otx_key = f"{software_name} {software_version}".strip()
         if otx_key in otx_results:
             otx_data    = otx_results[otx_key]
             cve_counts  = otx_data.get("cve_pulse_counts", {})
             active_cves = [cid for cid in cve_counts
                            if _THREAT_INTEL_CACHE.get(cid, {}).get("greynoise", {}).get("noise")]
-            enriched    = len(cve_counts)
-            if enriched or active_cves:
-                lines.append("## Threat Intelligence")
-                lines.append("")
-                if active_cves:
-                    lines.append(
-                        f"⚠ **{len(active_cves)}** CVE(s) for **{software_name} {software_version}** "
-                        "show active in-the-wild exploitation traffic (GreyNoise). "
-                        "See the Technical Report for per-CVE detail."
-                    )
-                elif enriched:
-                    lines.append(
-                        f"CIRCL CVE Search returned enrichment data for **{enriched}** CVE(s). "
-                        "No active GreyNoise exploitation signals detected at time of scan."
-                    )
-                lines.append("")
+            if active_cves:
+                lines.append(
+                    f"- ⚠ **{len(active_cves)} CVE(s)** show active in-the-wild exploitation (GreyNoise)"
+                )
 
-        lines.append("## Threat Map")
-        lines.append(_format_threat_map(rows))
+        # Top 3 CVEs (names + NVD links only — no CVSS vectors etc.)
         lines.append("")
+        lines.append("**Top vulnerabilities by risk:**")
+        for r in rows[:3]:
+            cid  = r.get("CVE ID","")
+            nvd  = r.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cid}"
+            sev  = r.get("CVSS Severity","")
+            rs   = r.get("Risk Score","")
+            desc = str(r.get("Description","") or "").strip()
+            if len(desc) > 150:
+                desc = desc[:147] + "…"
+            lines.append(f"- [{cid}]({nvd}) — {sev}, Risk {rs}: {desc}")
 
-        lines.append("## Top CVEs by Risk Score")
-        lines.append(_format_top_cves(rows, limit=10))
-        lines.append("")
-
-        lines.append("## Threat Scenarios")
-        lines.append(_format_scenarios(rows, software_name, limit=5))
-        lines.append("")
-
-        lines.append(_format_mitigations(rows, limit=10))
         lines.append("")
         lines.append("---")
         lines.append("")
 
-    exec_line = "This report groups findings by software and highlights the highest-risk CVEs, mapped threats, likely scenarios, and recommended mitigations."
-    exec_md = _executive_summary(all_rows)
-    conc_md = _conclusion_section(all_rows)
-    body_md = "\n".join(lines).strip() + "\n"
-    full_md = f"{exec_line}\n{exec_md}\n{body_md}\n{conc_md}"
+    full_md  = "\n".join(lines).strip() + "\n"
     logo_b64 = _load_logo_b64()
 
     return _wrap_html_report(
         title=report_title,
         body_md=full_md,
         logo_b64=logo_b64,
+        subtitle="Executive Summary",
+        toc_html=toc_html,
     )
 
 def build_technical_report_markdown(all_rows: List[Dict[str, Any]], report_title: str = "Technical Threat Intelligence Report") -> str:
@@ -2895,6 +3047,35 @@ _NIST_IMPL: Dict[str, str] = {
 }
 
 
+def _attack_link(tech_id: str, label: str = "") -> str:
+    """Return a markdown link to ATT&CK technique page (opens in new tab via inline HTML)."""
+    tid = tech_id.replace(".", "/")
+    url = f"https://attack.mitre.org/techniques/{tid}/"
+    display = label or tech_id
+    return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{html.escape(display)}</a>'
+
+
+def _d3fend_link(cm_name: str) -> str:
+    """Return a markdown-style link to D3FEND technique page."""
+    slug = cm_name.replace(" ", "")
+    url = f"https://d3fend.mitre.org/technique/d3f:{slug}/"
+    return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{html.escape(cm_name)}</a>'
+
+
+def _nist_link(ctrl_id: str, label: str = "") -> str:
+    """Return a link to NIST SP 800-53 control page."""
+    family = ctrl_id.split("-")[0].upper() if "-" in ctrl_id else ctrl_id.upper()
+    url = f"https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl_id}"
+    display = label or ctrl_id
+    return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{html.escape(display)}</a>'
+
+
+def _nvd_link(cve_id: str) -> str:
+    """Return a link to NVD CVE detail page."""
+    url = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+    return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{html.escape(cve_id)}</a>'
+
+
 def _defensive_patch_table(rows: List[Dict[str, Any]]) -> str:
     """Build a patch-tracking table: one row per unique software item."""
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
@@ -2961,7 +3142,31 @@ def _defensive_immediate_actions(rows: List[Dict[str, Any]]) -> str:
         lines.append("**Required actions (complete within 24–72 hours):**")
         lines.append("1. Confirm whether this software version is deployed in production.")
         lines.append("2. Apply the vendor patch — check the NVD link above for vendor advisory.")
-        lines.append("3. If a patch is unavailable, apply compensating controls (WAF rule, network isolation, or disable the feature).")
+
+        # Build compensating controls block with linked NIST/D3FEND references
+        d3fend_vals = _split_multi(r.get("D3FEND Countermeasures", ""))
+        nist_vals   = _split_multi(r.get("NIST 800-53 Controls", ""))
+
+        if d3fend_vals or nist_vals:
+            comp_parts: List[str] = []
+            if d3fend_vals:
+                d3_links = ", ".join(
+                    f"[{cm}](https://d3fend.mitre.org/technique/d3f:{cm.replace(' ','')}/) (D3FEND)"
+                    for cm in d3fend_vals[:3]
+                )
+                comp_parts.append(f"D3FEND: {d3_links}")
+            if nist_vals:
+                nist_links = ", ".join(
+                    f"[{ctrl.split()[0]}](https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl.split()[0]}) — {ctrl}"
+                    for ctrl in nist_vals[:3]
+                )
+                comp_parts.append(f"NIST 800-53: {nist_links}")
+            lines.append(
+                f"3. If a patch is unavailable, apply compensating controls: {'; '.join(comp_parts)}."
+            )
+        else:
+            lines.append("3. If a patch is unavailable, apply compensating controls: network isolation, WAF rule, or disable the feature.")
+
         lines.append("4. Verify remediation by re-scanning or reviewing the patched version string.")
         lines.append("5. File an incident ticket and document the remediation timeline.")
         if kev:
@@ -2978,6 +3183,7 @@ def _defensive_control_implementation(rows: List[Dict[str, Any]]) -> str:
     """
     For each unique ATT&CK technique found, produce step-by-step
     implementation guidance covering D3FEND countermeasures and NIST controls.
+    All ATT&CK, D3FEND, and NIST references include hyperlinks (open in new tab).
     """
     top = _top_techniques(rows, top_n=10)
     if not top:
@@ -2989,46 +3195,47 @@ def _defensive_control_implementation(rows: List[Dict[str, Any]]) -> str:
         tactics = ", ".join(meta.get("tactics", [])) or "Unknown"
         d3fend  = meta.get("d3fend", [])
         nist    = meta.get("nist", [])
+        atk_url = f"https://attack.mitre.org/techniques/{aid.replace('.','/')}/"
 
         lines.append(f"## {rank}. {tname} ({aid})")
         lines.append(f"- **Observed in:** {cnt} CVE{'s' if cnt != 1 else ''} in this scan")
         lines.append(f"- **ATT&CK Tactics:** {tactics}")
-        lines.append(f"- **ATT&CK Reference:** https://attack.mitre.org/techniques/{aid.replace('.','/')}/")
+        lines.append(f"- **ATT&CK Reference:** {atk_url}")
         lines.append("")
 
-        # D3FEND implementation steps
+        # D3FEND implementation steps with links
         if d3fend:
             lines.append("### D3FEND Countermeasures — Implementation Steps")
             for cm in d3fend:
                 steps = _D3FEND_IMPL.get(cm)
                 if not steps:
-                    # Try partial / case-insensitive match
                     for key, val in _D3FEND_IMPL.items():
                         if key.lower() in cm.lower() or cm.lower() in key.lower():
                             steps = val
                             break
                 if not steps:
                     steps = _D3FEND_GENERIC
-                lines.append(f"**{cm}**")
+                d3f_slug = cm.replace(" ", "")
+                d3f_url  = f"https://d3fend.mitre.org/technique/d3f:{d3f_slug}/"
+                lines.append(f"**{cm}** — [D3FEND reference]({d3f_url})")
                 for i, step in enumerate(steps, 1):
                     lines.append(f"{i}. {step}")
-                lines.append(f"- D3FEND reference: https://d3fend.mitre.org/technique/d3f:{cm.replace(' ','-')}/")
                 lines.append("")
         else:
             lines.append("### D3FEND Countermeasures")
             lines.append("- No specific D3FEND mappings available for this technique. Refer to https://d3fend.mitre.org for manual lookup.")
             lines.append("")
 
-        # NIST control implementation notes
+        # NIST control implementation notes with links
         if nist:
             lines.append("### NIST SP 800-53 Control Implementation")
-            lines.append("| Control | Description | Implementation Note |")
-            lines.append("|---|---|---|")
+            lines.append("| Control | Description | Implementation Note | Reference |")
+            lines.append("|---|---|---|---|")
             for ctrl in nist:
-                # Extract control family (e.g. "SI-2" from "SI-2 Flaw Remediation")
                 ctrl_id = ctrl.split()[0] if ctrl.split() else ctrl
                 note = _NIST_IMPL.get(ctrl_id, "Review NIST SP 800-53 Rev 5 for full implementation guidance.")
-                lines.append(f"| {ctrl_id} | {ctrl} | {note} |")
+                nist_url = f"https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl_id}"
+                lines.append(f"| {ctrl_id} | {ctrl} | {note} | {nist_url} |")
             lines.append("")
         else:
             lines.append("### NIST SP 800-53 Controls")
@@ -3104,19 +3311,22 @@ def _defensive_monitoring_checklist(rows: List[Dict[str, Any]]) -> str:
 
 def build_defensive_report(
     all_rows: List[Dict[str, Any]],
-    report_title: str = "Defensive Implementation Report",
+    report_title: str = "Technical & Defensive Implementation Report",
 ) -> str:
     """
-    Build a SOC/IT-ready defensive report with step-by-step control
-    implementation guidance derived from the scan findings.
+    Combined SOC/IT technical + defensive report with:
+    - TOC at the top
+    - Immediate actions (with linked NIST/D3FEND)
+    - Patch tracking table
+    - Per-software CVE breakdowns with threat scenarios
+    - Control implementation guide (ATT&CK → D3FEND → NIST with links)
+    - SOC monitoring checklist
     """
     logo_b64 = _load_logo_b64()
 
-    # Date header
     import datetime
     scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Aggregate stats
     total_cves = len(all_rows)
     software_set = {str(r.get("Software Name","")).strip() for r in all_rows if r.get("Software Name")}
     kev_total  = sum(1 for r in all_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
@@ -3124,13 +3334,129 @@ def build_defensive_report(
     crit_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
     high_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
 
+    # Build per-software CVE + scenario breakdown (formerly in technical report)
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in all_rows:
+        key = (str(row.get("Software Name","")).strip(), str(row.get("Software Version","")).strip())
+        grouped[key].append(row)
+
+    sw_sections: List[str] = []
+    sw_toc_entries: List[str] = []
+    for (sw_name, sw_ver), sw_rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
+        sw_rows.sort(key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
+        slug = re.sub(r"[^a-z0-9]+", "-", f"{sw_name} {sw_ver}".lower()).strip("-")
+        sw_toc_entries.append(f'<li><a href="#{slug}">{html.escape(sw_name)} {html.escape(sw_ver)}</a></li>')
+
+        total = len(sw_rows)
+        crit  = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+        high  = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+        med   = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "MEDIUM")
+        low   = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "LOW")
+        kev   = sum(1 for r in sw_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+        expl  = sum(1 for r in sw_rows if str(r.get("Public Exploit","")).upper() == "YES")
+
+        block: List[str] = [
+            f"# {sw_name} {sw_ver}",
+            "",
+            f"- Total CVEs: {total}  |  Critical: {crit}  |  High: {high}  |  Medium: {med}  |  Low: {low}",
+            f"- Known Exploited (KEV): {kev}  |  Public Exploit: {expl}",
+            f"- Overall Risk: {sw_rows[0].get('Risk Level','INFO')}  |  Highest Score: {sw_rows[0].get('Risk Score',0)}",
+            "",
+        ]
+
+        # CVE breakdown with scenarios
+        for r in sw_rows:
+            cid  = r.get("CVE ID","")
+            nvd_url = r.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cid}"
+            desc = str(r.get("Description","") or "").strip() or "No description available."
+            score= r.get("CVSS Base Score","N/A")
+            sev  = r.get("CVSS Severity","")
+            rs   = r.get("Risk Score","")
+            rl   = r.get("Risk Level","")
+            kev_f= str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+            expl_f= str(r.get("Public Exploit","")).upper() == "YES"
+            epss = r.get("EPSS Score","")
+            conf = r.get("Version Confirmed","")
+            attacks = _split_multi(r.get("ATT&CK Techniques",""))
+            d3fend  = _split_multi(r.get("D3FEND Countermeasures",""))
+            nist    = _split_multi(r.get("NIST 800-53 Controls",""))
+
+            block.append(f"## {cid}")
+            block.append(f"- CVSS: {score} ({sev})  |  Risk Score: {rs} ({rl})  |  EPSS: {epss}  |  Version Confirmed: {conf}")
+            if kev_f: block.append("- **⚠ CISA KEV-LISTED — active exploitation documented**")
+            if expl_f: block.append(f"- **PUBLIC EXPLOIT available** — Sources: {r.get('Exploit Sources','') or 'See NVD'}")
+            block.append(f"- Description: {desc}")
+
+            # ATT&CK links
+            if attacks:
+                atk_parts = []
+                for atk in attacks:
+                    m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", atk)
+                    if m:
+                        tid, tname = m.group(1), m.group(2)
+                        atk_parts.append(f"[{tid} ({tname})](https://attack.mitre.org/techniques/{tid.replace('.','/')}/ \"ATT&CK\")")
+                    else:
+                        atk_parts.append(atk)
+                block.append(f"- ATT&CK Techniques: {'; '.join(atk_parts)}")
+
+            # D3FEND links
+            if d3fend:
+                d3_parts = [f"[{cm}](https://d3fend.mitre.org/technique/d3f:{cm.replace(' ','')}/)" for cm in d3fend]
+                block.append(f"- D3FEND Countermeasures: {', '.join(d3_parts)}")
+
+            # NIST links
+            if nist:
+                nist_parts = [
+                    f"[{ctrl.split()[0]}](https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl.split()[0]}) — {ctrl}"
+                    for ctrl in nist
+                ]
+                block.append(f"- NIST 800-53: {'; '.join(nist_parts)}")
+
+            block.append(f"- NVD: {nvd_url}")
+
+            # Threat scenario from this CVE's ATT&CK mappings
+            if attacks:
+                first = attacks[0]
+                m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", first)
+                if m:
+                    aid, aname = m.group(1), m.group(2)
+                else:
+                    aid, aname = first, first
+                scenario_info = SCENARIOS.get(aid)
+                if scenario_info and scenario_info.get("description"):
+                    narrative = scenario_info["description"].format(cve_id=cid, software_name=sw_name)
+                else:
+                    narrative = _scenario_template(aid, aname, sw_name, cid)
+                tactics_list = get_tactics(aid)
+                impact_text  = get_impact(aid)
+                block.append(f"- **Threat Scenario:** {narrative}")
+                if tactics_list:
+                    block.append(f"- Tactics: {', '.join(tactics_list)}")
+                if impact_text:
+                    block.append(f"- Impact: {impact_text}")
+
+            block.append("")
+
+        sw_sections.append("\n".join(block))
+
+    # Build TOC
+    toc_html = (
+        '<h2>Contents</h2><ol>'
+        '<li><a href="#section-1-immediate-actions-required">Section 1 — Immediate Actions Required</a></li>'
+        '<li><a href="#section-2-patch-tracking-table">Section 2 — Patch Tracking Table</a></li>'
+        '<li><a href="#section-3-per-software-cve-breakdown">Section 3 — Per-Software CVE Breakdown</a>'
+        f'<ol>{"".join(sw_toc_entries)}</ol></li>'
+        '<li><a href="#section-4-control-implementation-guide">Section 4 — Control Implementation Guide</a></li>'
+        '<li><a href="#section-5-soc-monitoring-and-validation-checklist">Section 5 — SOC Monitoring and Validation Checklist</a></li>'
+        '</ol>'
+    )
+
     lines: List[str] = [
-        "## Defensive Report — Purpose and Scope",
+        "## Report Purpose and Scope",
         "",
-        "This report is intended for SOC analysts, IT security engineers, and system administrators. "
-        "It translates the raw vulnerability data from this Draugr scan into actionable, prioritised "
-        "implementation steps. Each section maps directly to the ATT&CK techniques, D3FEND countermeasures, "
-        "and NIST SP 800-53 controls identified during the scan.",
+        "This combined Technical & Defensive Implementation report is intended for SOC analysts, "
+        "IT security engineers, and system administrators. It provides full CVE detail, threat scenario "
+        "mapping, and step-by-step control implementation guidance derived from ATT&CK, D3FEND, and NIST SP 800-53.",
         "",
         f"- Scan date: {scan_date}",
         f"- Software items scanned: {len(software_set)}",
@@ -3152,27 +3478,29 @@ def build_defensive_report(
         "",
         "# Section 2 — Patch Tracking Table",
         "",
-        "Use this table to track patch status across all scanned software. Assign each row as a ticket "
-        "in your ITSM system and update status as patches are applied.",
+        "Use this table to track patch status across all scanned software.",
         "",
         _defensive_patch_table(all_rows),
         "",
         "---",
         "",
-        "# Section 3 — Control Implementation Guide",
+        "# Section 3 — Per-Software CVE Breakdown",
         "",
-        "The following section provides step-by-step implementation guidance for each ATT&CK technique "
-        "identified in this scan, ranked by frequency of occurrence. Each entry includes D3FEND "
-        "countermeasure implementation steps and NIST SP 800-53 control notes.",
+        "Full CVE details, threat scenarios, and control mappings for each software item.",
+        "",
+    ] + sw_sections + [
+        "",
+        "---",
+        "",
+        "# Section 4 — Control Implementation Guide",
+        "",
+        "Step-by-step guidance for each ATT&CK technique found, ranked by frequency.",
         "",
         _defensive_control_implementation(all_rows),
         "",
         "---",
         "",
-        "# Section 4 — SOC Monitoring and Validation Checklist",
-        "",
-        "Complete this checklist after applying the controls above. Use it as evidence of remediation "
-        "for audit, compliance, or incident response purposes.",
+        "# Section 5 — SOC Monitoring and Validation Checklist",
         "",
         _defensive_monitoring_checklist(all_rows),
         "",
@@ -3183,7 +3511,8 @@ def build_defensive_report(
         title=report_title,
         body_md=body_md,
         logo_b64=logo_b64,
-        subtitle="SOC & IT Implementation Guide",
+        subtitle="Technical & SOC Implementation Guide",
+        toc_html=toc_html,
     )
 
 
@@ -3653,6 +3982,7 @@ def build_redteam_report(
     """
     Build a red-team-focused report ranking targets by exploitability,
     mapping ATT&CK kill chains, and inventorying available exploit code.
+    Engagement Recommendations are Section 1; other sections follow.
     """
     logo_b64 = _load_logo_b64()
     otx_results = otx_results or {}
@@ -3666,12 +3996,10 @@ def build_redteam_report(
     crit_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
     high_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
 
-    # OTX environment-level stats for header
     total_otx_pulses = sum(
         d.get("pulse_count", 0) for d in otx_results.values() if not d.get("error")
     )
 
-    # Determine overall threat level for the environment
     if kev_total >= 5 or crit_total >= 10:
         threat_level = "CRITICAL — Active exploitation risk; multiple high-value targets present."
     elif kev_total > 0 or expl_total >= 5:
@@ -3681,12 +4009,25 @@ def build_redteam_report(
     else:
         threat_level = "MODERATE — Limited exploit exposure identified."
 
+    # TOC
+    toc_html = (
+        '<h2>Contents</h2><ol>'
+        '<li><a href="#section-1-engagement-recommendations">Section 1 — Engagement Recommendations</a></li>'
+        '<li><a href="#section-2-target-priority-ranking">Section 2 — Target Priority Ranking</a></li>'
+        '<li><a href="#section-3-per-target-attack-profiles">Section 3 — Per-Target Attack Profiles</a></li>'
+        '<li><a href="#section-4-exploit-inventory">Section 4 — Exploit Inventory</a></li>'
+        '<li><a href="#section-5-threat-intelligence-summary">Section 5 — Threat Intelligence Summary</a></li>'
+        '<li><a href="#section-6-highest-epss-probability-cves">Section 6 — Highest EPSS Probability CVEs</a></li>'
+        '</ol>'
+    )
+
     lines: List[str] = [
         "## Red Team Report — Purpose and Scope",
         "",
         "This report is intended for red team operators, penetration testers, and threat-intelligence "
         "analysts. It identifies the most attractive targets in the scanned environment, ranks them by "
-        "exploitability, and maps available attack paths using the MITRE ATT&CK framework.",
+        "exploitability, and maps available attack paths using the "
+        "[MITRE ATT&CK framework](https://attack.mitre.org/ \"ATT&CK\").",
         "",
         "> **HANDLING: RESTRICTED** — This report contains information about exploitable vulnerabilities "
         "in production systems. Distribute only to authorised personnel.",
@@ -3694,14 +4035,28 @@ def build_redteam_report(
         f"- Scan date: {scan_date}",
         f"- Software items assessed: {len(software_set)}",
         f"- Total CVEs: {len(all_rows)}  |  Critical: {crit_total}  |  High: {high_total}",
-        f"- KEV-listed (active exploitation documented): {kev_total}",
+        f"- KEV-listed (active exploitation documented): {kev_total}  — [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)",
         f"- CVEs with public exploit code: {expl_total}",
-        f"- OTX pulses across all targets: {total_otx_pulses}" if otx_results else "",
         f"- **Overall environment threat level: {threat_level}**",
         "",
         "---",
         "",
-        "# Section 1 — Target Priority Ranking",
+        "# Section 1 — Engagement Recommendations",
+        "",
+        "Based on the scan findings, the following engagement priorities are recommended:",
+        "",
+        "1. **Begin with KEV-listed and public-exploit CVEs** — these have the lowest technical barrier and highest confidence of exploitation success. See Section 4 for the full exploit inventory.",
+        "2. **Target the highest-scoring software items first** (see Section 2) — they offer the best risk/return for initial access.",
+        "3. **Cross-reference threat intelligence** (Sections 3 and 5) — CVEs with active GreyNoise signals have confirmed in-the-wild exploitation; established adversary tooling is likely available.",
+        "4. **Map the [ATT&CK](https://attack.mitre.org/) techniques** identified in Section 3 to your toolset; look for gaps in defender coverage to exploit.",
+        f"5. **Chain vulnerabilities where possible** — privilege-escalation CVEs ([T1068](https://attack.mitre.org/techniques/T1068/)) after initial-access CVEs ([T1190](https://attack.mitre.org/techniques/T1190/)) are a common and effective pattern.",
+        "6. **Cross-reference with CTI** — search VirusTotal, Shodan, and threat-intel feeds for IoCs related to the KEV entries; determine if the environment is already compromised.",
+        "7. **Validate EPSS top-10 CVEs** (Section 6) — high EPSS scores indicate adversary attention; these may have undisclosed or newly published PoC code.",
+        "8. **Document all findings** in your engagement management platform and align with the Rules of Engagement before exploitation.",
+        "",
+        "---",
+        "",
+        "# Section 2 — Target Priority Ranking",
         "",
         "Targets are ranked by a composite score using the highest single CVE risk score "
         "as the base, with flat bonuses for KEV status, public exploit availability, "
@@ -3717,25 +4072,26 @@ def build_redteam_report(
         "",
         "---",
         "",
-        "# Section 2 — Per-Target Attack Profiles",
+        "# Section 3 — Per-Target Attack Profiles",
         "",
         "Each target is profiled with recommended entry vectors, ATT&CK kill-chain coverage, "
-        "OTX threat intelligence, vulnerability class breakdown, and operator notes.",
+        "threat intelligence, vulnerability class breakdown, and operator notes.",
         "",
         _redteam_attack_chains(all_rows, otx_results=otx_results),
         "",
         "---",
         "",
-        "# Section 3 — Exploit Inventory",
+        "# Section 4 — Exploit Inventory",
         "",
-        "All CVEs in this scan that have confirmed public exploit code or are listed in the CISA KEV "
-        "catalog. These represent the most immediately actionable exploitation opportunities.",
+        "All CVEs in this scan that have confirmed public exploit code or are listed in the "
+        "[CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog). "
+        "These represent the most immediately actionable exploitation opportunities.",
         "",
         _redteam_exploit_inventory(all_rows),
         "",
         "---",
         "",
-        "# Section 4 — Threat Intelligence Summary",
+        "# Section 5 — Threat Intelligence Summary",
         "",
         "Environment-level view of threat activity from CIRCL CVE Search and GreyNoise Community. "
         "CVEs with active GreyNoise signals represent confirmed in-the-wild exploitation — "
@@ -3745,24 +4101,12 @@ def build_redteam_report(
         "",
         "---",
         "",
-        "# Section 5 — Highest EPSS Probability CVEs",
+        "# Section 6 — Highest EPSS Probability CVEs",
+        "",
+        "The [EPSS (Exploit Prediction Scoring System)](https://www.first.org/epss/) scores below "
+        "indicate the probability of exploitation in the wild within 30 days.",
         "",
         _redteam_high_epss(all_rows),
-        "",
-        "---",
-        "",
-        "# Section 6 — Engagement Recommendations",
-        "",
-        "Based on the findings above, the following engagement priorities are recommended:",
-        "",
-        "1. **Begin with KEV-listed and public-exploit CVEs** — these have the lowest technical barrier and highest confidence of exploitation success.",
-        "2. **Target the highest-scoring software items first** (see Section 1) — they offer the best risk/return for initial access.",
-        "3. **Cross-reference OTX pulse data** (Sections 2 and 4) — CVEs and products with high pulse counts have established adversary tooling; these are the most battle-tested entry points.",
-        "4. **Map the ATT&CK techniques identified** in Section 2 to your toolset; look for gaps in defender coverage to exploit.",
-        "5. **Chain vulnerabilities where possible** — privilege-escalation CVEs (T1068) after initial-access CVEs (T1190) are a common and effective pattern.",
-        "6. **Cross-reference with CTI** — search VirusTotal, Shodan, and threat-intel feeds for IoCs related to the KEV entries; determine if the environment is already compromised.",
-        "7. **Validate EPSS top-10 CVEs** (Section 5) — high EPSS scores indicate adversary attention; these may have undisclosed or newly published PoC code.",
-        "8. **Document all findings** in your engagement management platform and align with the Rules of Engagement before exploitation.",
         "",
     ]
 
@@ -3772,6 +4116,7 @@ def build_redteam_report(
         body_md=body_md,
         logo_b64=logo_b64,
         subtitle="Target Prioritisation & Attack Path Analysis",
+        toc_html=toc_html,
     )
 
 
