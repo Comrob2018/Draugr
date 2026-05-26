@@ -1615,28 +1615,95 @@ def load_kev_with_fallback(path: str, *, log=None) -> Dict[str, Dict[str, str]]:
     return {}
 
 
-def parse_software_list(path: str) -> List[Tuple[str, str]]:
+def parse_software_list(path: str) -> List[Tuple[str, str, str, str]]:
     """
-    Parse a software list file.
-    Supported formats per line:  product  |  product,version
-    Lines starting with '#' are ignored.
+    Parse a software list file into (name, version, publisher, install_date) 4-tuples.
+
+    Supported formats
+    -----------------
+    1. CSV with a header row containing a 'Name' column and optionally
+       'Version', 'Publisher', and 'Install Date' columns. Any additional
+       columns are ignored. Covers exports from Hapy, SCCM, PDQ, Qualys, etc:
+           Name,Version,Publisher,Install Date
+           Name,Version
+    2. Two-column headerless CSV:  product,version
+       (publisher and install_date will be empty strings)
+    3. Plain text, one product name per line
+       (version, publisher, and install_date will be empty strings)
+
+    Lines starting with '#' are ignored in all formats.
+
+    Install date normalisation
+    --------------------------
+    Dates in compact YYYYMMDD format (e.g. 20250417) are normalised to
+    ISO 8601 (YYYY-MM-DD) for consistency with NVD/KEV date fields.
     """
-    entries: List[Tuple[str, str]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "," in line:
-                name, version = [p.strip() for p in line.split(",", 1)]
-                if "name" in name.lower():
-                    continue
-                else:
-                    name = name.strip('"')
-                    version = version.strip('"')
-                    entries.append((name, version))
-            else:
-                entries.append((line, ""))
+    import csv as _csv
+
+    entries: List[Tuple[str, str, str, str]] = []
+
+    def _normalise_date(raw: str) -> str:
+        """Convert YYYYMMDD → YYYY-MM-DD; pass through anything else."""
+        s = raw.strip()
+        if len(s) == 8 and s.isdigit():
+            return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+        return s
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        raw_content = f.read()
+
+    lines = raw_content.splitlines()
+    non_empty = [l for l in lines if l.strip() and not l.strip().startswith("#")]
+    if not non_empty:
+        return entries
+
+    first = non_empty[0]
+    is_csv = "," in first
+
+    if is_csv:
+        reader = _csv.DictReader(
+            (l for l in lines if not l.strip().startswith("#")),
+        )
+        fieldnames_lower = [str(f).lower().strip() for f in (reader.fieldnames or [])]
+
+        if "name" in fieldnames_lower:
+            # Structured CSV with known headers — map by column name
+            fn = reader.fieldnames or []
+
+            def _col(keyword: str) -> Optional[str]:
+                """Return the original fieldname whose lower-stripped form matches keyword."""
+                return next((f for f in fn if f.strip().lower() == keyword), None)
+
+            name_col    = _col("name")
+            version_col = _col("version")
+            pub_col     = next(
+                (f for f in fn if f.strip().lower() in ("publisher", "vendor", "manufacturer")),
+                None,
+            )
+            date_col    = next(
+                (f for f in fn if "install" in f.strip().lower() or "date" in f.strip().lower()),
+                None,
+            )
+
+            for row in reader:
+                name    = str(row.get(name_col, "") or "").strip().strip('"')
+                version = str(row.get(version_col, "") or "").strip().strip('"') if version_col else ""
+                pub     = str(row.get(pub_col,  "") or "").strip().strip('"') if pub_col  else ""
+                idate   = _normalise_date(str(row.get(date_col, "") or "")) if date_col else ""
+                if name:
+                    entries.append((name, version, pub, idate))
+        else:
+            # Headerless CSV — positional: col0=name, col1=version
+            for row in reader:
+                values  = list(row.values())
+                name    = str(values[0] if values else "").strip().strip('"')
+                version = str(values[1] if len(values) > 1 else "").strip().strip('"')
+                if name and name.lower() != "name":
+                    entries.append((name, version, "", ""))
+    else:
+        for line in non_empty:
+            entries.append((line.strip(), "", "", ""))
+
     return entries
 
 
@@ -2661,200 +2728,797 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     return full_html
 
 
+# ======================================================================
+#  EXECUTIVE REPORT — Business-language risk translation helpers
+# ======================================================================
+
+# Maps ATT&CK tactic names to plain-language business impact statements.
+_TACTIC_BUSINESS_IMPACT: Dict[str, str] = {
+    "initial-access":       "An adversary could gain an initial foothold into the organization's systems, serving as the entry point for further attack activity.",
+    "execution":            "An attacker could run malicious commands or software on organizational systems, enabling data theft, disruption, or further compromise.",
+    "persistence":          "An attacker could establish a long-term, hidden presence — surviving reboots and password changes — allowing extended undetected access.",
+    "privilege-escalation": "An attacker with limited access could elevate their permissions to gain administrative or system-level control, significantly expanding their reach.",
+    "defense-evasion":      "An attacker could hide their activity from security monitoring tools, increasing the time before detection and response.",
+    "credential-access":    "An attacker could steal account credentials, enabling impersonation of legitimate users and unauthorized access to sensitive systems.",
+    "discovery":            "An attacker could map the organization's internal network and identify valuable targets, systems, and data stores.",
+    "lateral-movement":     "An attacker could spread from an initially compromised system to other systems across the organization's network.",
+    "collection":           "An attacker could identify and gather sensitive organizational data, intellectual property, or operational information.",
+    "command-and-control":  "An attacker could establish a covert communication channel to remotely direct compromised systems from outside the organization.",
+    "exfiltration":         "An attacker could steal and transmit sensitive data outside the organization, resulting in a data breach.",
+    "impact":               "An attacker could disrupt, degrade, or destroy organizational systems and data, causing operational downtime or permanent data loss.",
+}
+
+# Maps ATT&CK technique IDs to concise, business-language risk narratives.
+_TECHNIQUE_BUSINESS_NARRATIVE: Dict[str, str] = {
+    "T1190": "Attackers could exploit weaknesses in internet-facing systems to gain unauthorized remote access without requiring valid credentials — bypassing perimeter defenses entirely.",
+    "T1068": "Once inside, attackers could exploit software weaknesses to elevate their access to administrator or system level, giving them full control over affected machines.",
+    "T1059": "Attackers could use built-in system tools to run malicious commands — making it difficult to distinguish attack activity from normal operations.",
+    "T1203": "Malicious content (files, links, or web pages) could trigger unauthorized code execution on employee workstations, serving as an entry point for broader compromise.",
+    "T1078": "Attackers could use stolen or weak credentials to access systems as a legitimate user, making malicious activity harder to detect.",
+    "T1499": "Attackers could overwhelm systems with traffic or requests, causing service outages that disrupt operations and deny access to critical capabilities.",
+    "T1005": "Attackers could access and collect sensitive files, credentials, and operational data stored on compromised systems.",
+    "T1083": "Attackers could enumerate directories and files to identify high-value data targets before exfiltration.",
+    "T1105": "Attackers could download additional malicious tools onto compromised systems, expanding their capabilities once inside the network.",
+    "T1557": "Attackers could intercept and manipulate communications between systems, enabling credential theft, data tampering, or session hijacking.",
+    "T1040": "Attackers could capture unencrypted network traffic to harvest credentials and sensitive data in transit.",
+    "T1110": "Attackers could systematically attempt to guess or crack passwords, potentially gaining unauthorized access to accounts without exploiting a specific vulnerability.",
+    "T1548": "Attackers could abuse legitimate privilege-management features to bypass security controls and gain elevated system access.",
+    "T1222": "Attackers could modify file and directory permissions to gain access to restricted data or maintain persistence after initial compromise.",
+    "T1552": "Attackers could locate and harvest stored credentials — including passwords, API keys, and certificates — enabling broader access across the organization.",
+    "T1090": "Attackers could route their traffic through internal systems to bypass network monitoring and reach otherwise restricted resources.",
+    "T1189": "Employees visiting a compromised website could unknowingly trigger malicious code execution, providing attackers with an initial foothold.",
+}
+
+# Maps severity levels and risk scores to plain-language posture descriptions.
+def _risk_posture_label(max_score: float, crit: int, kev: int, expl: int) -> str:
+    """Return a plain-language risk posture label suitable for executive reporting."""
+    if kev > 0 or max_score >= 80:
+        return "CRITICAL — Immediate action required. Active exploitation is occurring or imminent."
+    if expl > 0 or max_score >= 60 or crit > 0:
+        return "HIGH — Significant risk. Exploitation tools exist and attack probability is elevated."
+    if max_score >= 40:
+        return "MODERATE — Meaningful exposure. Vulnerabilities present but exploitation is less immediate."
+    return "LOW — Limited near-term risk. Standard patching cadence is appropriate."
+
+
+def _technique_to_business(aid: str, tactic_list: List[str]) -> str:
+    """Return the best available business-language description for a technique."""
+    narrative = _TECHNIQUE_BUSINESS_NARRATIVE.get(aid)
+    if narrative:
+        return narrative
+    # Fall back to tactic-level impact
+    for tactic in tactic_list:
+        t = tactic.lower().replace(" ", "-")
+        impact = _TACTIC_BUSINESS_IMPACT.get(t)
+        if impact:
+            return impact
+    return "Attackers could exploit this weakness to gain unauthorized access, disrupt operations, or compromise sensitive data."
+
+
+def _attack_scenario_business(rows: List[Dict[str, Any]], software_name: str) -> List[str]:
+    """
+    Generate 1–3 concise, business-language attack scenario paragraphs
+    for a software item, based on its ATT&CK technique mappings.
+    Returns a list of scenario strings.
+    """
+    # Collect unique technique IDs and their tactic sets, prioritised by risk score
+    seen_aids: set = set()
+    ordered_attacks: List[Tuple[str, str, List[str]]] = []  # (aid, name, tactics)
+    for r in rows:
+        attacks = _split_multi(r.get("ATT&CK Techniques", ""))
+        tactics = _split_multi(r.get("ATT&CK Tactics", ""))
+        for atk in attacks:
+            m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", atk)
+            if m:
+                aid, aname = m.group(1), m.group(2)
+            else:
+                aid, aname = atk, atk
+            if aid and aid not in seen_aids:
+                seen_aids.add(aid)
+                ordered_attacks.append((aid, aname, tactics))
+
+    scenarios: List[str] = []
+    for aid, aname, tactics in ordered_attacks[:3]:
+        narrative = _technique_to_business(aid, tactics)
+        scenarios.append(narrative)
+    return scenarios
+
+
+def _kev_business_statement(kev_count: int, sw_name: str) -> str:
+    if kev_count == 0:
+        return ""
+    if kev_count == 1:
+        return (
+            f"One vulnerability affecting **{sw_name}** has been confirmed as actively "
+            "exploited by threat actors in real-world attacks. The U.S. Cybersecurity and "
+            "Infrastructure Security Agency (CISA) has mandated remediation of this class "
+            "of vulnerability for federal agencies, reflecting the severity of the threat."
+        )
+    return (
+        f"**{kev_count} vulnerabilities** affecting **{sw_name}** have been confirmed as "
+        "actively exploited by threat actors in real-world attacks. These represent the "
+        "highest-priority remediation items — CISA has mandated patching of such "
+        "vulnerabilities for all federal agencies due to the documented exploitation activity."
+    )
+
+
+def _exploit_business_statement(expl_count: int, sw_name: str) -> str:
+    if expl_count == 0:
+        return ""
+    if expl_count == 1:
+        return (
+            f"Publicly available exploit code exists for one vulnerability in **{sw_name}**. "
+            "This lowers the technical skill required to mount an attack, increasing the "
+            "likelihood of exploitation by less sophisticated threat actors."
+        )
+    return (
+        f"Publicly available exploit code exists for **{expl_count} vulnerabilities** in "
+        f"**{sw_name}**. This significantly lowers the barrier to attack — these "
+        "vulnerabilities can be exploited by a wide range of threat actors with minimal "
+        "technical expertise."
+    )
+
+
+# Business-language remediation actions keyed to ATT&CK technique IDs.
+_TECHNIQUE_REMEDIATION: Dict[str, str] = {
+    "T1190": "Apply vendor security patches to all internet-accessible systems and review network access controls to limit unnecessary external exposure.",
+    "T1068": "Deploy vendor patches to eliminate the privilege-escalation pathway and enforce the principle of least privilege across all accounts.",
+    "T1059": "Restrict which users and processes can run system commands, and deploy endpoint protection capable of detecting anomalous command execution.",
+    "T1203": "Apply vendor patches and ensure endpoint protection is active on all workstations; consider email and web content filtering.",
+    "T1078": "Enforce multi-factor authentication on all systems, rotate compromised credentials, and audit account access regularly.",
+    "T1499": "Deploy availability protections such as rate limiting and redundancy, and apply vendor patches to eliminate the underlying weakness.",
+    "T1005": "Apply patches, enforce data-access controls, and ensure sensitive data is encrypted at rest.",
+    "T1557": "Enforce encrypted communications (TLS) across all internal and external systems and deploy network monitoring.",
+    "T1040": "Enforce encryption for all data in transit and segment the network to limit the scope of any interception.",
+    "T1110": "Enforce strong password policies, implement account-lockout controls, and deploy multi-factor authentication.",
+    "T1548": "Apply patches, enforce least-privilege access, and audit privileged-account activity.",
+    "T1552": "Rotate all stored credentials, move secrets to a dedicated vault solution, and scan for hardcoded credentials in codebases.",
+}
+
+
 def build_executive_report_markdown(
     all_rows: List[Dict[str, Any]],
-    report_title: str = "Executive Threat Intelligence Report",
+    report_title: str = "Executive Cyber Risk Brief",
     otx_results: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Executive report: leads with conclusion and implementation guidance,
-    then provides the why (findings summary). Minimal technical detail.
-    All references link to ATT&CK, D3FEND, NIST, NVD.
+    Board-ready Executive Cyber Risk Brief.
+
+    Audience: Executives, board members, program/acquisition/operational leadership,
+              and non-technical stakeholders.
+
+    Structure:
+      1. Executive Summary — overall posture, key decisions required
+      2. Overall Risk Posture — likelihood vs consequence heat map narrative
+      3. Most Critical Risks — business-language description per software
+      4. Attack Scenarios — what an adversary would actually do
+      5. Operational & Business Impacts — mission, financial, regulatory, reputational
+      6. Risk Trends — active exploitation activity
+      7. Strategic Recommendations — leadership decisions
+      8. Resource Implications — investment framing
+      9. Prioritized Remediation Roadmap — tiered action plan
+     10. Residual Organizational Risk — what remains after remediation
     """
+    import datetime
+
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in all_rows:
         key = (str(row.get("Software Name", "")).strip(), str(row.get("Software Version", "")).strip())
         grouped[key].append(row)
-
     otx_results = otx_results or {}
+    scan_date = datetime.datetime.now().strftime("%B %d, %Y")
 
-    # Aggregate stats for the opening conclusion
-    total_cves = len(all_rows)
-    sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    # ── Aggregate stats ──────────────────────────────────────────────────
+    total_cves   = len(all_rows)
+    sev_counts   = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for r in all_rows:
-        sev = str(r.get("CVSS Severity","") or "").upper()
+        sev = str(r.get("CVSS Severity", "") or "").upper()
         if sev in sev_counts:
             sev_counts[sev] += 1
-    kev_total   = sum(1 for r in all_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
-    expl_total  = sum(1 for r in all_rows if str(r.get("Public Exploit","")).upper() == "YES")
-    max_risk    = max((_to_float(r.get("Risk Score",0)) for r in all_rows), default=0.0)
-    software_names = sorted({str(r.get("Software Name","")).strip() for r in all_rows if r.get("Software Name")})
+    kev_total    = sum(1 for r in all_rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
+    expl_total   = sum(1 for r in all_rows if str(r.get("Public Exploit", "")).upper() == "YES")
+    confirmed_total = sum(1 for r in all_rows if str(r.get("Version Confirmed", "")).upper() == "YES")
+    max_risk     = max((_to_float(r.get("Risk Score", 0)) for r in all_rows), default=0.0)
+    sw_count     = len(grouped)
+    sw_names     = sorted({n for (n, _) in grouped.keys() if n})
+    top5         = _top_techniques(all_rows, top_n=5)
 
-    # Top techniques for way-forward section
-    top = _top_techniques(all_rows, top_n=5)
-
-    # TOC
-    sw_toc = "".join(
-        f'<li><a href="#{re.sub(chr(32)+chr(43)+chr(63)+"[^a-z0-9]+", "-", f"{n} {v}".lower()).strip("-")}">'
-        f'{html.escape(n)} {html.escape(v)}</a></li>'
-        for (n, v) in sorted(grouped.keys(), key=lambda x: x[0].lower())
+    # Active GreyNoise exploitation count
+    gn_active_total = sum(
+        1 for r in all_rows
+        if _THREAT_INTEL_CACHE.get(r.get("CVE ID", ""), {}).get("greynoise", {}).get("noise")
     )
+
+    # Overall posture
+    posture = _risk_posture_label(max_risk, sev_counts["CRITICAL"], kev_total, expl_total)
+
+    # ── TOC ──────────────────────────────────────────────────────────────
     toc_html = (
         '<h2>Contents</h2><ol>'
-        '<li><a href="#conclusion-and-way-forward">Conclusion &amp; Way Forward</a></li>'
-        '<li><a href="#immediate-implementation-guidance">Immediate Implementation Guidance</a></li>'
-        '<li><a href="#findings-summary-the-why">Findings Summary — The Why</a></li>'
-        f'<li><a href="#software-risk-overview">Software Risk Overview</a><ol>{sw_toc}</ol></li>'
+        '<li><a href="#executive-summary">Executive Summary</a></li>'
+        '<li><a href="#overall-risk-posture">Overall Risk Posture</a></li>'
+        '<li><a href="#most-critical-risks">Most Critical Risks</a></li>'
+        '<li><a href="#attack-scenarios">Attack Scenarios</a></li>'
+        '<li><a href="#operational-and-business-impacts">Operational and Business Impacts</a></li>'
+        '<li><a href="#risk-trends">Risk Trends</a></li>'
+        '<li><a href="#strategic-recommendations">Strategic Recommendations</a></li>'
+        '<li><a href="#resource-implications">Resource Implications</a></li>'
+        '<li><a href="#prioritized-remediation-roadmap">Prioritized Remediation Roadmap</a></li>'
+        '<li><a href="#residual-organizational-risk">Residual Organizational Risk</a></li>'
         '</ol>'
     )
 
     lines: List[str] = []
 
-    # ── 1. CONCLUSION & WAY FORWARD (lead) ──────────────────────────────
+    # ── SECTION 1 — EXECUTIVE SUMMARY ───────────────────────────────────
     lines += [
-        "## Conclusion and Way Forward",
+        "## Executive Summary",
         "",
-        f"The vulnerability assessment of **{len(software_names)}** software {'items' if len(software_names) != 1 else 'item'} "
-        f"identified **{total_cves} CVEs**, including "
-        f"**{sev_counts['CRITICAL']} Critical** and **{sev_counts['HIGH']} High** severity findings.",
-    ]
-    if kev_total:
-        lines.append(
-            f"**{kev_total} CVE{'s are' if kev_total != 1 else ' is'} listed in the "
-            f"[CISA Known Exploited Vulnerabilities catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)** "
-            "— these have confirmed active exploitation in the wild and require immediate action."
-        )
-    if expl_total:
-        lines.append(
-            f"**{expl_total} CVE{'s have' if expl_total != 1 else ' has'} publicly available exploit code**, "
-            "meaning the barrier to attack is minimal."
-        )
-    lines += [
-        "",
-        "**What needs to happen:**",
-        "",
-        "1. **Patch immediately** — Apply vendor patches for all KEV-listed CVEs within 24–72 hours.",
-        "2. **Patch urgently** — Address all Critical and High severity CVEs within your patch SLA.",
-        "3. **Harden** — Deploy the defensive controls identified below to reduce residual risk.",
-        "4. **Monitor** — Ensure detection coverage exists for the attack techniques identified.",
-        "5. **Validate** — Re-scan after patching to confirm remediation effectiveness.",
-        "",
-        "---",
+        f"**Assessment Date:** {scan_date}  |  "
+        f"**Systems Reviewed:** {sw_count}  |  "
+        f"**Overall Risk Posture:** {posture.split('—')[0].strip()}",
         "",
     ]
 
-    # ── 2. IMMEDIATE IMPLEMENTATION GUIDANCE ────────────────────────────
-    lines += [
-        "## Immediate Implementation Guidance",
-        "",
-        "The following defensive priorities address the highest-impact attack vectors:",
-        "",
-    ]
-    if top:
-        step = 1
-        for aid, cnt, meta in top:
-            tname   = meta.get("name", aid)
-            atk_url = f"https://attack.mitre.org/techniques/{aid.replace('.','/')}/"
-            d3fend  = meta.get("d3fend", [])
-            nist    = meta.get("nist", [])
-            lines.append(
-                f"**Priority {step}: [{tname}]({atk_url}) ({aid})** — affects {cnt} CVE{'s' if cnt != 1 else ''}"
-            )
-            if d3fend:
-                d3_links = ", ".join(
-                    f"[{cm}](https://d3fend.mitre.org/technique/d3f:{cm.replace(' ','')}/ \"D3FEND\")"
-                    for cm in d3fend[:3]
-                )
-                lines.append(f"- D3FEND controls: {d3_links}")
-            if nist:
-                nist_links = ", ".join(
-                    f"[{ctrl.split()[0]}](https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl.split()[0]} \"NIST SP 800-53\") — {ctrl}"
-                    for ctrl in nist[:3]
-                )
-                lines.append(f"- NIST 800-53: {nist_links}")
-            lines.append("")
-            step += 1
+    # Determine urgency framing
+    if kev_total > 0:
+        urgency_lead = (
+            f"This assessment identified **{kev_total} actively exploited "
+            f"{'vulnerability' if kev_total == 1 else 'vulnerabilities'}** across the "
+            f"reviewed systems. Threat actors are currently exploiting these weaknesses in "
+            f"real-world attacks against organizations worldwide. Immediate leadership "
+            f"action is required."
+        )
+    elif sev_counts["CRITICAL"] > 0 or expl_total > 0:
+        urgency_lead = (
+            f"This assessment identified **{sev_counts['CRITICAL']} critical-severity "
+            f"{'weakness' if sev_counts['CRITICAL'] == 1 else 'weaknesses'}** with "
+            f"{expl_total} publicly available attack tools, across {sw_count} reviewed "
+            f"systems. The probability of exploitation is elevated and prompt action is warranted."
+        )
     else:
-        lines.append("No ATT&CK technique mappings were resolved. Focus on patching identified CVEs directly.")
-        lines.append("")
+        urgency_lead = (
+            f"This assessment reviewed {sw_count} systems and identified "
+            f"{total_cves} security weaknesses requiring attention as part of a structured "
+            f"remediation programme."
+        )
+    lines += [urgency_lead, ""]
 
+    # Decision summary box
     lines += [
-        "---",
-        "",
-        "## Findings Summary — The Why",
-        "",
-        f"The scan covered **{len(software_names)}** software items: {', '.join(software_names)}.",
-        "",
-        f"Severity breakdown: Critical **{sev_counts['CRITICAL']}** | High **{sev_counts['HIGH']}** | "
-        f"Medium **{sev_counts['MEDIUM']}** | Low **{sev_counts['LOW']}**.",
+        "**Leadership decisions required:**",
         "",
     ]
-    if max_risk:
-        lines.append(f"Highest weighted risk score: **{max_risk:.1f}**/100.")
-        lines.append("")
-
-    if top:
-        lines.append("The most prevalent attack techniques observed:")
-        for aid, cnt, meta in top:
-            tactics_str = ", ".join(meta.get("tactics", [])) or "—"
-            atk_url = f"https://attack.mitre.org/techniques/{aid.replace('.','/')}/"
-            lines.append(f"- **[{meta['name']}]({atk_url})** ({aid}) — {cnt} CVE{'s' if cnt != 1 else ''}, Tactics: {tactics_str}")
-        lines.append("")
-
+    if kev_total > 0:
+        lines.append(f"- **Authorize emergency patching** for {kev_total} actively exploited {'system' if kev_total == 1 else 'systems'} — within 24–72 hours.")
+    if sev_counts["CRITICAL"] > 0:
+        lines.append(f"- **Direct IT/Security** to prioritize remediation of {sev_counts['CRITICAL']} critical-severity weaknesses within the current sprint/cycle.")
+    if expl_total > 0:
+        lines.append(f"- **Confirm monitoring is active** on systems with publicly available attack tools ({expl_total} {'instance' if expl_total == 1 else 'instances'}).")
     lines += [
-        "---",
+        "- **Review and approve** the remediation roadmap in Section 9.",
+        "- **Confirm resources** (personnel and budget) are allocated to address findings.",
         "",
-        "## Software Risk Overview",
+        "---",
         "",
     ]
 
-    # Per-software summary (high-level only — no raw CVE lists)
-    for (software_name, software_version), rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
-        rows.sort(key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
+    # ── SECTION 2 — OVERALL RISK POSTURE ────────────────────────────────
+    lines += [
+        "## Overall Risk Posture",
+        "",
+        f"**{posture}**",
+        "",
+    ]
 
-        total   = len(rows)
-        crit    = sum(1 for r in rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
-        high    = sum(1 for r in rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
-        kev_c   = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
-        expl_c  = sum(1 for r in rows if str(r.get("Public Exploit","")).upper() == "YES")
-        max_rs  = rows[0].get("Risk Score", 0)
-        rl      = rows[0].get("Risk Level", "INFO")
+    # Narrative posture paragraph
+    if kev_total > 0 or gn_active_total > 0:
+        lines.append(
+            f"The organization's current exposure is **elevated above baseline**. "
+            f"{'Active real-world exploitation of identified weaknesses has been confirmed. ' if kev_total > 0 else ''}"
+            f"{'Threat monitoring services have detected ongoing exploitation attempts targeting these specific vulnerabilities. ' if gn_active_total > 0 else ''}"
+            "The likelihood of a successful attack is high if remediation action is not taken promptly."
+        )
+    elif sev_counts["CRITICAL"] > 0 and expl_total > 0:
+        lines.append(
+            "The organization faces a **high-probability, high-consequence** threat scenario. "
+            "Critical weaknesses exist alongside publicly available attack tools, meaning "
+            "adversaries do not require advanced capabilities to mount a successful attack. "
+            "The window of opportunity for remediation before exploitation is narrow."
+        )
+    elif sev_counts["CRITICAL"] > 0:
+        lines.append(
+            "The organization has critical weaknesses that, if exploited, could result in "
+            "significant operational disruption or data loss. While no confirmed active "
+            "exploitation has been detected for these specific systems, the severity of the "
+            "weaknesses warrants prioritized attention."
+        )
+    else:
+        lines.append(
+            "The organization's current exposure is within a manageable range. "
+            "Identified weaknesses should be addressed through a structured remediation "
+            "programme to maintain a strong defensive posture."
+        )
+    lines.append("")
 
-        lines.append(f"# {software_name} {software_version}")
+    # Risk posture table
+    lines += [
+        "| Risk Dimension | Status | Assessment |",
+        "|---|---|---|",
+        f"| Active exploitation confirmed | {'⚠ YES' if kev_total > 0 else 'No'} | {'Immediate action required' if kev_total > 0 else 'No confirmed active exploitation at this time'} |",
+        f"| Attack tools publicly available | {'⚠ YES' if expl_total > 0 else 'No'} | {f'{expl_total} weaknesses have known, accessible attack tools' if expl_total > 0 else 'No publicly available attack tools identified'} |",
+        f"| Critical-severity weaknesses | {'⚠ YES' if sev_counts['CRITICAL'] > 0 else 'No'} | {str(sev_counts['CRITICAL']) + ' critical findings requiring priority attention' if sev_counts['CRITICAL'] > 0 else 'No critical findings'} |",
+        f"| Threat actor interest | {'⚠ Elevated' if gn_active_total > 0 else 'Standard'} | {'Active scanning and exploitation attempts observed' if gn_active_total > 0 else 'No anomalous threat activity detected'} |",
+        f"| Regulatory/compliance exposure | {'⚠ YES' if kev_total > 0 else 'Potential'} | {'KEV-listed vulnerabilities carry federal remediation mandates' if kev_total > 0 else 'Unpatched critical findings may create compliance gaps'} |",
+        "",
+        "---",
+        "",
+    ]
+
+    # ── SECTION 3 — MOST CRITICAL RISKS ─────────────────────────────────
+    lines += [
+        "## Most Critical Risks",
+        "",
+        "The following systems represent the highest-priority risk to the organization. "
+        "Each entry describes the nature of the risk in operational terms.",
+        "",
+    ]
+
+    # Rank software by criticality
+    sw_ranked = sorted(
+        grouped.items(),
+        key=lambda kv: (
+            sum(1 for r in kv[1] if str(r.get("Known Exploited Vulnerability","")).upper() == "YES"),
+            sum(1 for r in kv[1] if str(r.get("Public Exploit","")).upper() == "YES"),
+            sum(1 for r in kv[1] if str(r.get("CVSS Severity","")).upper() == "CRITICAL"),
+            max((_to_float(r.get("Risk Score",0)) for r in kv[1]), default=0.0),
+        ),
+        reverse=True,
+    )
+
+    for (sw_name, sw_ver), sw_rows in sw_ranked:
+        sw_rows_sorted = sorted(sw_rows, key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
+        crit    = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+        high    = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+        kev_c   = sum(1 for r in sw_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+        expl_c  = sum(1 for r in sw_rows if str(r.get("Public Exploit","")).upper() == "YES")
+        max_rs  = max((_to_float(r.get("Risk Score",0)) for r in sw_rows), default=0.0)
+        posture_sw = _risk_posture_label(max_rs, crit, kev_c, expl_c)
+
+        label_parts = posture_sw.split("—")[0].strip()
+        lines.append(f"### {sw_name}")
+        pub_sw   = str(sw_rows_sorted[0].get("Publisher", "") or "") if sw_rows_sorted else ""
+        idate_sw = str(sw_rows_sorted[0].get("Install Date", "") or "") if sw_rows_sorted else ""
+        if pub_sw or idate_sw:
+            meta_parts = []
+            if pub_sw:   meta_parts.append(f"Publisher: {pub_sw}")
+            if idate_sw: meta_parts.append(f"Installed: {idate_sw}")
+            lines.append(f"*{' | '.join(meta_parts)}*")
+        lines.append(f"**Risk Level: {label_parts}**")
         lines.append("")
-        lines.append(f"- Overall Risk: **{rl}** (score {max_rs})  |  CVEs: {total}  |  Critical: {crit}  |  High: {high}")
-        if kev_c:
-            lines.append(f"- ⚠ **{kev_c} KEV-listed CVE{'s' if kev_c != 1 else ''}** — active exploitation documented")
-        if expl_c:
-            lines.append(f"- **{expl_c} CVE{'s have' if expl_c != 1 else ' has'} public exploit code** available")
 
-        # Threat intelligence summary
-        otx_key = f"{software_name} {software_version}".strip()
-        if otx_key in otx_results:
-            otx_data    = otx_results[otx_key]
-            cve_counts  = otx_data.get("cve_pulse_counts", {})
-            active_cves = [cid for cid in cve_counts
-                           if _THREAT_INTEL_CACHE.get(cid, {}).get("greynoise", {}).get("noise")]
-            if active_cves:
+        # Patch age context for executives
+        age_vals: List[int] = []
+        for r in sw_rows_sorted:
+            try:
+                age_vals.append(int(str(r.get("Patch Age (Days)", "") or "")))
+            except ValueError:
+                pass
+        if age_vals:
+            max_age_sw = max(age_vals)
+            if max_age_sw > 180:
                 lines.append(
-                    f"- ⚠ **{len(active_cves)} CVE(s)** show active in-the-wild exploitation (GreyNoise)"
+                    f"⚠ **Long-standing exposure:** Vulnerable software has been installed for over "
+                    f"{max_age_sw} days. CVEs disclosed during this period represent an unpatched window "
+                    "of risk that has been open for an extended time."
                 )
+                lines.append("")
+            elif max_age_sw > 30:
+                lines.append(
+                    f"This software has been installed for {max_age_sw} days. "
+                    "One or more CVEs were disclosed during the current installation period."
+                )
+                lines.append("")
 
-        # Top 3 CVEs (names + NVD links only — no CVSS vectors etc.)
-        lines.append("")
-        lines.append("**Top vulnerabilities by risk:**")
-        for r in rows[:3]:
-            cid  = r.get("CVE ID","")
-            nvd  = r.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cid}"
-            sev  = r.get("CVSS Severity","")
-            rs   = r.get("Risk Score","")
-            desc = str(r.get("Description","") or "").strip()
-            if len(desc) > 150:
-                desc = desc[:147] + "…"
-            lines.append(f"- [{cid}]({nvd}) — {sev}, Risk {rs}: {desc}")
+        # Business-language description of what the weaknesses allow
+        scenarios = _attack_scenario_business(sw_rows_sorted, sw_name)
+        if scenarios:
+            lines.append("**What this means for the organization:**")
+            lines.append("")
+            for s in scenarios[:2]:
+                lines.append(f"- {s}")
+            lines.append("")
 
-        lines.append("")
+        # KEV and exploit statements
+        kev_stmt  = _kev_business_statement(kev_c, sw_name)
+        expl_stmt = _exploit_business_statement(expl_c, sw_name)
+        if kev_stmt:
+            lines.append(kev_stmt)
+            lines.append("")
+        if expl_stmt:
+            lines.append(expl_stmt)
+            lines.append("")
+
+        # GreyNoise active exploitation signal
+        gn_active_sw = sum(
+            1 for r in sw_rows
+            if _THREAT_INTEL_CACHE.get(r.get("CVE ID",""), {}).get("greynoise", {}).get("noise")
+        )
+        if gn_active_sw > 0:
+            lines.append(
+                f"⚠ **Threat monitoring services have detected active exploitation attempts** "
+                f"targeting {gn_active_sw} of the weaknesses in {sw_name}. This indicates "
+                "adversaries are currently probing or attacking systems with these vulnerabilities."
+            )
+            lines.append("")
+
+        # Concise severity summary — no CVE IDs, no CVSS numbers
+        impact_parts = []
+        if crit > 0:
+            impact_parts.append(f"{crit} weakness{'es' if crit != 1 else ''} rated as the highest possible severity")
+        if high > 0:
+            impact_parts.append(f"{high} high-severity weakness{'es' if high != 1 else ''}")
+        if impact_parts:
+            lines.append(f"**Scope:** {'; '.join(impact_parts)}.")
+            lines.append("")
+
         lines.append("---")
+        lines.append("")
+
+    # ── SECTION 4 — ATTACK SCENARIOS ────────────────────────────────────
+    lines += [
+        "## Attack Scenarios",
+        "",
+        "The following scenarios describe how an adversary could realistically exploit "
+        "the identified weaknesses. These are not hypothetical — they represent documented "
+        "attack patterns used by threat actors against organizations with similar exposures.",
+        "",
+    ]
+
+    # Build scenarios from top ATT&CK techniques across all findings
+    scenario_count = 0
+    seen_scenario_aids: set = set()
+    for aid, cnt, meta in top5:
+        if aid in seen_scenario_aids:
+            continue
+        seen_scenario_aids.add(aid)
+        scenario_count += 1
+        tactic_list = meta.get("tactics", [])
+        narrative   = _technique_to_business(aid, tactic_list)
+        tactics_str = ", ".join(tactic_list) if tactic_list else "general attack activity"
+
+        # Determine which software is affected
+        affected_sw = []
+        for (sn, sv), sw_rows in grouped.items():
+            for r in sw_rows:
+                attacks = _split_multi(r.get("ATT&CK Techniques",""))
+                if any(aid in a for a in attacks):
+                    if sn not in affected_sw:
+                        affected_sw.append(sn)
+                    break
+
+        lines.append(f"### Scenario {scenario_count}: {meta.get('name', aid)}")
+        lines.append(f"**Threat phase:** {tactics_str.title()}")
+        lines.append(f"**Affects:** {', '.join(affected_sw) if affected_sw else 'Multiple systems'}")
+        lines.append("")
+        lines.append(narrative)
+        lines.append("")
+
+        # Remediation action in business language
+        remediation = _TECHNIQUE_REMEDIATION.get(aid)
+        if remediation:
+            lines.append(f"**How to reduce this risk:** {remediation}")
+            lines.append("")
+
+    if scenario_count == 0:
+        lines.append("No specific attack scenarios could be mapped from the current findings.")
+        lines.append("")
+
+    lines += ["---", ""]
+
+    # ── SECTION 5 — OPERATIONAL & BUSINESS IMPACTS ──────────────────────
+    lines += [
+        "## Operational and Business Impacts",
+        "",
+        "If the identified weaknesses are exploited, the organization may experience "
+        "the following consequences:",
+        "",
+    ]
+
+    # Derive impact categories from what was found
+    has_rce    = any(aid in seen_scenario_aids for aid in ["T1190","T1059","T1203"])
+    has_privesc= "T1068" in seen_scenario_aids or "T1548" in seen_scenario_aids
+    has_data   = any(aid in seen_scenario_aids for aid in ["T1005","T1552","T1040","T1557"])
+    has_dos    = "T1499" in seen_scenario_aids
+    has_persist= any(aid in seen_scenario_aids for aid in ["T1078","T1105"])
+
+    impact_lines: List[str] = []
+
+    if has_rce or kev_total > 0:
+        impact_lines.append(
+            "**Operational Disruption** — Unauthorized control of systems could disrupt "
+            "mission-critical operations, cause unplanned downtime, and require emergency "
+            "response resources to contain and recover."
+        )
+    if has_data:
+        impact_lines.append(
+            "**Data Breach / Information Loss** — Sensitive organizational data, personnel "
+            "records, or intellectual property could be accessed and exfiltrated, triggering "
+            "breach notification obligations and reputational damage."
+        )
+    if has_privesc:
+        impact_lines.append(
+            "**Escalating Compromise** — Once inside, attackers could gain administrative "
+            "control, expanding the scope of a breach well beyond the initial point of entry "
+            "and increasing recovery costs significantly."
+        )
+    if has_dos:
+        impact_lines.append(
+            "**Service Availability Loss** — Systems could be rendered unavailable, "
+            "disrupting operations, impacting customers or mission partners, and incurring "
+            "financial loss from downtime."
+        )
+    if has_persist:
+        impact_lines.append(
+            "**Long-Term Persistent Access** — Attackers could maintain hidden, long-term "
+            "access to organizational systems — surviving remediation efforts — enabling "
+            "ongoing data theft, surveillance, or future disruptive action."
+        )
+    if kev_total > 0:
+        impact_lines.append(
+            "**Regulatory and Compliance Exposure** — Active exploitation of federal "
+            "mandate-listed vulnerabilities may trigger reporting requirements, audit "
+            "findings, or contractual penalties depending on your regulatory environment."
+        )
+    if expl_total > 0 and not kev_total:
+        impact_lines.append(
+            "**Reputational Risk** — A successful attack exploiting publicly known, "
+            "unpatched vulnerabilities may attract external scrutiny and raise questions "
+            "about the organization's security posture and due diligence."
+        )
+
+    # Supply chain consideration
+    sc_sw = [n for n in sw_names if any(
+        keyword in n.lower() for keyword in
+        ["library","sdk","framework","runtime","driver","agent","client","connector","plugin","module"]
+    )]
+    if sc_sw:
+        impact_lines.append(
+            f"**Supply Chain Risk** — Vulnerabilities in foundational software components "
+            f"({', '.join(sc_sw[:3])}) could have downstream effects on dependent "
+            "applications and services, potentially amplifying the scope of any breach."
+        )
+
+    if not impact_lines:
+        impact_lines.append(
+            "**Operational Risk** — Identified weaknesses, if exploited, could disrupt "
+            "operations, expose sensitive data, and require unplanned remediation resources."
+        )
+
+    for imp in impact_lines:
+        lines.append(f"- {imp}")
+        lines.append("")
+
+    lines += ["---", ""]
+
+    # ── SECTION 6 — RISK TRENDS ──────────────────────────────────────────
+    lines += [
+        "## Risk Trends",
+        "",
+    ]
+
+    if kev_total > 0 or gn_active_total > 0:
+        lines.append(
+            "**Exploitation activity is confirmed and current.** The threat environment "
+            "for the assessed systems is active:"
+        )
+        lines.append("")
+        if kev_total > 0:
+            lines.append(
+                f"- **{kev_total} {'vulnerability has' if kev_total == 1 else 'vulnerabilities have'}** "
+                "been added to the U.S. government's catalog of weaponized vulnerabilities, "
+                "confirming real-world exploitation by threat actors."
+            )
+        if gn_active_total > 0:
+            lines.append(
+                f"- **Active scanning and exploitation attempts** have been observed against "
+                f"{gn_active_total} of the identified weaknesses, indicating threat actors are "
+                "actively targeting systems with these vulnerabilities."
+            )
+        if expl_total > 0:
+            lines.append(
+                f"- **{expl_total} {'weakness has' if expl_total == 1 else 'weaknesses have'}** "
+                "publicly available attack tools, lowering the barrier for less sophisticated attackers."
+            )
+    elif expl_total > 0:
+        lines.append(
+            f"**Attack tools are publicly available** for {expl_total} of the identified "
+            "weaknesses. While no confirmed active exploitation has been detected, the "
+            "availability of attack tools increases the probability of exploitation over time. "
+            "The risk trajectory is upward if remediation is delayed."
+        )
+    else:
+        lines.append(
+            "No confirmed active exploitation of the identified weaknesses has been detected "
+            "at this time. However, the presence of unpatched vulnerabilities represents an "
+            "ongoing and increasing risk as threat actors continue to expand their target sets."
+        )
+    lines += ["", "---", ""]
+
+    # ── SECTION 7 — STRATEGIC RECOMMENDATIONS ───────────────────────────
+    lines += [
+        "## Strategic Recommendations",
+        "",
+        "The following recommendations are directed at leadership and require organizational "
+        "decision-making, resourcing, or policy action:",
+        "",
+    ]
+
+    rec_num = 1
+    if kev_total > 0:
+        lines.append(
+            f"**{rec_num}. Authorize Emergency Remediation** — Direct security and IT teams to "
+            f"immediately patch the {kev_total} actively exploited {'weakness' if kev_total == 1 else 'weaknesses'} "
+            "identified in this report. Establish a 24–72 hour remediation deadline and "
+            "confirm completion."
+        )
+        lines.append("")
+        rec_num += 1
+
+    if sev_counts["CRITICAL"] > 0 or sev_counts["HIGH"] > 0:
+        lines.append(
+            f"**{rec_num}. Establish a Formal Patch Management Programme** — The volume of "
+            f"critical ({sev_counts['CRITICAL']}) and high ({sev_counts['HIGH']}) severity "
+            "findings indicates a need for a structured, time-bound patching process with "
+            "defined service-level targets and executive visibility into compliance."
+        )
+        lines.append("")
+        rec_num += 1
+
+    lines.append(
+        f"**{rec_num}. Verify Monitoring and Detection Coverage** — Confirm that security "
+        "monitoring tools are actively watching for signs of exploitation on the systems "
+        "identified in this report. Gaps in detection capability increase dwell time if "
+        "an attack occurs."
+    )
+    lines.append("")
+    rec_num += 1
+
+    if total_cves > 20:
+        lines.append(
+            f"**{rec_num}. Invest in Vulnerability Management Capability** — The scale of "
+            f"findings ({total_cves} weaknesses across {sw_count} systems) suggests that "
+            "vulnerability management may benefit from additional tooling, staffing, or "
+            "process improvements to sustain a lower ongoing risk profile."
+        )
+        lines.append("")
+        rec_num += 1
+
+    lines.append(
+        f"**{rec_num}. Schedule a Follow-On Assessment** — After completing remediation, "
+        "conduct a validation scan to confirm the risk has been reduced and to identify "
+        "any newly disclosed vulnerabilities in the assessed systems."
+    )
+    lines.append("")
+    lines += ["---", ""]
+
+    # ── SECTION 8 — RESOURCE IMPLICATIONS ───────────────────────────────
+    lines += [
+        "## Resource Implications",
+        "",
+        "Addressing the findings in this report will require coordination across IT, "
+        "security, and operational teams. The following resource categories should be "
+        "considered:",
+        "",
+    ]
+
+    if kev_total > 0:
+        lines.append(
+            "- **Immediate response capacity** — Security and IT personnel will need to be "
+            f"allocated for emergency patching of the {kev_total} actively exploited "
+            "{'system' if kev_total == 1 else 'systems'}, potentially requiring after-hours effort."
+        )
+    if sev_counts["CRITICAL"] + sev_counts["HIGH"] > 0:
+        lines.append(
+            f"- **Planned remediation effort** — Patching and hardening {sev_counts['CRITICAL'] + sev_counts['HIGH']} "
+            "critical and high-severity findings across the assessed systems will require "
+            "scheduled maintenance windows, testing, and change-management processes."
+        )
+    lines += [
+        "- **Testing and validation** — Patches must be tested in non-production environments "
+        "before deployment to avoid operational disruption, and re-scanned post-deployment "
+        "to confirm effectiveness.",
+        "- **Monitoring uplift** — If detection gaps exist, investment in security monitoring "
+        "tools or managed security services may be warranted to improve response capability.",
+        "",
+        "---",
+        "",
+    ]
+
+    # ── SECTION 9 — PRIORITIZED REMEDIATION ROADMAP ─────────────────────
+    lines += [
+        "## Prioritized Remediation Roadmap",
+        "",
+        "The following tiered action plan is recommended, ordered by urgency and impact:",
+        "",
+        "| Priority | Timeframe | Action | Rationale |",
+        "|---|---|---|---|",
+    ]
+
+    if kev_total > 0:
+        lines.append(
+            f"| **1 — Emergency** | 24–72 hours | Apply patches for {kev_total} actively exploited "
+            f"{'weakness' if kev_total == 1 else 'weaknesses'} | Confirmed real-world exploitation — "
+            "highest probability of immediate harm |"
+        )
+    if sev_counts["CRITICAL"] > 0:
+        lines.append(
+            f"| **2 — Critical** | Within 7 days | Remediate {sev_counts['CRITICAL']} critical-severity "
+            "weaknesses | Exploitation would have maximum organizational impact |"
+        )
+    if expl_total > 0:
+        lines.append(
+            f"| **3 — Urgent** | Within 14 days | Address {expl_total} weaknesses with public attack tools | "
+            "Attack barrier is low; exploitation probability is elevated |"
+        )
+    if sev_counts["HIGH"] > 0:
+        lines.append(
+            f"| **4 — High Priority** | Within 30 days | Patch {sev_counts['HIGH']} high-severity weaknesses | "
+            "Significant potential impact; systematic remediation required |"
+        )
+    if sev_counts["MEDIUM"] + sev_counts["LOW"] > 0:
+        lines.append(
+            f"| **5 — Routine** | Within 90 days | Address remaining {sev_counts['MEDIUM'] + sev_counts['LOW']} "
+            "moderate and low-severity findings | Standard patch cadence is appropriate |"
+        )
+    lines.append(
+        "| **Ongoing** | Continuous | Re-scan after each remediation wave; subscribe to vendor advisories | "
+        "New vulnerabilities are disclosed continuously; sustained vigilance is required |"
+    )
+    lines += ["", "---", ""]
+
+    # ── SECTION 10 — RESIDUAL ORGANIZATIONAL RISK ───────────────────────
+    lines += [
+        "## Residual Organizational Risk",
+        "",
+        "Even after completing the remediation roadmap above, a degree of residual "
+        "risk will remain. Leadership should be aware of the following:",
+        "",
+    ]
+
+    residual: List[str] = []
+    residual.append(
+        "**New vulnerabilities will continue to be disclosed** in the assessed software. "
+        "The remediation of today's findings does not guarantee the absence of future risk — "
+        "a continuous monitoring and patching programme is essential."
+    )
+    if sev_counts["MEDIUM"] + sev_counts["LOW"] > 0:
+        residual.append(
+            f"**{sev_counts['MEDIUM'] + sev_counts['LOW']} moderate and lower-severity weaknesses** "
+            "will remain until the routine remediation phase is complete. While individually "
+            "less impactful, attackers can chain lower-severity weaknesses to achieve "
+            "significant outcomes."
+        )
+    if total_cves > confirmed_total and confirmed_total > 0:
+        residual.append(
+            "**Not all identified weaknesses have been version-confirmed** against the exact "
+            "software deployed. Some findings are based on product matching and may not all "
+            "apply — a targeted review by IT teams is recommended to validate applicability."
+        )
+    residual.append(
+        "**Human factors and process gaps** — technical patching addresses software "
+        "vulnerabilities but does not mitigate risks arising from phishing, weak passwords, "
+        "insider threats, or misconfigured access controls. A holistic security programme "
+        "should address these dimensions in parallel."
+    )
+    residual.append(
+        "**Supply chain and third-party risk** — this assessment covers identified software "
+        "components but does not account for vulnerabilities in third-party services, "
+        "cloud providers, or vendor-managed systems that may pose indirect risk."
+    )
+
+    for r_item in residual:
+        lines.append(f"- {r_item}")
         lines.append("")
 
     full_md  = "\n".join(lines).strip() + "\n"
@@ -2864,7 +3528,7 @@ def build_executive_report_markdown(
         title=report_title,
         body_md=full_md,
         logo_b64=logo_b64,
-        subtitle="Executive Summary",
+        subtitle="Cyber Risk Brief — Executive & Leadership Audience",
         toc_html=toc_html,
     )
 
@@ -3309,211 +3973,1192 @@ def _defensive_monitoring_checklist(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# ======================================================================
+#  TECHNICAL & DEFENSIVE ENGINEERING REPORT — Supporting data structures
+# ======================================================================
+
+# CWE → plain-language technical impact description
+_CWE_TECHNICAL_IMPACT: Dict[str, str] = {
+    "CWE-78":   "OS command injection — attacker-supplied input is executed by the operating system shell, enabling arbitrary command execution with the privileges of the affected process.",
+    "CWE-77":   "Command injection — unsanitized input is interpreted as shell commands, enabling arbitrary command execution.",
+    "CWE-89":   "SQL injection — attacker-controlled input is interpreted as SQL, enabling unauthorized database read/write, authentication bypass, or lateral movement via linked servers.",
+    "CWE-79":   "Cross-site scripting (XSS) — attacker-controlled script executes in victim browsers, enabling session hijacking, credential theft, or DOM manipulation.",
+    "CWE-94":   "Code injection — attacker-supplied data is evaluated as executable code, bypassing application logic and enabling arbitrary execution.",
+    "CWE-502":  "Deserialization of untrusted data — crafted serialized objects trigger arbitrary code execution or object injection during the deserialization process.",
+    "CWE-119":  "Buffer overflow — memory corruption outside allocated bounds can corrupt adjacent heap/stack structures, enabling controlled code execution or denial of service.",
+    "CWE-120":  "Classic buffer overflow — unbounded copy operations write past allocation boundaries, creating direct memory corruption primitives for exploitation.",
+    "CWE-125":  "Out-of-bounds read — memory read beyond buffer boundaries leaks adjacent heap/stack content, potentially disclosing pointers, keys, or sensitive data.",
+    "CWE-787":  "Out-of-bounds write — memory corruption primitive enabling heap/stack manipulation for controlled code execution or privilege escalation.",
+    "CWE-416":  "Use-after-free — access to freed memory regions creates type confusion and read/write primitives exploitable for code execution.",
+    "CWE-476":  "NULL pointer dereference — process crash on NULL dereference, exploitable as a denial-of-service primitive; rarely exploitable for code execution.",
+    "CWE-190":  "Integer overflow — arithmetic overflow corrupts size or index calculations, creating heap overflow conditions downstream.",
+    "CWE-122":  "Heap-based buffer overflow — off-by-N writes on the heap corrupt allocator metadata or adjacent objects, enabling code execution.",
+    "CWE-22":   "Path traversal — unsanitized path separators (../) allow reads/writes outside the intended directory, enabling config disclosure, log poisoning, or code placement.",
+    "CWE-434":  "Unrestricted file upload — server accepts attacker-supplied files without type validation, enabling web shell deployment or malicious library loading.",
+    "CWE-287":  "Authentication bypass — authentication logic can be circumvented without valid credentials, granting unauthorized access.",
+    "CWE-306":  "Missing authentication — critical functionality exposed without authentication requirement.",
+    "CWE-862":  "Missing authorization — authenticated users can access resources or operations beyond their intended privilege level.",
+    "CWE-863":  "Incorrect authorization — access control checks are performed against incorrect principals or contexts.",
+    "CWE-269":  "Improper privilege management — privileges are acquired, retained, or released incorrectly, enabling privilege escalation or lock-in of elevated rights.",
+    "CWE-798":  "Hard-coded credentials — static credentials embedded in code or binaries are extractable via reverse engineering, providing unconditional authentication bypass.",
+    "CWE-521":  "Weak password requirements — no enforcement of complexity or length minimums, enabling brute-force and dictionary attacks.",
+    "CWE-307":  "Improper restriction of authentication attempts — no lockout or rate-limiting, enabling unlimited credential guessing.",
+    "CWE-327":  "Use of broken cryptographic algorithm — deprecated cipher suite (e.g., RC4, DES, MD5) susceptible to known cryptanalytic attacks.",
+    "CWE-295":  "Improper certificate validation — TLS certificate chain not validated, enabling MitM attacks on encrypted channels.",
+    "CWE-326":  "Inadequate encryption strength — key length below modern standards (e.g., RSA-1024, ECC-160) vulnerable to factoring or discrete-log attacks.",
+    "CWE-319":  "Cleartext transmission — sensitive data transmitted without encryption, interceptable by passive network adversaries.",
+    "CWE-200":  "Information exposure — internal state, stack traces, or sensitive data returned to unauthorized parties via error messages or API responses.",
+    "CWE-532":  "Information exposure through log files — credentials, tokens, or PII written to logs accessible beyond intended audience.",
+    "CWE-611":  "XML external entity (XXE) injection — XML parser processes external entity declarations, enabling SSRF, file disclosure, or denial of service.",
+    "CWE-400":  "Uncontrolled resource consumption — absent resource limits allow attacker-driven memory exhaustion, CPU saturation, or thread starvation.",
+    "CWE-770":  "Allocation of resources without limits — unbounded allocation leads to OOM conditions or connection exhaustion under adversarial load.",
+    "CWE-918":  "Server-side request forgery (SSRF) — server fetches attacker-specified URIs, enabling access to internal services, metadata endpoints, or cloud IMDS.",
+    "CWE-352":  "Cross-site request forgery (CSRF) — absent CSRF token allows attacker-crafted pages to trigger authenticated actions in victim sessions.",
+    "CWE-732":  "Incorrect permission assignment — files or directories with overly permissive ACLs allow unauthorized read, write, or execution.",
+    "CWE-276":  "Incorrect default permissions — installation creates resources with world-readable or world-writable permissions.",
+    "CWE-362":  "Race condition (TOCTOU) — time-of-check to time-of-use window enables privilege escalation via symlink or file substitution attacks.",
+    "CWE-20":   "Improper input validation — insufficient bounds or type checking on external input; root cause for many injection, overflow, and traversal vulnerabilities.",
+}
+
+# ATT&CK technique ID -> technical detection recommendations
+_TECHNIQUE_DETECTION: Dict[str, List[str]] = {
+    "T1190": [
+        "Monitor web/application server logs for anomalous request patterns: unusually long query strings, encoded payloads (%2F, %00, ../), or unexpected HTTP verbs.",
+        "Alert on process creation events where the parent is a web server process (e.g., IIS spawning cmd.exe, Apache spawning /bin/sh).",
+        "Deploy WAF rules to detect and block common exploitation patterns (SQLi, XSS, command injection payloads).",
+        "Monitor for unexpected outbound connections from application server hosts immediately following inbound exploit attempts.",
+    ],
+    "T1068": [
+        "Enable process creation auditing (Windows Event 4688 / Linux auditd execve) and alert on privilege transitions from standard to SYSTEM/root context.",
+        "Monitor for token impersonation API calls (NtCreateToken, ZwDuplicateToken) from non-privileged processes.",
+        "Alert on unexpected writes to privileged directories (C:\\Windows\\System32, /etc/sudoers.d) from unprivileged processes.",
+        "Deploy kernel exploit mitigations: Credential Guard, SMEP, SMAP, Supervisor Mode Execution Prevention.",
+    ],
+    "T1059": [
+        "Log and alert on suspicious command-line arguments: base64 blobs, -EncodedCommand (PowerShell), IEX, Invoke-Expression, curl|bash patterns.",
+        "Enable Script Block Logging (PowerShell) and Module Logging; forward to SIEM.",
+        "Alert on unusual parent-child process chains (e.g., Office spawning wscript, web server spawning interpreter).",
+        "Restrict interpreter execution via application whitelisting (AppLocker/WDAC on Windows, AppArmor/SELinux on Linux).",
+    ],
+    "T1203": [
+        "Deploy endpoint detection (EDR) with memory-scanning and shellcode detection on all endpoints.",
+        "Alert on heap spray indicators: large uniform memory allocations in process heap.",
+        "Monitor for ROP chain indicators: unusual ret-after-call patterns in exception records.",
+        "Enforce Exploit Protection settings (DEP, ASLR, CFG, SEHOP) on the affected application.",
+    ],
+    "T1078": [
+        "Alert on authentication from unusual source IPs, user-agents, or at anomalous times relative to historical baseline.",
+        "Monitor for credential stuffing indicators: high failure-to-success ratio from single IPs across many accounts.",
+        "Enable MFA; alert on MFA bypass attempts (push fatigue, SIM swap indicators).",
+        "Audit service account activity; alert on service accounts performing interactive logons.",
+    ],
+    "T1499": [
+        "Establish rate-limiting and connection throttling at the network edge for affected service ports.",
+        "Monitor for volumetric anomalies: sudden bandwidth spikes, connection-rate outliers from single sources.",
+        "Enable SYN cookies on affected hosts; deploy upstream scrubbing for L3/L4 floods.",
+        "Alert on application-layer resource exhaustion: thread pool saturation, connection queue overflow events.",
+    ],
+    "T1005": [
+        "Enable file access auditing on sensitive directories; alert on bulk read operations by non-authorized processes.",
+        "Monitor for staging indicators: large archive creation (zip, tar, 7z) in temp directories.",
+        "Alert on unusual access to credential stores: LSASS memory reads (Windows), /etc/shadow access (Linux), browser credential store access.",
+    ],
+    "T1557": [
+        "Deploy 802.1X port authentication to prevent unauthorized network devices.",
+        "Monitor for ARP spoofing: duplicate MAC-to-IP mappings, unexpected ARP replies.",
+        "Enable DNSSEC and monitor for DNS response anomalies (unexpected TTL changes, answer substitution).",
+        "Enforce mutual TLS (mTLS) on sensitive service-to-service communications.",
+    ],
+    "T1040": [
+        "Monitor for promiscuous-mode NIC flags (ifconfig promisc, ip link show) on host systems.",
+        "Alert on unexpected packet capture tools (tcpdump, Wireshark, tshark) executing on non-analyst systems.",
+        "Enforce TLS encryption on all inter-service communications to render passive capture ineffective.",
+    ],
+    "T1110": [
+        "Alert on repeated authentication failures from single sources exceeding threshold (e.g., >10 failures in 60 seconds).",
+        "Monitor for distributed brute-force: low-and-slow attempts distributed across many source IPs.",
+        "Enable account lockout policies; monitor for lockout events as an indicator of brute-force campaigns.",
+        "Deploy CAPTCHA or adaptive authentication on externally accessible login endpoints.",
+    ],
+    "T1548": [
+        "Audit UAC bypass events (Windows Event 4673, 4674) and alert on elevation from unexpected contexts.",
+        "Monitor sudo command execution on Linux; alert on unusual sudo -l enumeration or unexpected privilege grants.",
+        "Alert on setuid/setgid bit modification on Linux executable files.",
+    ],
+    "T1222": [
+        "Enable file and directory permission change auditing (Windows 4670; Linux auditd chmod syscall).",
+        "Alert on mass permission change events affecting large numbers of files in short time windows.",
+    ],
+    "T1552": [
+        "Alert on access to known credential storage locations: Windows Credential Manager, SAM hive, LSA secrets, .ssh/ directories.",
+        "Monitor for environment variable enumeration (set / env / printenv) from unexpected processes.",
+        "Deploy secrets scanning in CI/CD pipelines; alert on commits containing credential patterns.",
+    ],
+    "T1090": [
+        "Monitor for SOCKS proxy establishment from internal hosts to external IPs.",
+        "Alert on unusual port-forwarding rules (netsh interface portproxy, ssh -L/-R, rinetd).",
+        "Deploy egress filtering to block outbound connections on non-standard ports from application hosts.",
+    ],
+    "T1189": [
+        "Deploy DNS-based threat filtering to block known malicious domains.",
+        "Monitor browser process children for unexpected executable launches.",
+        "Enable Exploit Protection (EMET-equivalent) for browser processes.",
+    ],
+}
+
+# ATT&CK technique ID -> actionable technical mitigations
+_TECHNIQUE_MITIGATION: Dict[str, List[str]] = {
+    "T1190": [
+        "Apply the vendor security patch immediately. Verify the patched version is deployed using package metadata or binary version strings.",
+        "Implement strict input validation and parameterized queries/prepared statements at the application layer for all external-facing inputs.",
+        "Restrict network access to the affected service using host-based firewall rules or network ACLs; limit exposure to required source IPs only.",
+        "Deploy a WAF with rule sets targeting the relevant vulnerability class (SQLi, XSS, RCE payloads) as a compensating control pending patch deployment.",
+        "Review and revoke any excess permissions held by the service account running the affected component.",
+    ],
+    "T1068": [
+        "Apply the vendor patch. Privilege escalation vulnerabilities typically require local code execution as a prerequisite — patch both the PE vector and any initial access CVEs.",
+        "Enforce mandatory integrity controls: run the affected service under a restricted account; apply SELinux/AppArmor profiles on Linux or MIC on Windows.",
+        "Enable kernel exploit mitigations: Credential Guard (Windows), SMEP/SMAP (enforced at OS level), Kernel Page Table Isolation.",
+        "Audit and reduce service account privileges — apply principle of least privilege; remove local administrator rights from service accounts.",
+    ],
+    "T1059": [
+        "Disable or restrict the relevant interpreter where not operationally required (e.g., PowerShell Constrained Language Mode, shell restrictions via /etc/shells).",
+        "Apply application whitelisting (AppLocker/WDAC on Windows) to prevent execution of unauthorized scripts and binaries.",
+        "Restrict the affected application's ability to spawn child processes using OS-level controls (seccomp, AppArmor, Windows Job Objects).",
+        "Patch the underlying vulnerability that enables the code path to reach the interpreter.",
+    ],
+    "T1203": [
+        "Apply the vendor patch. Client-side exploitation typically targets browser engines, document parsers, or media codecs.",
+        "Enable Exploit Protection controls: DEP, ASLR, CFG, and SEHOP on the affected application.",
+        "Disable the vulnerable feature or file-type handler if operationally feasible while awaiting patching.",
+        "Deploy EDR with memory-resident exploit detection (shellcode scanning, ROP detection) on all endpoints.",
+    ],
+    "T1078": [
+        "Enforce MFA on all external-facing and privileged authentication endpoints.",
+        "Rotate all credentials for accounts that may be exposed by the vulnerability; audit recently authenticated sessions for indicators of compromise.",
+        "Implement account lockout and alerting for failed authentication patterns.",
+        "Review service accounts: disable interactive logon capability; scope to minimum required permissions.",
+    ],
+    "T1499": [
+        "Apply the patch to eliminate the resource exhaustion primitive. As a compensating control, implement rate limiting at the load balancer or reverse proxy.",
+        "Deploy the affected service behind a reverse proxy capable of absorbing or shedding malformed requests.",
+        "Enable OS-level resource limits (ulimit, cgroups, Windows Job Objects) to prevent single-process resource exhaustion.",
+    ],
+    "T1005": [
+        "Apply the patch. Enforce filesystem ACLs restricting the affected process to the minimum required file-system access.",
+        "Implement file integrity monitoring (FIM) on sensitive directories; alert on unexpected bulk reads.",
+        "Encrypt sensitive data at rest so that successful file access does not yield usable plaintext.",
+    ],
+    "T1557": [
+        "Enforce TLS with mutual authentication (mTLS) on all inter-service communications.",
+        "Deploy certificate pinning for high-value communications channels to prevent certificate substitution attacks.",
+        "Enable DNSSEC to protect against DNS-based MitM; monitor for certificate anomalies via Certificate Transparency logs.",
+    ],
+    "T1040": [
+        "Enforce encryption (TLS 1.2+) on all communications channels involving sensitive data.",
+        "Audit the network for promiscuous-mode interfaces and unauthorized packet capture tools.",
+        "Segment the network to limit the scope of data accessible from any single capture vantage point.",
+    ],
+    "T1110": [
+        "Enforce account lockout after a configurable failure threshold with exponential back-off.",
+        "Deploy MFA — credential knowledge alone becomes insufficient for authentication success.",
+        "Monitor and alert on authentication failure spikes; block source IPs exceeding brute-force thresholds.",
+        "Enforce a strong password policy (minimum 12 characters, complexity requirements, breach-password screening).",
+    ],
+    "T1548": [
+        "Apply the patch that eliminates the privilege escalation path.",
+        "Enforce least privilege: revoke local admin rights from standard user accounts; scope service accounts to minimum required permissions.",
+        "Enable and tune UAC (Windows) or sudo access controls (Linux) to require explicit user consent for privilege elevation.",
+    ],
+    "T1222": [
+        "Audit and remediate incorrect file/directory permissions; apply the principle of least privilege to ACLs.",
+        "Monitor for unauthorized permission changes; implement FIM on critical paths.",
+        "Restrict which processes and users can modify permissions via AppArmor/SELinux or WDAC policies.",
+    ],
+    "T1552": [
+        "Remove hard-coded credentials from code; migrate secrets to a vault solution (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault).",
+        "Rotate all secrets that may have been exposed; revoke compromised API keys and certificates immediately.",
+        "Implement automated secrets scanning in the CI/CD pipeline to prevent future credential leakage.",
+    ],
+    "T1090": [
+        "Implement egress filtering at the network boundary; block outbound connections on non-standard ports from application hosts.",
+        "Monitor for proxy/tunnel establishment from unexpected processes or hosts.",
+        "Apply application-layer controls to restrict which processes may establish outbound network connections.",
+    ],
+    "T1189": [
+        "Apply browser and OS patches. Enforce browser exploit mitigations (sandbox, JIT hardening).",
+        "Deploy DNS-based threat filtering to block known exploit kit domains.",
+        "Implement Content Security Policy (CSP) headers to reduce XSS and drive-by attack surface.",
+    ],
+}
+
+# CWE IDs that indicate high-risk architectural patterns requiring design-level remediation
+_ARCH_RISK_CWES: Dict[str, str] = {
+    "CWE-798": "Hard-coded credentials detected — this is an architectural defect requiring design remediation, not a configuration patch. The binary or source must be refactored to use runtime secret injection.",
+    "CWE-319": "Cleartext protocol exposure — any component transmitting sensitive data without encryption represents a persistent architectural risk until the protocol is upgraded.",
+    "CWE-295": "Certificate validation bypass — this indicates an intentional or negligent design decision to trust unverified TLS endpoints, rendering encrypted channels equivalent to plaintext.",
+    "CWE-306": "Missing authentication — exposed unauthenticated endpoints represent a fundamental access control design gap not addressable by patching alone.",
+    "CWE-502": "Deserialization attack surface — use of native deserialization of untrusted data is a high-risk architectural pattern. Consider migration to safer serialization formats (JSON, Protocol Buffers).",
+    "CWE-918": "SSRF attack surface — server-side request capabilities without allowlist enforcement expose cloud metadata endpoints, internal services, and SSRF-to-RCE chains.",
+    "CWE-611": "XXE attack surface — XML parsers with external entity processing enabled present a persistent SSRF and file-disclosure risk class until parser configuration is hardened globally.",
+}
+
+
+def _cve_chain_analysis(sw_rows: List[Dict[str, Any]]) -> List[str]:
+    """
+    Identify vulnerability chaining opportunities within a software item.
+    Returns a list of chain narrative strings.
+    """
+    chains: List[str] = []
+    cve_by_technique: Dict[str, List[str]] = defaultdict(list)
+    has_initial_access = False
+    has_privesc        = False
+    has_execution      = False
+    has_cred_access    = False
+    has_lateral        = False
+
+    initial_access_cves: List[str] = []
+    privesc_cves:        List[str] = []
+    execution_cves:      List[str] = []
+
+    for r in sw_rows:
+        cid     = r.get("CVE ID", "")
+        attacks = _split_multi(r.get("ATT&CK Techniques", ""))
+        tactics = [t.lower().replace(" ", "-") for t in _split_multi(r.get("ATT&CK Tactics", ""))]
+        for atk in attacks:
+            m = re.match(r"^([A-Z0-9.]+)", atk)
+            if m:
+                cve_by_technique[m.group(1)].append(cid)
+        if "initial-access" in tactics:
+            has_initial_access = True
+            initial_access_cves.append(cid)
+        if "privilege-escalation" in tactics:
+            has_privesc = True
+            privesc_cves.append(cid)
+        if "execution" in tactics:
+            has_execution = True
+            execution_cves.append(cid)
+        if "credential-access" in tactics:
+            has_cred_access = True
+        if "lateral-movement" in tactics:
+            has_lateral = True
+
+    if has_initial_access and has_privesc:
+        ia_ex = ", ".join(initial_access_cves[:2]) or "initial-access CVE"
+        pe_ex = ", ".join(privesc_cves[:2]) or "privilege-escalation CVE"
+        chains.append(
+            f"**Initial Access → Privilege Escalation:** {ia_ex} enables remote code execution "
+            f"as a low-privileged process. {pe_ex} can subsequently be exploited to elevate to "
+            "SYSTEM/root, granting full host control. This is a high-confidence two-stage attack "
+            "path requiring remediation of both CVEs."
+        )
+    if has_initial_access and has_execution and has_cred_access:
+        chains.append(
+            f"**Initial Access → Execution → Credential Harvesting:** An attacker gaining execution "
+            f"via {initial_access_cves[0] if initial_access_cves else 'an initial-access CVE'} could "
+            "leverage execution primitives to deploy credential-harvesting tooling, acquiring credentials "
+            "usable for lateral movement beyond the initially compromised host."
+        )
+    if has_execution and has_lateral:
+        chains.append(
+            "**Execution → Lateral Movement:** Exploitation of execution-enabling CVEs on this host, "
+            "combined with lateral movement attack paths, creates a viable pivot scenario. Attackers "
+            "with code execution could enumerate and attack adjacent hosts via harvested credentials "
+            "or internal trust relationships."
+        )
+    high_frequency_techs = [(tid, cves) for tid, cves in cve_by_technique.items() if len(cves) >= 3]
+    if high_frequency_techs:
+        tid, cves = high_frequency_techs[0]
+        chains.append(
+            f"**Technique Amplification — {tid}:** {len(cves)} independent CVEs map to this technique, "
+            "providing multiple distinct paths to the same attack objective. Patching one CVE does not "
+            "close the full attack surface; all must be addressed."
+        )
+    return chains
+
+
+def _format_cve_engineering(r: Dict[str, Any], sw_name: str) -> List[str]:
+    """
+    Format a single CVE into a detailed engineering assessment entry.
+    Returns a list of markdown lines.
+    """
+    cid      = r.get("CVE ID", "")
+    nvd_url  = r.get("NVD URL", "") or f"https://nvd.nist.gov/vuln/detail/{cid}"
+    desc     = str(r.get("Description", "") or "").strip() or "No description available."
+    score    = r.get("CVSS Base Score", "N/A")
+    sev      = str(r.get("CVSS Severity", "") or "").upper()
+    vector   = str(r.get("CVSS Vector", "") or "")
+    rs       = r.get("Risk Score", "")
+    rl       = r.get("Risk Level", "")
+    kev_f    = str(r.get("Known Exploited Vulnerability", "")).upper() == "YES"
+    expl_f   = str(r.get("Public Exploit", "")).upper() == "YES"
+    epss     = r.get("EPSS Score", "")
+    conf     = str(r.get("Version Confirmed", "") or "")
+    cwes     = _split_multi(r.get("CWE", ""))
+    attacks  = _split_multi(r.get("ATT&CK Techniques", ""))
+    tactics  = _split_multi(r.get("ATT&CK Tactics", ""))
+    d3fend   = _split_multi(r.get("D3FEND Countermeasures", ""))
+    nist     = _split_multi(r.get("NIST 800-53 Controls", ""))
+    expl_src = str(r.get("Exploit Sources", "") or "")
+    pub_date = str(r.get("CVE Date", "") or "")
+
+    gn       = _THREAT_INTEL_CACHE.get(cid, {}).get("greynoise", {})
+    gn_active = gn.get("noise", False)
+    gn_riot   = gn.get("riot", False)
+    circl     = _THREAT_INTEL_CACHE.get(cid, {}).get("circl", {})
+    capecs    = circl.get("capec") or []
+
+    block: List[str] = []
+    block.append(f"## {cid}")
+
+    badges = []
+    if sev:        badges.append(f"[{sev}]")
+    if kev_f:      badges.append("⚠ KEV")
+    if expl_f:     badges.append("🔴 PUBLIC EXPLOIT")
+    if gn_active:  badges.append("🟠 ACTIVE IN-WILD")
+    block.append(f"**{'  '.join(badges)}**" if badges else "")
+    block.append("")
+
+    block.append("| Field | Value |")
+    block.append("|---|---|")
+    block.append(f"| CVE ID | [{cid}]({nvd_url}) |")
+    block.append(f"| CVSS Base Score | {score} ({sev}) |")
+    if vector:
+        block.append(f"| CVSS Vector | `{vector}` |")
+    block.append(f"| Draugr Risk Score | {rs} / 100 ({rl}) |")
+    block.append(f"| EPSS (30-day exploitation probability) | {epss} |")
+    block.append(f"| CISA KEV Listed | {'Yes — active exploitation confirmed' if kev_f else 'No'} |")
+    block.append(f"| Public Exploit Available | {'Yes — ' + (expl_src or 'see NVD') if expl_f else 'No'} |")
+    block.append(f"| Version Confirmed | {conf if conf else 'Unverified — based on CPE product match'} |")
+    block.append(f"| Published | {pub_date} |")
+    # Publisher and patch age from inventory data
+    sw_publisher  = str(r.get("Publisher", "") or "")
+    sw_idate      = str(r.get("Install Date", "") or "")
+    patch_age     = str(r.get("Patch Age (Days)", "") or "")
+    if sw_publisher:
+        block.append(f"| Publisher | {sw_publisher} |")
+    if sw_idate:
+        block.append(f"| Install Date | {sw_idate} |")
+    if patch_age:
+        # Flag if vulnerability was present at install time
+        if patch_age == "0 (installed after CVE published)":
+            block.append("| Patch Age | Not vulnerable at install — CVE published before install date |")
+        else:
+            try:
+                age_int = int(patch_age)
+                age_note = " ⚠ OVERDUE" if age_int > 30 and kev_f else (" ⚠ OVERDUE" if age_int > 90 else "")
+                block.append(f"| Patch Age | {patch_age} days since install{age_note} |")
+            except ValueError:
+                block.append(f"| Patch Age | {patch_age} |")
+    if gn_active:
+        block.append("| GreyNoise | Active exploitation traffic observed |")
+    elif gn_riot:
+        block.append("| GreyNoise | Known scanner/research activity observed |")
+    block.append("")
+
+    block.append("### Affected Component and Technical Description")
+    block.append(f"**Affected Software:** {sw_name}")
+    block.append(f"**Technical Description:** {desc}")
+    block.append("")
+
+    if cwes:
+        block.append("### Weakness Classification (CWE)")
+        for cwe in cwes:
+            cwe_num = cwe.replace("CWE-", "")
+            cwe_url = f"https://cwe.mitre.org/data/definitions/{cwe_num}.html"
+            tech_impact = _CWE_TECHNICAL_IMPACT.get(cwe, "See CWE reference for detailed weakness description.")
+            block.append(f"- **[{cwe}]({cwe_url}):** {tech_impact}")
+        for cwe in cwes:
+            arch_note = _ARCH_RISK_CWES.get(cwe)
+            if arch_note:
+                block.append(f"- **Architectural Risk ({cwe}):** {arch_note}")
+        block.append("")
+
+    block.append("### Exploitability Analysis")
+    expl_conditions: List[str] = []
+    if vector:
+        v = vector.upper()
+        if "AV:N" in v:
+            expl_conditions.append("**Attack Vector: Network** — exploitable remotely without requiring physical or adjacent network access")
+        elif "AV:A" in v:
+            expl_conditions.append("**Attack Vector: Adjacent** — requires attacker to be on the same network segment (LAN/VLAN)")
+        elif "AV:L" in v:
+            expl_conditions.append("**Attack Vector: Local** — requires local code execution as a prerequisite; typically chained after initial access")
+        elif "AV:P" in v:
+            expl_conditions.append("**Attack Vector: Physical** — requires physical access to the target system")
+        if "PR:N" in v:
+            expl_conditions.append("**Privileges Required: None** — no prior authentication or authorization required")
+        elif "PR:L" in v:
+            expl_conditions.append("**Privileges Required: Low** — requires low-privilege authenticated access")
+        elif "PR:H" in v:
+            expl_conditions.append("**Privileges Required: High** — requires administrative or root-level access as a prerequisite")
+        if "UI:N" in v:
+            expl_conditions.append("**User Interaction: None** — exploitation does not require victim action; enables autonomous/worm-like propagation")
+        elif "UI:R" in v:
+            expl_conditions.append("**User Interaction: Required** — victim must perform an action (open file, visit URL)")
+        if "AC:L" in v:
+            expl_conditions.append("**Attack Complexity: Low** — no special conditions required; exploitation is straightforward and repeatable")
+        elif "AC:H" in v:
+            expl_conditions.append("**Attack Complexity: High** — exploitation requires race conditions, specific configurations, or adversary-controlled environment elements")
+        if "S:C" in v:
+            expl_conditions.append("**Scope: Changed** — successful exploitation can affect components beyond the vulnerable component boundary (container escape, hypervisor escape)")
+    if expl_f:
+        expl_conditions.append(f"**Public Exploit Code Exists** — weaponized PoC or working exploit available: {expl_src or 'check NVD references and Vulners'}. Exploitation barrier is low.")
+    if kev_f:
+        expl_conditions.append("**CISA KEV Confirmed** — this vulnerability has been weaponized and is actively exploited by threat actors in real-world campaigns.")
+    if gn_active:
+        expl_conditions.append("**GreyNoise Active Signal** — exploitation or scanning attempts observed against this CVE in the wild.")
+    try:
+        epss_val = float(str(epss).rstrip("%"))
+        if epss_val >= 10.0:
+            expl_conditions.append(f"**High EPSS ({epss})** — top-decile exploitation probability; adversary tooling likely exists or is in active development.")
+        elif epss_val >= 1.0:
+            expl_conditions.append(f"**Moderate EPSS ({epss})** — meaningful exploitation probability within a 30-day window.")
+    except (ValueError, TypeError):
+        pass
+
+    for ec in expl_conditions:
+        block.append(f"- {ec}")
+    if not expl_conditions:
+        block.append("- Exploitability conditions could not be fully determined — consult the NVD advisory for CVSS vector detail.")
+    block.append("")
+
+    if attacks:
+        block.append("### MITRE ATT&CK Mapping")
+        for atk in attacks:
+            m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", atk)
+            if m:
+                tid, tname = m.group(1), m.group(2)
+                atk_url = f"https://attack.mitre.org/techniques/{tid.replace('.','/')}/"
+                block.append(f"- **[{tid} — {tname}]({atk_url})**")
+            else:
+                block.append(f"- {atk}")
+        if tactics:
+            block.append(f"- **Tactics:** {', '.join(tactics)}")
+        if capecs:
+            capec_str = "; ".join(f"CAPEC-{c.get('id','')} {c.get('name','')}" for c in capecs[:3])
+            block.append(f"- **CAPEC Attack Patterns:** {capec_str}")
+        block.append("")
+
+    if attacks:
+        first = attacks[0]
+        m2 = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", first)
+        if m2:
+            aid, aname = m2.group(1), m2.group(2)
+        else:
+            aid, aname = first, first
+        scenario_info = SCENARIOS.get(aid)
+        if scenario_info and scenario_info.get("description"):
+            narrative = scenario_info["description"].format(cve_id=cid, software_name=sw_name)
+        else:
+            narrative = _scenario_template(aid, aname, sw_name, cid)
+        impact_text = get_impact(aid)
+        block.append("### Threat Scenario")
+        block.append(narrative)
+        if impact_text:
+            block.append(f"**Expected Impact:** {impact_text}")
+        block.append("")
+
+    block.append("### Operational Impact")
+    op_impacts: List[str] = []
+    if sev == "CRITICAL":
+        op_impacts.append("Potential for complete compromise of the affected host or service; recovery may require system rebuild.")
+    if kev_f or gn_active:
+        op_impacts.append("Active exploitation confirmed or observed — incident response posture should be elevated; treat as a potential active incident until cleared.")
+    if expl_f:
+        op_impacts.append("Public exploit availability reduces the technical barrier for low-skilled threat actors; probability of exploitation is elevated above CVSS score alone.")
+    if conf.upper() == "YES":
+        op_impacts.append("Version-confirmed as applicable to the specific deployed version — confirmed exposure, not a speculative CPE match.")
+    elif not conf:
+        op_impacts.append("Version confirmation is pending — manual validation against the exact deployed build is recommended.")
+    for oip in op_impacts:
+        block.append(f"- {oip}")
+    if not op_impacts:
+        block.append("- Assess operational impact based on the function and network exposure of the affected component in your environment.")
+    block.append("")
+
+    block.append("### Detection Recommendations")
+    first_aid = ""
+    if attacks:
+        m3 = re.match(r"^([A-Z0-9.]+)", attacks[0])
+        if m3:
+            first_aid = m3.group(1)
+    det_recs = _TECHNIQUE_DETECTION.get(first_aid, [])
+    cwe_det: List[str] = []
+    for cwe in cwes:
+        if cwe == "CWE-89":
+            cwe_det.append("Monitor application logs for anomalous SQL syntax in query parameters; enable WAF SQL injection rule sets.")
+        elif cwe == "CWE-79":
+            cwe_det.append("Monitor for script injection payloads in web request parameters; enforce CSP headers.")
+        elif cwe == "CWE-798":
+            cwe_det.append("Alert on authentication using credentials extracted from code repositories or binary analysis.")
+        elif cwe == "CWE-502":
+            cwe_det.append("Alert on Java/Python deserialization operations from externally-sourced data; monitor for deserialization gadget chain indicators.")
+    for d in (det_recs + cwe_det)[:5]:
+        block.append(f"- {d}")
+    if not det_recs and not cwe_det:
+        block.append("- Review the NVD advisory and vendor security bulletin for CVE-specific indicators of exploitation.")
+        block.append("- Enable verbose logging on the affected service and forward to SIEM for anomaly detection.")
+    block.append("")
+
+    block.append("### Mitigation Recommendations")
+    first_aid2 = ""
+    if attacks:
+        m4 = re.match(r"^([A-Z0-9.]+)", attacks[0])
+        if m4:
+            first_aid2 = m4.group(1)
+    mit_recs = _TECHNIQUE_MITIGATION.get(first_aid2, [])
+    block.append(f"1. **Apply vendor patch** — consult the [NVD advisory]({nvd_url}) for vendor patch details. This is the primary remediation.")
+    step = 2
+    for mr in mit_recs[:4]:
+        block.append(f"{step}. {mr}")
+        step += 1
+    if d3fend:
+        for cm in d3fend[:3]:
+            d3f_slug = cm.replace(" ", "")
+            d3f_url  = f"https://d3fend.mitre.org/technique/d3f:{d3f_slug}/"
+            block.append(f"{step}. Deploy [D3FEND countermeasure: {cm}]({d3f_url})")
+            step += 1
+    block.append("")
+
+    if nist:
+        block.append("### Applicable NIST SP 800-53 Controls")
+        block.append("| Control ID | Control Name | Implementation Guidance |")
+        block.append("|---|---|---|")
+        for ctrl in nist[:6]:
+            ctrl_id  = ctrl.split()[0] if ctrl.split() else ctrl
+            ctrl_url = f"https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl_id}"
+            note     = _NIST_IMPL.get(ctrl_id, "Refer to NIST SP 800-53 Rev 5.")
+            block.append(f"| [{ctrl_id}]({ctrl_url}) | {ctrl} | {note} |")
+        block.append("")
+
+    block.append("---")
+    block.append("")
+    return block
+
+
 def build_defensive_report(
     all_rows: List[Dict[str, Any]],
-    report_title: str = "Technical & Defensive Implementation Report",
+    report_title: str = "Technical Security Assessment Report",
 ) -> str:
     """
-    Combined SOC/IT technical + defensive report with:
-    - TOC at the top
-    - Immediate actions (with linked NIST/D3FEND)
-    - Patch tracking table
-    - Per-software CVE breakdowns with threat scenarios
-    - Control implementation guide (ATT&CK → D3FEND → NIST with links)
-    - SOC monitoring checklist
+    Comprehensive Technical Security Assessment for security engineers, ISSOs,
+    SOC analysts, RMF reviewers, vulnerability management teams, and technical leadership.
+    Suitable for RMF evidence packages, POA&M development, and security review boards.
     """
-    logo_b64 = _load_logo_b64()
-
     import datetime
-    scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    total_cves = len(all_rows)
-    software_set = {str(r.get("Software Name","")).strip() for r in all_rows if r.get("Software Name")}
-    kev_total  = sum(1 for r in all_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
-    expl_total = sum(1 for r in all_rows if str(r.get("Public Exploit","")).upper() == "YES")
-    crit_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
-    high_total = sum(1 for r in all_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+    logo_b64  = _load_logo_b64()
+    scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M UTC")
 
-    # Build per-software CVE + scenario breakdown (formerly in technical report)
+    total_cves    = len(all_rows)
+    sev_counts    = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    kev_total     = 0
+    expl_total    = 0
+    confirmed_total = 0
+    max_risk      = 0.0
+    epss_values: List[float] = []
+
+    for r in all_rows:
+        sev = str(r.get("CVSS Severity", "") or "").upper()
+        if sev in sev_counts:
+            sev_counts[sev] += 1
+        if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES":
+            kev_total += 1
+        if str(r.get("Public Exploit", "")).upper() == "YES":
+            expl_total += 1
+        if str(r.get("Version Confirmed", "")).upper() == "YES":
+            confirmed_total += 1
+        rs = _to_float(r.get("Risk Score", 0))
+        if rs > max_risk:
+            max_risk = rs
+        epss_val = _epss_float(r.get("EPSS Score", 0))
+        if epss_val > 0:
+            epss_values.append(epss_val)
+
+    gn_active_total = sum(
+        1 for r in all_rows
+        if _THREAT_INTEL_CACHE.get(r.get("CVE ID", ""), {}).get("greynoise", {}).get("noise")
+    )
+    cwe_counter: Counter = Counter()
+    for r in all_rows:
+        for cwe in _split_multi(r.get("CWE", "")):
+            cwe_counter[cwe] += 1
+
+    top5  = _top_techniques(all_rows, top_n=5)
+    top10 = _top_techniques(all_rows, top_n=10)
+
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in all_rows:
-        key = (str(row.get("Software Name","")).strip(), str(row.get("Software Version","")).strip())
+        key = (str(row.get("Software Name", "")).strip(), str(row.get("Software Version", "")).strip())
         grouped[key].append(row)
+    sw_count = len(grouped)
 
-    sw_sections: List[str] = []
-    sw_toc_entries: List[str] = []
-    for (sw_name, sw_ver), sw_rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
-        sw_rows.sort(key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
-        slug = re.sub(r"[^a-z0-9]+", "-", f"{sw_name} {sw_ver}".lower()).strip("-")
-        sw_toc_entries.append(f'<li><a href="#{slug}">{html.escape(sw_name)} {html.escape(sw_ver)}</a></li>')
-
-        total = len(sw_rows)
-        crit  = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
-        high  = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
-        med   = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "MEDIUM")
-        low   = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "LOW")
-        kev   = sum(1 for r in sw_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
-        expl  = sum(1 for r in sw_rows if str(r.get("Public Exploit","")).upper() == "YES")
-
-        block: List[str] = [
-            f"# {sw_name} {sw_ver}",
-            "",
-            f"- Total CVEs: {total}  |  Critical: {crit}  |  High: {high}  |  Medium: {med}  |  Low: {low}",
-            f"- Known Exploited (KEV): {kev}  |  Public Exploit: {expl}",
-            f"- Overall Risk: {sw_rows[0].get('Risk Level','INFO')}  |  Highest Score: {sw_rows[0].get('Risk Score',0)}",
-            "",
-        ]
-
-        # CVE breakdown with scenarios
-        for r in sw_rows:
-            cid  = r.get("CVE ID","")
-            nvd_url = r.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cid}"
-            desc = str(r.get("Description","") or "").strip() or "No description available."
-            score= r.get("CVSS Base Score","N/A")
-            sev  = r.get("CVSS Severity","")
-            rs   = r.get("Risk Score","")
-            rl   = r.get("Risk Level","")
-            kev_f= str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
-            expl_f= str(r.get("Public Exploit","")).upper() == "YES"
-            epss = r.get("EPSS Score","")
-            conf = r.get("Version Confirmed","")
-            attacks = _split_multi(r.get("ATT&CK Techniques",""))
-            d3fend  = _split_multi(r.get("D3FEND Countermeasures",""))
-            nist    = _split_multi(r.get("NIST 800-53 Controls",""))
-
-            block.append(f"## {cid}")
-            block.append(f"- CVSS: {score} ({sev})  |  Risk Score: {rs} ({rl})  |  EPSS: {epss}  |  Version Confirmed: {conf}")
-            if kev_f: block.append("- **⚠ CISA KEV-LISTED — active exploitation documented**")
-            if expl_f: block.append(f"- **PUBLIC EXPLOIT available** — Sources: {r.get('Exploit Sources','') or 'See NVD'}")
-            block.append(f"- Description: {desc}")
-
-            # ATT&CK links
-            if attacks:
-                atk_parts = []
-                for atk in attacks:
-                    m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", atk)
-                    if m:
-                        tid, tname = m.group(1), m.group(2)
-                        atk_parts.append(f"[{tid} ({tname})](https://attack.mitre.org/techniques/{tid.replace('.','/')}/ \"ATT&CK\")")
-                    else:
-                        atk_parts.append(atk)
-                block.append(f"- ATT&CK Techniques: {'; '.join(atk_parts)}")
-
-            # D3FEND links
-            if d3fend:
-                d3_parts = [f"[{cm}](https://d3fend.mitre.org/technique/d3f:{cm.replace(' ','')}/)" for cm in d3fend]
-                block.append(f"- D3FEND Countermeasures: {', '.join(d3_parts)}")
-
-            # NIST links
-            if nist:
-                nist_parts = [
-                    f"[{ctrl.split()[0]}](https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl.split()[0]}) — {ctrl}"
-                    for ctrl in nist
-                ]
-                block.append(f"- NIST 800-53: {'; '.join(nist_parts)}")
-
-            block.append(f"- NVD: {nvd_url}")
-
-            # Threat scenario from this CVE's ATT&CK mappings
-            if attacks:
-                first = attacks[0]
-                m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", first)
-                if m:
-                    aid, aname = m.group(1), m.group(2)
-                else:
-                    aid, aname = first, first
-                scenario_info = SCENARIOS.get(aid)
-                if scenario_info and scenario_info.get("description"):
-                    narrative = scenario_info["description"].format(cve_id=cid, software_name=sw_name)
-                else:
-                    narrative = _scenario_template(aid, aname, sw_name, cid)
-                tactics_list = get_tactics(aid)
-                impact_text  = get_impact(aid)
-                block.append(f"- **Threat Scenario:** {narrative}")
-                if tactics_list:
-                    block.append(f"- Tactics: {', '.join(tactics_list)}")
-                if impact_text:
-                    block.append(f"- Impact: {impact_text}")
-
-            block.append("")
-
-        sw_sections.append("\n".join(block))
-
-    # Build TOC
+    # TOC
+    sw_toc_items = "".join(
+        f'<li><a href="#{re.sub(r"[^a-z0-9]+", "-", f"{n} {v}".lower()).strip("-")}">'
+        f'{html.escape(n)} {html.escape(v)}</a></li>'
+        for (n, v) in sorted(grouped.keys(), key=lambda x: x[0].lower())
+    )
     toc_html = (
         '<h2>Contents</h2><ol>'
-        '<li><a href="#section-1-immediate-actions-required">Section 1 — Immediate Actions Required</a></li>'
-        '<li><a href="#section-2-patch-tracking-table">Section 2 — Patch Tracking Table</a></li>'
-        '<li><a href="#section-3-per-software-cve-breakdown">Section 3 — Per-Software CVE Breakdown</a>'
-        f'<ol>{"".join(sw_toc_entries)}</ol></li>'
-        '<li><a href="#section-4-control-implementation-guide">Section 4 — Control Implementation Guide</a></li>'
-        '<li><a href="#section-5-soc-monitoring-and-validation-checklist">Section 5 — SOC Monitoring and Validation Checklist</a></li>'
+        '<li><a href="#1-executive-technical-summary">1. Executive Technical Summary</a></li>'
+        '<li><a href="#2-asset-and-system-overview">2. Asset and System Overview</a></li>'
+        '<li><a href="#3-severity-distribution-and-risk-scoring">3. Severity Distribution and Risk Scoring</a></li>'
+        '<li><a href="#4-vulnerability-chaining-and-attack-path-analysis">4. Vulnerability Chaining and Attack Path Analysis</a></li>'
+        '<li><a href="#5-detailed-cve-analysis">5. Detailed CVE Analysis</a>'
+        f'<ol>{sw_toc_items}</ol></li>'
+        '<li><a href="#6-cwe-weakness-distribution">6. CWE Weakness Distribution</a></li>'
+        '<li><a href="#7-mitre-attck-technique-coverage">7. MITRE ATT&amp;CK Technique Coverage</a></li>'
+        '<li><a href="#8-kev-and-epss-priority-analysis">8. KEV / EPSS Priority Analysis</a></li>'
+        '<li><a href="#9-threat-scenario-library">9. Threat Scenario Library</a></li>'
+        '<li><a href="#10-detection-engineering-recommendations">10. Detection Engineering Recommendations</a></li>'
+        '<li><a href="#11-mitigation-and-control-implementation">11. Mitigation and Control Implementation</a></li>'
+        '<li><a href="#12-defensive-architecture-considerations">12. Defensive Architecture Considerations</a></li>'
+        '<li><a href="#13-security-control-gaps">13. Security Control Gaps</a></li>'
+        '<li><a href="#14-recommended-remediation-prioritization">14. Recommended Remediation Prioritization</a></li>'
+        '<li><a href="#15-residual-risk-discussion">15. Residual Risk Discussion</a></li>'
         '</ol>'
     )
 
-    lines: List[str] = [
-        "## Report Purpose and Scope",
+    lines: List[str] = []
+
+    # 1. Executive Technical Summary
+    lines += [
+        "# 1. Executive Technical Summary",
         "",
-        "This combined Technical & Defensive Implementation report is intended for SOC analysts, "
-        "IT security engineers, and system administrators. It provides full CVE detail, threat scenario "
-        "mapping, and step-by-step control implementation guidance derived from ATT&CK, D3FEND, and NIST SP 800-53.",
+        f"**Assessment Date:** {scan_date}",
+        f"**Systems Assessed:** {sw_count}  |  **Total CVEs Identified:** {total_cves}",
+        f"**Maximum Risk Score:** {max_risk:.1f} / 100  |  **Overall Posture:** "
+        f"{'CRITICAL' if kev_total > 0 or max_risk >= 80 else 'HIGH' if max_risk >= 60 or sev_counts['CRITICAL'] > 0 else 'MODERATE'}",
         "",
-        f"- Scan date: {scan_date}",
-        f"- Software items scanned: {len(software_set)}",
-        f"- Total CVEs identified: {total_cves}",
-        f"- Critical: {crit_total}  |  High: {high_total}",
-        f"- CISA KEV-listed: {kev_total}",
-        f"- CVEs with public exploit code: {expl_total}",
+        f"This assessment identified **{total_cves} CVEs** across **{sw_count} software components**, "
+        f"with **{sev_counts['CRITICAL']} Critical**, **{sev_counts['HIGH']} High**, "
+        f"**{sev_counts['MEDIUM']} Medium**, and **{sev_counts['LOW']} Low** severity findings.",
+    ]
+    if kev_total > 0:
+        lines.append(
+            f"**{kev_total} CVE{'s are' if kev_total != 1 else ' is'} listed in the "
+            f"[CISA Known Exploited Vulnerabilities (KEV) catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)**, "
+            "confirming active in-the-wild exploitation. These are the highest-priority remediation items regardless of CVSS score."
+        )
+    if gn_active_total > 0:
+        lines.append(
+            f"GreyNoise threat intelligence confirms active exploitation activity for **{gn_active_total} CVEs** — "
+            "treat these as KEV-equivalent priority."
+        )
+    if expl_total > 0:
+        lines.append(
+            f"**{expl_total} CVEs** have publicly available exploit code (ExploitDB, Metasploit, Vulners, or NVD references), "
+            "reducing the technical exploitation barrier to script-kiddie level for these findings."
+        )
+    if confirmed_total > 0:
+        lines.append(
+            f"**{confirmed_total} CVEs** have been version-confirmed as applicable to the exact deployed version — "
+            "confirmed exposures, not speculative CPE matches."
+        )
+    lines += ["", "---", ""]
+
+    # 2. Asset / System Overview
+    lines += [
+        "# 2. Asset and System Overview",
+        "",
+        "| Software | Version | Publisher | Install Date | CVEs | Critical | High | KEV | Public Exploit | Max Risk | Action |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for (sw_name, sw_ver), sw_rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
+        crit   = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+        high   = sum(1 for r in sw_rows if str(r.get("CVSS Severity","")).upper() == "HIGH")
+        kev_c  = sum(1 for r in sw_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+        expl_c = sum(1 for r in sw_rows if str(r.get("Public Exploit","")).upper() == "YES")
+        max_rs = max((_to_float(r.get("Risk Score",0)) for r in sw_rows), default=0.0)
+        pub    = str(sw_rows[0].get("Publisher", "") or "") if sw_rows else ""
+        idate  = str(sw_rows[0].get("Install Date", "") or "") if sw_rows else ""
+        action = ("PATCH IMMEDIATELY — KEV/CRITICAL" if (kev_c or crit) else
+                  "PATCH URGENTLY — HIGH" if high else "SCHEDULE PATCH")
+        lines.append(f"| {sw_name} | {sw_ver} | {pub} | {idate} | {len(sw_rows)} | {crit} | {high} | {kev_c} | {expl_c} | {max_rs:.1f} | {action} |")
+    lines += ["", "---", ""]
+
+    # 3. Severity Distribution and Risk Scoring
+    lines += [
+        "# 3. Severity Distribution and Risk Scoring",
+        "",
+        "| Severity | Count | % of Total |",
+        "|---|---|---|",
+    ]
+    for sev_label in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        cnt = sev_counts.get(sev_label, 0)
+        pct = (cnt / total_cves * 100) if total_cves else 0
+        lines.append(f"| {sev_label} | {cnt} | {pct:.1f}% |")
+    lines += [
+        "",
+        f"**Draugr Weighted Risk Score Model** (0–100): CVSS×0.35 + EPSS×0.25 + KEV×0.20 + Public Exploit×0.10 + Version Confirmation×0.10",
+        f"- Highest risk score: **{max_risk:.1f}**",
+    ]
+    if epss_values:
+        avg_epss = sum(epss_values) / len(epss_values)
+        max_epss = max(epss_values)
+        lines.append(f"- EPSS range: {min(epss_values)*100:.2f}% – {max_epss*100:.2f}%  |  Mean: {avg_epss*100:.2f}%")
+
+    # Patch age analysis
+    import datetime as _dt
+    age_entries: List[int] = []
+    overdue_kev: List[Dict[str, Any]] = []
+    overdue_crit: List[Dict[str, Any]] = []
+    for r in all_rows:
+        pa = str(r.get("Patch Age (Days)", "") or "")
+        try:
+            age_int = int(pa)
+            age_entries.append(age_int)
+            if age_int > 30 and str(r.get("Known Exploited Vulnerability","")).upper() == "YES":
+                overdue_kev.append(r)
+            if age_int > 90 and str(r.get("CVSS Severity","")).upper() == "CRITICAL":
+                overdue_crit.append(r)
+        except ValueError:
+            pass
+
+    if age_entries:
+        avg_age = sum(age_entries) / len(age_entries)
+        max_age = max(age_entries)
+        lines += [
+            "",
+            "**Patch Age Analysis** (based on inventory install dates):",
+            "",
+            f"- Average days since install across all affected CVEs: **{avg_age:.0f} days**",
+            f"- Maximum days since install: **{max_age} days**",
+        ]
+        if overdue_kev:
+            lines.append(
+                f"- **{len(overdue_kev)} KEV-listed CVE(s)** present on systems installed >30 days ago "
+                "— these represent confirmed exploitation risk on aged deployments."
+            )
+        if overdue_crit:
+            lines.append(
+                f"- **{len(overdue_crit)} Critical CVE(s)** present on systems installed >90 days ago "
+                "— unpatched critical findings on long-running deployments represent elevated residual risk."
+            )
+    lines += ["", "---", ""]
+
+    # 4. Vulnerability Chaining and Attack Path Analysis
+    lines += [
+        "# 4. Vulnerability Chaining and Attack Path Analysis",
+        "",
+        "The following multi-stage attack paths were identified. Chains represent scenarios where "
+        "multiple CVEs compound to achieve outcomes beyond their individual severity ratings.",
+        "",
+    ]
+    any_chain = False
+    for (sw_name, sw_ver), sw_rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
+        sw_rows_s = sorted(sw_rows, key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
+        chains = _cve_chain_analysis(sw_rows_s)
+        if chains:
+            any_chain = True
+            lines.append(f"### {sw_name} {sw_ver}")
+            for ch in chains:
+                lines.append(f"- {ch}")
+            lines.append("")
+    if not any_chain:
+        lines.append("No multi-stage vulnerability chains were identified. Individual CVEs should still be assessed for standalone exploitation potential.")
+        lines.append("")
+    lines += ["---", ""]
+
+    # 5. Detailed CVE Analysis
+    lines += [
+        "# 5. Detailed CVE Analysis",
+        "",
+        "Findings are ordered by risk score (descending) within each software component.",
+        "",
+    ]
+    for (sw_name, sw_ver), sw_rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
+        sw_rows_s = sorted(sw_rows, key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True)
+        crit  = sum(1 for r in sw_rows_s if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+        high  = sum(1 for r in sw_rows_s if str(r.get("CVSS Severity","")).upper() == "HIGH")
+        kev_c = sum(1 for r in sw_rows_s if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+        max_rs = max((_to_float(r.get("Risk Score",0)) for r in sw_rows_s), default=0.0)
+        lines.append(f"## {sw_name} {sw_ver}")
+        lines.append(f"CVEs: {len(sw_rows_s)}  |  Critical: {crit}  |  High: {high}  |  KEV: {kev_c}  |  Max Risk Score: {max_rs:.1f}")
+        lines.append("")
+        for r in sw_rows_s:
+            lines.extend(_format_cve_engineering(r, sw_name))
+    lines += ["---", ""]
+
+    # 6. CWE Weakness Distribution
+    lines += [
+        "# 6. CWE Weakness Distribution",
+        "",
+        "High-frequency CWEs indicate systemic coding or architectural deficiencies across the assessed components.",
+        "",
+        "| CWE | Weakness Class | Count | Architectural Risk |",
+        "|---|---|---|---|",
+    ]
+    for cwe, cnt in cwe_counter.most_common(15):
+        cwe_num   = cwe.replace("CWE-", "")
+        cwe_url   = f"https://cwe.mitre.org/data/definitions/{cwe_num}.html"
+        short     = _CWE_TECHNICAL_IMPACT.get(cwe, "See CWE reference.")
+        short     = short.split("—")[0].strip() if "—" in short else short[:80]
+        arch_flag = "Yes — design remediation required" if cwe in _ARCH_RISK_CWES else "No"
+        lines.append(f"| [{cwe}]({cwe_url}) | {short} | {cnt} | {arch_flag} |")
+    lines += ["", "---", ""]
+
+    # 7. ATT&CK Technique Coverage
+    lines += [
+        "# 7. MITRE ATT&CK Technique Coverage",
+        "",
+        f"Technique mapping derived from CWE→CAPEC→ATT&CK correlation across all {total_cves} CVEs.",
+        "",
+        "| Rank | Technique | Name | CVE Count | Tactics | Reference |",
+        "|---|---|---|---|---|---|",
+    ]
+    for rank, (aid, cnt, meta) in enumerate(top10, 1):
+        tname   = meta.get("name", aid)
+        tactics = ", ".join(meta.get("tactics", [])) or "—"
+        atk_url = f"https://attack.mitre.org/techniques/{aid.replace('.','/')}/"
+        lines.append(f"| {rank} | {aid} | {tname} | {cnt} | {tactics} | {atk_url} |")
+    lines += [
+        "",
+        "Detection engineering should prioritize building or validating detection rules for each "
+        "technique in rank order. See Section 10 for per-technique detection guidance.",
         "",
         "---",
         "",
-        "# Section 1 — Immediate Actions Required",
+    ]
+
+    # 8. KEV / EPSS Priority Analysis
+    lines += ["# 8. KEV / EPSS Priority Analysis", ""]
+    kev_rows = sorted(
+        [r for r in all_rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES"],
+        key=lambda r: _to_float(r.get("Risk Score",0)), reverse=True
+    )
+    if kev_rows:
+        lines += [
+            f"## CISA KEV-Listed CVEs ({len(kev_rows)})",
+            "",
+            "CISA BOD 22-01 mandates remediation of KEV-listed vulnerabilities for federal agencies. "
+            "These represent the highest-confidence exploitation risk in this scan.",
+            "",
+            "| CVE ID | Software | CVSS | Risk Score | EPSS | KEV Due Date | NVD |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for r in kev_rows:
+            cid2    = r.get("CVE ID", "")
+            sw2     = r.get("Software Name", "")
+            cvss2   = f"{r.get('CVSS Base Score','N/A')} ({r.get('CVSS Severity','')})"
+            rs2     = r.get("Risk Score", "")
+            epss2   = r.get("EPSS Score", "")
+            due     = r.get("kev_due_date", "") or "—"
+            nvd2    = r.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cid2}"
+            lines.append(f"| {cid2} | {sw2} | {cvss2} | {rs2} | {epss2} | {due} | {nvd2} |")
+        lines.append("")
+    else:
+        lines += ["No CISA KEV-listed CVEs identified.", ""]
+
+    epss_rows = sorted(
+        [r for r in all_rows if _epss_float(r.get("EPSS Score",0)) > 0],
+        key=lambda r: _epss_float(r.get("EPSS Score",0)), reverse=True
+    )[:10]
+    if epss_rows:
+        lines += [
+            "## Highest EPSS Probability CVEs (Top 10)",
+            "",
+            "EPSS scores reflect the 30-day in-the-wild exploitation probability (FIRST.org).",
+            "",
+            "| CVE ID | Software | EPSS | CVSS | KEV | Public Exploit |",
+            "|---|---|---|---|---|---|",
+        ]
+        for r in epss_rows:
+            cid3   = r.get("CVE ID", "")
+            sw3    = r.get("Software Name", "")
+            epss3  = r.get("EPSS Score", "")
+            cvss3  = f"{r.get('CVSS Base Score','N/A')} ({r.get('CVSS Severity','')})"
+            kev3   = "Yes" if str(r.get("Known Exploited Vulnerability","")).upper() == "YES" else "No"
+            expl3  = "Yes" if str(r.get("Public Exploit","")).upper() == "YES" else "No"
+            lines.append(f"| {cid3} | {sw3} | {epss3} | {cvss3} | {kev3} | {expl3} |")
+        lines.append("")
+    lines += ["---", ""]
+
+    # 9. Threat Scenario Library
+    lines += [
+        "# 9. Threat Scenario Library",
         "",
-        "The following CVEs require remediation within 24–72 hours. They are either listed in the "
-        "CISA Known Exploited Vulnerabilities (KEV) catalog, have publicly available exploit code, or both.",
+        "Threat scenarios describe realistic adversary courses of action derived from ATT&CK mappings. "
+        "Scenarios are technique-scoped to capture patterns across multiple CVEs.",
         "",
-        _defensive_immediate_actions(all_rows),
+    ]
+    seen_aids: set = set()
+    scenario_num = 0
+    for (sw_name, sw_ver), sw_rows in sorted(grouped.items(), key=lambda x: x[0][0].lower()):
+        for r in sorted(sw_rows, key=lambda r: _to_float(r.get("Risk Score", 0)), reverse=True):
+            for atk in _split_multi(r.get("ATT&CK Techniques", "")):
+                m = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", atk)
+                if m:
+                    aid, aname = m.group(1), m.group(2)
+                else:
+                    aid, aname = atk, atk
+                if aid and aid not in seen_aids:
+                    seen_aids.add(aid)
+                    scenario_num += 1
+                    cid = r.get("CVE ID","")
+                    scenario_info = SCENARIOS.get(aid)
+                    if scenario_info and scenario_info.get("description"):
+                        narrative = scenario_info["description"].format(cve_id=cid, software_name=sw_name)
+                    else:
+                        narrative = _scenario_template(aid, aname, sw_name, cid)
+                    tactics_list = get_tactics(aid)
+                    impact_text  = get_impact(aid)
+                    atk_url      = f"https://attack.mitre.org/techniques/{aid.replace('.','/')}/"
+                    lines.append(f"### Scenario {scenario_num}: [{aname} ({aid})]({atk_url})")
+                    lines.append(f"**Affects:** {sw_name} {sw_ver}  |  **Tactic(s):** {', '.join(tactics_list) if tactics_list else '—'}")
+                    lines.append(f"**Representative CVE:** {cid}")
+                    lines.append("")
+                    lines.append(narrative)
+                    if impact_text:
+                        lines.append(f"**Expected Impact:** {impact_text}")
+                    lines.append("")
+    if scenario_num == 0:
+        lines.append("No ATT&CK-mapped threat scenarios available for the current findings.")
+        lines.append("")
+    lines += ["---", ""]
+
+    # 10. Detection Engineering Recommendations
+    lines += [
+        "# 10. Detection Engineering Recommendations",
         "",
-        "---",
+        "Detection guidance is organized by ATT&CK technique in frequency order. "
+        "Each entry is intended for SIEM rule development, EDR policy configuration, or network monitoring.",
         "",
-        "# Section 2 — Patch Tracking Table",
+    ]
+    for aid, cnt, meta in top10:
+        tname   = meta.get("name", aid)
+        atk_url = f"https://attack.mitre.org/techniques/{aid.replace('.','/')}/"
+        det_recs = _TECHNIQUE_DETECTION.get(aid, [])
+        lines.append(f"### [{tname} ({aid})]({atk_url}) — {cnt} CVE{'s' if cnt != 1 else ''}")
+        lines.append(f"**Tactics:** {', '.join(meta.get('tactics', [])) or '—'}")
+        lines.append("")
+        if det_recs:
+            for dr in det_recs:
+                lines.append(f"- {dr}")
+        else:
+            lines.append("- Review the ATT&CK technique page for recommended data sources and detection guidance.")
+            lines.append("- Enable relevant Windows Security Event IDs or Linux audit rules for this technique class.")
+        lines.append("")
+    lines += ["---", ""]
+
+    # 11. Mitigation and Control Implementation
+    lines += [
+        "# 11. Mitigation and Control Implementation",
         "",
-        "Use this table to track patch status across all scanned software.",
-        "",
-        _defensive_patch_table(all_rows),
-        "",
-        "---",
-        "",
-        "# Section 3 — Per-Software CVE Breakdown",
-        "",
-        "Full CVE details, threat scenarios, and control mappings for each software item.",
-        "",
-    ] + sw_sections + [
-        "",
-        "---",
-        "",
-        "# Section 4 — Control Implementation Guide",
-        "",
-        "Step-by-step guidance for each ATT&CK technique found, ranked by frequency.",
+        "ATT&CK technique → D3FEND countermeasure → NIST SP 800-53 Rev 5 control mapping, "
+        "ranked by CVE frequency.",
         "",
         _defensive_control_implementation(all_rows),
         "",
         "---",
         "",
-        "# Section 5 — SOC Monitoring and Validation Checklist",
+    ]
+
+    # 12. Defensive Architecture Considerations
+    lines += [
+        "# 12. Defensive Architecture Considerations",
         "",
-        _defensive_monitoring_checklist(all_rows),
+        "Architectural risks identified from the vulnerability and CWE profile of the assessed systems:",
+        "",
+    ]
+    arch_findings: List[str] = []
+    network_exposed = sum(1 for r in all_rows if "AV:N" in str(r.get("CVSS Vector","") or "").upper())
+    if network_exposed > 0:
+        arch_findings.append(
+            f"**Network Exposure Surface ({network_exposed} CVEs, AV:N):** These CVEs are exploitable from any "
+            "network-connected host. Network segmentation, host-based firewall enforcement, and service exposure "
+            "reduction are critical architectural mitigations independent of patch status."
+        )
+    for cwe, cnt_cwe in cwe_counter.most_common():
+        arch_note = _ARCH_RISK_CWES.get(cwe)
+        if arch_note and cnt_cwe > 0:
+            arch_findings.append(f"**{cwe} ({cnt_cwe} occurrence{'s' if cnt_cwe != 1 else ''}):** {arch_note}")
+    if sum(1 for v in epss_values if v >= 0.05) >= 3:
+        high_epss_c = sum(1 for v in epss_values if v >= 0.05)
+        arch_findings.append(
+            f"**High-EPSS Cluster ({high_epss_c} CVEs ≥5% EPSS):** Active adversary tooling development is "
+            "indicated. Consider whether architectural alternatives exist for the most critical affected components."
+        )
+    if cwe_counter.get("CWE-319", 0) + cwe_counter.get("CWE-327", 0) + cwe_counter.get("CWE-295", 0) > 0:
+        arch_findings.append(
+            "**Insecure Protocol/Cryptographic Risk (CWE-319/327/295):** Enforce TLS 1.2+ with valid "
+            "certificate chains across all communication paths. Disable legacy cleartext protocols "
+            "(HTTP, FTP, Telnet, SNMPv1/v2) on all affected components."
+        )
+    if cwe_counter.get("CWE-306", 0) + cwe_counter.get("CWE-287", 0) + cwe_counter.get("CWE-798", 0) > 0:
+        arch_findings.append(
+            "**Authentication Architecture Deficiency (CWE-306/287/798):** Missing authentication, "
+            "authentication bypass, or hard-coded credentials indicate a design-level access control gap. "
+            "MFA enforcement, credential vaulting, and Zero Trust architecture principles are required."
+        )
+    priv_cwes_count = sum(cwe_counter.get(c, 0) for c in ["CWE-269","CWE-862","CWE-863","CWE-276","CWE-732"])
+    if priv_cwes_count >= 2:
+        arch_findings.append(
+            f"**Privilege and Access Control Deficiency ({priv_cwes_count} related CWEs):** Multiple privilege "
+            "management weaknesses indicate least-privilege is not consistently enforced. A formal access control "
+            "review of service accounts, file system permissions, and API authorization is warranted."
+        )
+    for af in arch_findings:
+        lines.append(f"- {af}")
+        lines.append("")
+    if not arch_findings:
+        lines.append("No systemic architectural risk patterns identified beyond the individual CVE findings.")
+        lines.append("")
+    lines += ["---", ""]
+
+    # 13. Security Control Gaps
+    lines += [
+        "# 13. Security Control Gaps",
+        "",
+        "NIST SP 800-53 Rev 5 control families with the highest frequency of mapping across "
+        "the identified CVEs indicate likely implementation gaps:",
+        "",
+        "| Control | Frequency | Gap Assessment | Implementation Guidance |",
+        "|---|---|---|---|",
+    ]
+    nist_counter: Counter = Counter()
+    for r in all_rows:
+        for ctrl in _split_multi(r.get("NIST 800-53 Controls", "")):
+            ctrl_id = ctrl.split()[0] if ctrl.split() else ctrl
+            nist_counter[ctrl_id] += 1
+    for ctrl_id, freq in nist_counter.most_common(12):
+        note     = _NIST_IMPL.get(ctrl_id, "Refer to NIST SP 800-53 Rev 5 for full guidance.")
+        ctrl_url = f"https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl_id}"
+        gap_note = "High — systematic gap indicated" if freq >= 5 else "Moderate"
+        lines.append(f"| [{ctrl_id}]({ctrl_url}) | {freq} CVEs | {gap_note} | {note} |")
+    lines += ["", "---", ""]
+
+    # 14. Recommended Remediation Prioritization (POA&M-ready)
+    lines += [
+        "# 14. Recommended Remediation Prioritization",
+        "",
+        "POA&M-ready prioritized remediation plan. Items ordered by the Draugr risk model "
+        "incorporating CVSS, EPSS, KEV status, exploit availability, and version confirmation.",
+        "",
+        "## Tier 1 — Emergency (24–72 hours)",
+        "",
+    ]
+    tier1 = sorted(
+        [r for r in all_rows if
+         str(r.get("Known Exploited Vulnerability","")).upper() == "YES" or
+         _THREAT_INTEL_CACHE.get(r.get("CVE ID",""),{}).get("greynoise",{}).get("noise")],
+        key=lambda r: _to_float(r.get("Risk Score",0)), reverse=True
+    )
+    if tier1:
+        lines += ["| CVE ID | Software | Risk Score | Rationale |", "|---|---|---|---|"]
+        for r in tier1[:10]:
+            cid4    = r.get("CVE ID","")
+            sw4     = r.get("Software Name","")
+            rs4     = r.get("Risk Score","")
+            kev4    = str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+            rationale = "KEV-listed; active exploitation confirmed" if kev4 else "GreyNoise active exploitation signal"
+            nvd4    = r.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cid4}"
+            lines.append(f"| [{cid4}]({nvd4}) | {sw4} | {rs4} | {rationale} |")
+        lines.append("")
+    else:
+        lines += ["No Tier 1 emergency items in this scan.", ""]
+
+    tier1_ids = {r.get("CVE ID","") for r in tier1}
+    tier2 = sorted(
+        [r for r in all_rows if r.get("CVE ID","") not in tier1_ids and
+         (str(r.get("CVSS Severity","")).upper() == "CRITICAL" or
+          str(r.get("Public Exploit","")).upper() == "YES")],
+        key=lambda r: _to_float(r.get("Risk Score",0)), reverse=True
+    )
+    lines += ["## Tier 2 — Critical (7 days)", ""]
+    if tier2:
+        lines += ["| CVE ID | Software | CVSS | Risk Score | Rationale |", "|---|---|---|---|---|"]
+        for r in tier2[:15]:
+            cid5    = r.get("CVE ID","")
+            sw5     = r.get("Software Name","")
+            cvss5   = f"{r.get('CVSS Base Score','N/A')} ({r.get('CVSS Severity','')})"
+            rs5     = r.get("Risk Score","")
+            is_crit = str(r.get("CVSS Severity","")).upper() == "CRITICAL"
+            is_expl = str(r.get("Public Exploit","")).upper() == "YES"
+            rationale = ("Critical + public exploit" if is_crit and is_expl else
+                         "Critical severity" if is_crit else "Public exploit code available")
+            nvd5    = r.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cid5}"
+            lines.append(f"| [{cid5}]({nvd5}) | {sw5} | {cvss5} | {rs5} | {rationale} |")
+        lines.append("")
+    else:
+        lines += ["No additional Tier 2 items beyond Tier 1.", ""]
+
+    tier12_ids = tier1_ids | {r.get("CVE ID","") for r in tier2}
+    tier3_count = sum(1 for r in all_rows if r.get("CVE ID","") not in tier12_ids and
+                      str(r.get("CVSS Severity","")).upper() == "HIGH")
+    tier4_count = sum(1 for r in all_rows if r.get("CVE ID","") not in tier12_ids and
+                      str(r.get("CVSS Severity","")).upper() not in ("CRITICAL","HIGH"))
+    lines += [
+        f"## Tier 3 — High Priority (30 days)",
+        "",
+        f"**{tier3_count} High-severity CVEs** — address via standard change management. See Section 5 for full detail.",
+        "",
+        f"## Tier 4 — Routine (90 days)",
+        "",
+        f"**{tier4_count} Medium/Low CVEs** — address through standard vulnerability management programme.",
+        "",
+        "---",
         "",
     ]
 
-    body_md = "\n".join(lines)
+    # 15. Residual Risk Discussion
+    lines += [
+        "# 15. Residual Risk Discussion",
+        "",
+        "Upon completion of all remediation activities, the following residual risks persist and "
+        "should be documented in the system's risk acceptance framework:",
+        "",
+    ]
+    residual: List[str] = []
+    residual.append(
+        "**Continuous Disclosure Risk:** New CVEs will be published for the assessed components on an ongoing basis. "
+        "Subscribe to vendor security advisories and NVD feeds. A continuous monitoring and patch management programme "
+        "is required to maintain an acceptable risk posture beyond the remediation of current findings."
+    )
+    if sev_counts["MEDIUM"] + sev_counts["LOW"] > 0:
+        residual.append(
+            f"**Lower-Severity Vulnerability Accumulation ({sev_counts['MEDIUM']} Medium, {sev_counts['LOW']} Low):** "
+            "These CVEs are not individually critical but can be chained with future zero-days or other vulnerabilities. "
+            "Deferred remediation increases aggregate risk over time."
+        )
+    if total_cves > confirmed_total and confirmed_total > 0:
+        unconfirmed = total_cves - confirmed_total
+        residual.append(
+            f"**{unconfirmed} Unconfirmed Version Matches:** Matched via CPE lookup but not version-confirmed against "
+            "the exact deployed build. Manual validation by the system owner is required to determine definitive applicability."
+        )
+    residual.append(
+        "**Control Effectiveness Uncertainty:** D3FEND countermeasures and NIST 800-53 controls are documented as "
+        "recommendations; their implementation state was not validated by this assessment. A configuration audit or "
+        "purple-team exercise is recommended to confirm correct deployment."
+    )
+    residual.append(
+        "**Third-Party and Supply Chain Exposure:** This assessment covers identified software components but not their "
+        "transitive dependencies, runtime environments, or third-party integrations. Vulnerabilities in these layers "
+        "may create indirect exposure to the assessed systems."
+    )
+    if kev_total > 0:
+        residual.append(
+            "**Indicator of Compromise Review Required:** Given the presence of KEV-listed CVEs, a threat-hunting exercise "
+            "should be conducted to determine whether exploitation may have already occurred prior to remediation. Review "
+            "authentication logs, network flow data, and endpoint telemetry for indicators consistent with the ATT&CK "
+            "techniques identified in Section 7."
+        )
+    for r_item in residual:
+        lines.append(f"- {r_item}")
+        lines.append("")
+
+    body_md = "\n".join(lines).strip() + "\n"
     return _wrap_html_report(
         title=report_title,
         body_md=body_md,
         logo_b64=logo_b64,
-        subtitle="Technical & SOC Implementation Guide",
+        subtitle="Technical Security Assessment — Engineering & RMF Audience",
         toc_html=toc_html,
     )
+
 
 
 # ======================================================================
@@ -4235,7 +5880,7 @@ class ScanWorker(QThread):
         otx_intel_results: Dict[str, Any] = {}
         total = len(self.software)
 
-        for idx, (name, version) in enumerate(self.software, 1):
+        for idx, (name, version, publisher, install_date) in enumerate(self.software, 1):
 
             if self.isInterruptionRequested():
                 self._emit_log("Scan cancelled by user", "warning")
@@ -4375,9 +6020,30 @@ class ScanWorker(QThread):
                 capec_str = "; ".join(fw["capec_ids"])
                 nist_str = "; ".join(fw["nist_controls"])
 
+                # ---- patch age calculation ----
+                patch_age_days = ""
+                if install_date:
+                    try:
+                        import datetime as _dt
+                        idate_obj = _dt.datetime.strptime(install_date, "%Y-%m-%d").date()
+                        pub_raw   = str(cve.get("published", "") or "")[:10]
+                        if pub_raw:
+                            cve_date_obj = _dt.datetime.strptime(pub_raw, "%Y-%m-%d").date()
+                            if idate_obj >= cve_date_obj:
+                                # Installed after CVE published — not vulnerable at install time
+                                patch_age_days = "0 (installed after CVE published)"
+                            else:
+                                delta = (_dt.date.today() - idate_obj).days
+                                patch_age_days = str(delta)
+                    except (ValueError, TypeError):
+                        patch_age_days = ""
+
                 all_rows.append({
                     "Software Name": name,
                     "Software Version": version,
+                    "Publisher": publisher,
+                    "Install Date": install_date,
+                    "Patch Age (Days)": patch_age_days,
                     "CVE ID": cid,
                     "Description": cve.get("description", ""),
                     "CVE Date": cve.get("published", ""),
@@ -4547,6 +6213,9 @@ class ScanWorker(QThread):
         fieldnames = [
             "Software Name",
             "Software Version",
+            "Publisher",
+            "Install Date",
+            "Patch Age (Days)",
             "CVE ID",
             "Description",
             "Risk Score",
