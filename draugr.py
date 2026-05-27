@@ -56,16 +56,34 @@ from resources.mitre_attack_scenarios import TECHNIQUE_SCENARIOS as SCENARIOS, g
 
 # Draugr companion modules (imported with fallback so headless CLI still works)
 try:
-    from draugr_fleet import build_fleet_report_from_db
-    HAS_FLEET = True
+    from draugr_themes import get_theme, set_theme, load_saved_theme, qt_stylesheet, t as _t, THEMES, report_css_overrides
+    HAS_THEMES = True
+    load_saved_theme()
 except ImportError:
-    HAS_FLEET = False
+    HAS_THEMES = False
+    def _t(k, fb="#888"): return fb  # type: ignore
 
 try:
-    from draugr_alerts import check_alerts, dispatch_alerts, load_alert_config
-    HAS_ALERTS = True
+    from draugr_sbom import export_sbom
+    HAS_SBOM = True
 except ImportError:
-    HAS_ALERTS = False
+    HAS_SBOM = False
+
+try:
+    from draugr_plugins import load_plugins, apply_enrich_row, apply_score_modifier, apply_on_scan_complete, collect_report_sections, ensure_plugins_dir, get_loaded_plugins, get_load_errors
+    HAS_PLUGINS = True
+except ImportError:
+    HAS_PLUGINS = False
+    def apply_enrich_row(r): return r           # type: ignore
+    def apply_score_modifier(r, s): return s    # type: ignore
+    def apply_on_scan_complete(rows): return rows  # type: ignore
+    def collect_report_sections(rows): return ""   # type: ignore
+
+try:
+    from draugr_ics import enrich_row_with_ics, ics_summary_section, is_ics_relevant
+    HAS_ICS = True
+except ImportError:
+    HAS_ICS = False
 
 try:
     from draugr_cache import DraugrDB, get_db as _get_db, extract_system_id
@@ -142,9 +160,45 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
+DRAUGR_VERSION = "2.0.0"
+DRAUGR_UPDATE_URL = "https://api.github.com/repos/your-org/draugr/releases/latest"
 
 # Default path for the CPE mapping override file (same directory as script)
 CPE_MAPPING_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpe_mappings.json")
+
+# Confidence threshold for CPE matching (0.0–1.0). Overridable via Settings.
+_CPE_CONFIDENCE_THRESHOLD = 0.03
+
+
+def check_for_update() -> Optional[Dict[str, str]]:
+    """
+    Check GitHub releases API for a newer version.
+    Returns {"version": "x.y.z", "url": "..."} if update available, else None.
+    Non-blocking — caller should run in a thread.
+    """
+    if requests is None:
+        return None
+    try:
+        resp = requests.get(DRAUGR_UPDATE_URL, timeout=5,
+                            headers={"User-Agent": USER_AGENT})
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        latest = str(data.get("tag_name","") or "").lstrip("v")
+        url    = str(data.get("html_url","") or "")
+        if not latest:
+            return None
+        # Simple version comparison
+        def _ver(s):
+            try:
+                return tuple(int(x) for x in s.split("."))
+            except Exception:
+                return (0,)
+        if _ver(latest) > _ver(DRAUGR_VERSION):
+            return {"version": latest, "url": url}
+    except Exception:
+        pass
+    return None
 
 
 # ======================================================================
@@ -690,7 +744,7 @@ def find_cves_for_software(
     ):
         # Skip very low-confidence matches (below 3%) unless it's a local mapping
         conf = float(candidate.get("confidence", 1.0))
-        if conf < 0.03 and "(local mapping)" not in candidate.get("title", ""):
+        if conf < _CPE_CONFIDENCE_THRESHOLD and "(local mapping)" not in candidate.get("title", ""):
             continue
 
         # ── Auto-learn high-confidence CPE matches ─────────────────────
@@ -6311,6 +6365,21 @@ class ScanWorker(QThread):
                     "NIST 800-53 Controls": nist_str,
                     "NVD URL": nvd_url,
                 }
+
+                # ── ICS/OT ATT&CK enrichment ───────────────────────────
+                if HAS_ICS:
+                    row_dict = enrich_row_with_ics(row_dict)
+
+                # ── Plugin enrichment and score modification ───────────
+                if HAS_PLUGINS:
+                    row_dict = apply_enrich_row(row_dict)
+                    try:
+                        modified_score = apply_score_modifier(row_dict, risk_score)
+                        if modified_score != risk_score:
+                            row_dict["Risk Score"] = round(modified_score, 1)
+                    except Exception:
+                        pass
+
                 all_rows.append(row_dict)
 
                 risk_entries.append((risk_score, risk_label, cid))
@@ -6454,6 +6523,16 @@ class ScanWorker(QThread):
         # Final progress — ensure bar shows 100%
         self.progress_signal.emit(total, total)
 
+        # ── Plugin post-scan hook ──────────────────────────────────────
+        if HAS_PLUGINS:
+            try:
+                all_rows = apply_on_scan_complete(all_rows)
+            except Exception as e:
+                self._emit_log(f"⚠ Plugin on_scan_complete failed: {e}", "warn")
+
+        # Make rows accessible to the GUI results browser
+        self._completed_rows = all_rows
+
         # -----------------------------------------------------------------
         # Write CSV — sorted by Risk Score descending
         # -----------------------------------------------------------------
@@ -6490,6 +6569,8 @@ class ScanWorker(QThread):
             "ATT&CK Techniques",
             "D3FEND Countermeasures",
             "NIST 800-53 Controls",
+            "ICS ATT&CK Techniques",
+            "Tags",
             "NVD URL",
         ]
         self.status_signal.emit("Writing CSV…")
@@ -6553,7 +6634,23 @@ class ScanWorker(QThread):
                     except Exception as e:
                         self._emit_log(f"⚠ POA&M export failed: {e}", "warn")
 
-                # ── Clear resume cache on successful completion ────────
+                # ── SBOM export ────────────────────────────────────────
+                if HAS_SBOM and self.defensive_report_path:
+                    try:
+                        sbom_path = str(self.defensive_report_path).replace(
+                            "_defensive_report.html", "_sbom.json"
+                        )
+                        n_comp = export_sbom(
+                            all_rows,
+                            sbom_path,
+                            system_name=self.system_id or str(Path(self.output_path).stem),
+                            tool_version=DRAUGR_VERSION,
+                        )
+                        self._emit_log(
+                            f"📦 SBOM Export     → {sbom_path} ({n_comp} components)", "ok"
+                        )
+                    except Exception as e:
+                        self._emit_log(f"⚠ SBOM export failed: {e}", "warn")
                 if db and session_id:
                     try:
                         db.clear_session(session_id)
@@ -6647,13 +6744,42 @@ class ScanWorker(QThread):
 class CVEScannerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Draugr — Threat Intelligence System")
-        self.setMinimumSize(860, 760)
-        self.resize(920, 820)
-        self.scanning = False
-        self.worker = None
-        self.logging = False
+        self.setWindowTitle(f"Draugr — Threat Intelligence System  v{DRAUGR_VERSION}")
+        self.setMinimumSize(960, 780)
+        self.resize(1060, 860)
+        self.scanning    = False
+        self.worker      = None
+        self.logging     = False
+        self._scan_rows: List[Dict[str, Any]] = []   # last scan results for browser
+        self._profiles:  Dict[str, Dict[str, Any]] = self._load_profiles()
         self._build_ui()
+        # Async version check
+        if HAS_CACHE:
+            try:
+                from PyQt6.QtCore import QTimer as _QTimer
+                _QTimer.singleShot(3000, self._check_version)
+            except Exception:
+                pass
+
+    def _load_profiles(self) -> Dict[str, Dict[str, Any]]:
+        from draugr_cache import _default_cache_dir
+        path = _default_cache_dir() / "scan_profiles.json"
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_profiles(self) -> None:
+        try:
+            from draugr_cache import _default_cache_dir
+            path = _default_cache_dir() / "scan_profiles.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._profiles, f, indent=2)
+        except Exception:
+            pass
 
     def _build_ui(self):
         central = QWidget()
@@ -6920,10 +7046,40 @@ class CVEScannerWindow(QMainWindow):
         root.addLayout(filter_row)
         root.addSpacing(4)
 
-        # 2) Connect signals to keep the worker in sync
         self.chk_medium.stateChanged.connect(self._update_show_medium)
         self.chk_low.stateChanged.connect(self._update_show_low)
 
+        # ── Tab widget: Scan Log | Results Browser ─────────────────────
+        from PyQt6.QtWidgets import QTabWidget, QSplitter, QTableWidget, QTableWidgetItem
+
+        TAB_STYLE = f"""
+        QTabWidget::pane {{
+            border: 1px solid {C.BORDER};
+            background: {C.BG_CARD};
+            border-radius: 0 6px 6px 6px;
+        }}
+        QTabBar::tab {{
+            background: {C.BG};
+            color: {C.FG_DIM};
+            border: 1px solid {C.BORDER};
+            border-bottom: none;
+            padding: 5px 14px;
+            margin-right: 2px;
+            border-radius: 4px 4px 0 0;
+            font-size: 11px;
+        }}
+        QTabBar::tab:selected {{
+            background: {C.BG_CARD};
+            color: {C.FG};
+        }}
+        QTabBar::tab:hover {{
+            background: {C.BG_HOVER};
+        }}
+        """
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet(TAB_STYLE)
+
+        # Tab 1: Scan log
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setStyleSheet(
@@ -6931,8 +7087,7 @@ class CVEScannerWindow(QMainWindow):
             QTextEdit {{
                 background: {C.BG_CARD};
                 color: {C.FG};
-                border: 1px solid {C.BORDER};
-                border-radius: 10px;
+                border: none;
                 padding: 12px;
                 font-family: 'Consolas', 'SF Mono', 'Menlo', monospace;
                 font-size: 12px;
@@ -6940,7 +7095,92 @@ class CVEScannerWindow(QMainWindow):
             }}
             """
         )
-        root.addWidget(self.log, 1)
+        self.tab_widget.addTab(self.log, "📋  Scan Log")
+
+        # Tab 2: Results browser (table + CVE detail panel)
+        results_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: filterable results table
+        results_left = QWidget()
+        results_left_layout = QVBoxLayout(results_left)
+        results_left_layout.setContentsMargins(6, 6, 0, 6)
+        results_left_layout.setSpacing(4)
+
+        # Filter bar
+        filter_bar = QHBoxLayout()
+        self._results_filter = QLineEdit()
+        self._results_filter.setPlaceholderText("Filter by CVE, software, severity…")
+        self._results_filter.setStyleSheet(
+            f"QLineEdit {{ background:{C.BG_INPUT}; color:{C.FG}; border:1px solid {C.BORDER}; "
+            f"border-radius:4px; padding:4px 8px; font-size:11px; }}"
+        )
+        self._results_filter.textChanged.connect(self._apply_results_filter)
+
+        self._sev_filter = QComboBox()
+        self._sev_filter.addItems(["All", "CRITICAL", "HIGH", "MEDIUM", "LOW"])
+        self._sev_filter.setStyleSheet(
+            f"QComboBox {{ background:{C.BG_INPUT}; color:{C.FG}; border:1px solid {C.BORDER}; "
+            f"border-radius:4px; padding:4px 6px; font-size:11px; min-width:90px; }}"
+        )
+        self._sev_filter.currentTextChanged.connect(self._apply_results_filter)
+
+        self._kev_filter = QCheckBox("KEV only")
+        self._kev_filter.setStyleSheet(CHECKBOX_STYLE)
+        self._kev_filter.stateChanged.connect(self._apply_results_filter)
+
+        filter_bar.addWidget(self._results_filter, 1)
+        filter_bar.addWidget(self._sev_filter)
+        filter_bar.addWidget(self._kev_filter)
+        results_left_layout.addLayout(filter_bar)
+
+        RESULTS_TABLE_COLS = ["CVE ID", "Software", "Severity", "Risk", "CVSS", "KEV", "Exploit", "EPSS"]
+        self._results_table = QTableWidget(0, len(RESULTS_TABLE_COLS))
+        self._results_table.setHorizontalHeaderLabels(RESULTS_TABLE_COLS)
+        self._results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._results_table.setAlternatingRowColors(True)
+        self._results_table.setSortingEnabled(True)
+        self._results_table.horizontalHeader().setStretchLastSection(True)
+        self._results_table.setStyleSheet(
+            f"QTableWidget {{ background:{C.BG_CARD}; color:{C.FG}; "
+            f"border:none; gridline-color:{C.BORDER}; alternate-background-color:{C.BG}; }}"
+            f"QHeaderView::section {{ background:{C.BG_INPUT}; color:{C.FG_DIM}; "
+            f"border:1px solid {C.BORDER}; padding:5px; font-weight:600; font-size:11px; }}"
+            f"QTableWidget::item:selected {{ background:{C.ACCENT}; color:#fff; }}"
+        )
+        self._results_table.currentRowChanged.connect(self._on_result_row_selected)
+        results_left_layout.addWidget(self._results_table)
+        results_splitter.addWidget(results_left)
+
+        # Right: CVE detail panel
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(0, 6, 6, 6)
+        detail_layout.setSpacing(0)
+
+        detail_header = QLabel("CVE Detail")
+        detail_header.setStyleSheet(
+            f"color:{C.FG_DIM}; font-size:10px; font-weight:600; "
+            f"letter-spacing:2px; padding:0 0 4px 8px;"
+        )
+        detail_layout.addWidget(detail_header)
+
+        self._detail_panel = QTextEdit()
+        self._detail_panel.setReadOnly(True)
+        self._detail_panel.setStyleSheet(
+            f"QTextEdit {{ background:{C.BG}; color:{C.FG}; border:1px solid {C.BORDER}; "
+            f"border-radius:6px; padding:10px; font-size:12px; }}"
+        )
+        self._detail_panel.setPlaceholderText("Select a CVE from the table to see details…")
+        detail_layout.addWidget(self._detail_panel)
+        results_splitter.addWidget(detail_widget)
+        results_splitter.setSizes([520, 380])
+        results_splitter.setStyleSheet(
+            f"QSplitter::handle {{ background:{C.BORDER}; width:2px; }}"
+        )
+
+        self.tab_widget.addTab(results_splitter, "🔍  Results Browser")
+        root.addWidget(self.tab_widget, 1)
 
         # Status bar
         self.status_label = QLabel("Ready")
@@ -7085,6 +7325,45 @@ class CVEScannerWindow(QMainWindow):
         act_alerts.triggered.connect(self._configure_alerts)
         settings_menu.addAction(act_alerts)
 
+        settings_menu.addSeparator()
+
+        act_theme = QAction("Theme…", self)
+        act_theme.setToolTip("Switch between Dark and Light themes")
+        act_theme.triggered.connect(self._change_theme)
+        settings_menu.addAction(act_theme)
+
+        act_conf = QAction("CPE Confidence Threshold…", self)
+        act_conf.setToolTip("Adjust minimum CPE match confidence to reduce false positives")
+        act_conf.triggered.connect(self._set_confidence_threshold)
+        settings_menu.addAction(act_conf)
+
+        act_cpe_ed = QAction("CPE Mappings Editor…", self)
+        act_cpe_ed.setToolTip("Review and edit auto-learned and manual CPE mappings")
+        act_cpe_ed.triggered.connect(self._edit_cpe_mappings)
+        settings_menu.addAction(act_cpe_ed)
+
+        settings_menu.addSeparator()
+
+        act_profiles = QAction("Scan Profiles…", self)
+        act_profiles.setToolTip("Save and load named scan configurations")
+        act_profiles.triggered.connect(self._manage_profiles)
+        settings_menu.addAction(act_profiles)
+
+        act_pdf = QAction("Export PDF Reports…", self)
+        act_pdf.setToolTip("Export the last scan reports as PDF files")
+        act_pdf.triggered.connect(self._export_pdf)
+        settings_menu.addAction(act_pdf)
+
+        act_plugins = QAction("Plugins Manager…", self)
+        act_plugins.setToolTip("View loaded plugins and open the plugins directory")
+        act_plugins.triggered.connect(self._manage_plugins)
+        settings_menu.addAction(act_plugins)
+
+        act_kev_check = QAction("Check KEV for Latest Scan…", self)
+        act_kev_check.setToolTip("Re-check the last scan's CVEs against the live CISA KEV feed")
+        act_kev_check.triggered.connect(self._check_kev_now)
+        settings_menu.addAction(act_kev_check)
+
     # --------------------------------------------------------------
     # Helper slots
     # --------------------------------------------------------------
@@ -7117,7 +7396,11 @@ class CVEScannerWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.scan_btn.setText("▶   Start Scan")
         self.worker._write_logs()
-        # Keep the final status from the worker (Complete / Error / Cancelled)
+        # Populate results browser from the worker's completed rows
+        if hasattr(self.worker, '_completed_rows'):
+            self._scan_rows = self.worker._completed_rows
+            self._populate_results_table(self._scan_rows)
+            self.tab_widget.setCurrentIndex(1)   # switch to Results Browser
         self.worker = None
 
     def _start_scan(self, generate_executive_report: bool = False):
@@ -7206,7 +7489,220 @@ class CVEScannerWindow(QMainWindow):
         self.worker.finished_signal.connect(self._scan_finished)
         self.worker.start()
 
-    def _stop_scan(self):
+    # ------------------------------------------------------------------
+    # Results browser
+    # ------------------------------------------------------------------
+    def _populate_results_table(self, rows: List[Dict[str, Any]]) -> None:
+        from PyQt6.QtWidgets import QTableWidgetItem
+        from PyQt6.QtGui import QColor
+        self._results_table.setSortingEnabled(False)
+        self._results_table.setRowCount(0)
+        sev_colors = {
+            "CRITICAL": C.RED, "HIGH": C.ORANGE,
+            "MEDIUM": C.YELLOW, "LOW": C.GREEN,
+        }
+        for row in rows:
+            ri = self._results_table.rowCount()
+            self._results_table.insertRow(ri)
+            sev = str(row.get("CVSS Severity","") or "").upper()
+            kev = str(row.get("Known Exploited Vulnerability","")).upper() == "YES"
+            vals = [
+                row.get("CVE ID",""),
+                f"{row.get('Software Name','')} {row.get('Software Version','')}".strip(),
+                sev,
+                str(row.get("Risk Score","")),
+                str(row.get("CVSS Base Score","")),
+                "⚠ YES" if kev else "No",
+                "Yes" if str(row.get("Public Exploit","")).upper() == "YES" else "No",
+                str(row.get("EPSS Score","")),
+            ]
+            for ci, val in enumerate(vals):
+                item = QTableWidgetItem(val)
+                if ci == 2 and sev in sev_colors:
+                    item.setForeground(QColor(sev_colors[sev]))
+                if kev and ci == 5:
+                    item.setForeground(QColor(C.RED))
+                self._results_table.setItem(ri, ci, item)
+        self._results_table.setSortingEnabled(True)
+        self._results_table.resizeColumnsToContents()
+
+    def _apply_results_filter(self) -> None:
+        text    = self._results_filter.text().lower().strip()
+        sev_f   = self._sev_filter.currentText()
+        kev_f   = self._kev_filter.isChecked()
+        for ri in range(self._results_table.rowCount()):
+            show = True
+            if text:
+                row_text = " ".join(
+                    self._results_table.item(ri, ci).text().lower()
+                    for ci in range(self._results_table.columnCount())
+                    if self._results_table.item(ri, ci)
+                )
+                if text not in row_text:
+                    show = False
+            if sev_f != "All" and show:
+                sev_item = self._results_table.item(ri, 2)
+                if sev_item and sev_item.text().upper() != sev_f:
+                    show = False
+            if kev_f and show:
+                kev_item = self._results_table.item(ri, 5)
+                if kev_item and "YES" not in kev_item.text().upper():
+                    show = False
+            self._results_table.setRowHidden(ri, not show)
+
+    def _on_result_row_selected(self, current_row: int) -> None:
+        if current_row < 0 or not self._scan_rows:
+            return
+        # Find the matching row from _scan_rows by CVE ID
+        cve_item = self._results_table.item(current_row, 0)
+        if not cve_item:
+            return
+        cve_id = cve_item.text()
+        row = next((r for r in self._scan_rows if r.get("CVE ID","") == cve_id), None)
+        if row:
+            self._detail_panel.setHtml(self._render_cve_detail(row))
+
+    def _render_cve_detail(self, row: Dict[str, Any]) -> str:
+        """Render a rich HTML CVE detail card for the detail panel."""
+        cid     = row.get("CVE ID","")
+        sev     = str(row.get("CVSS Severity","") or "").upper()
+        score   = row.get("CVSS Base Score","")
+        rs      = row.get("Risk Score","")
+        epss    = row.get("EPSS Score","")
+        desc    = str(row.get("Description","") or "No description.")
+        kev     = str(row.get("Known Exploited Vulnerability","")).upper() == "YES"
+        expl    = str(row.get("Public Exploit","")).upper() == "YES"
+        expl_src= row.get("Exploit Sources","")
+        vector  = row.get("CVSS Vector","")
+        cwes    = row.get("CWE","")
+        attacks = row.get("ATT&CK Techniques","")
+        ics_att = row.get("ICS ATT&CK Techniques","")
+        d3fend  = row.get("D3FEND Countermeasures","")
+        nist    = row.get("NIST 800-53 Controls","")
+        nvd_url = row.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cid}"
+        adv_url = row.get("Vendor Advisory URL","")
+        adv_nm  = row.get("Vendor Advisory Name","")
+        pub     = row.get("Publisher","")
+        idate   = row.get("Install Date","")
+        patch_age = row.get("Patch Age (Days)","")
+        conf    = row.get("Version Confirmed","")
+        sev_color = {
+            "CRITICAL": C.RED, "HIGH": C.ORANGE,
+            "MEDIUM": C.YELLOW, "LOW": C.GREEN,
+        }.get(sev, C.FG_DIM)
+
+        h = html.escape
+        lines = [
+            f'<div style="font-family:Segoe UI,sans-serif;font-size:12px;color:{C.FG};">',
+            f'<h2 style="color:{sev_color};margin:0 0 4px 0;font-size:16px;">{h(cid)}</h2>',
+            f'<div style="color:{C.FG_DIM};font-size:10px;margin-bottom:10px;">'
+            f'CVSS {score} ({sev}) &nbsp;|&nbsp; Risk Score: {rs} &nbsp;|&nbsp; EPSS: {epss}</div>',
+        ]
+        if kev:
+            lines.append(f'<div style="background:#3a0a0a;color:{C.RED};padding:4px 8px;'
+                         f'border-radius:4px;margin-bottom:6px;font-size:11px;font-weight:700;">'
+                         f'⚠ CISA KEV-LISTED — Active exploitation confirmed</div>')
+        if expl:
+            lines.append(f'<div style="background:#2a1000;color:{C.ORANGE};padding:4px 8px;'
+                         f'border-radius:4px;margin-bottom:6px;font-size:11px;font-weight:700;">'
+                         f'🔴 PUBLIC EXPLOIT — {h(expl_src or "See NVD")}</div>')
+        lines.append(f'<p style="margin:8px 0;line-height:1.5;">{h(desc)}</p>')
+
+        def _section(title: str, content: str) -> str:
+            return (f'<div style="margin:8px 0;">'
+                    f'<div style="color:{C.FG_DIM};font-size:10px;font-weight:600;'
+                    f'letter-spacing:1px;margin-bottom:3px;">{title}</div>'
+                    f'<div style="font-size:11px;color:{C.FG};">{content}</div></div>')
+
+        def _link(url: str, label: str) -> str:
+            return f'<a href="{h(url)}" style="color:{C.BLUE};">{h(label)}</a>'
+
+        if vector:
+            lines.append(_section("CVSS VECTOR", f'<code style="color:{C.YELLOW}">{h(vector)}</code>'))
+        if cwes:
+            cwe_links = " ".join(
+                _link(f"https://cwe.mitre.org/data/definitions/{c.replace('CWE-','')}.html", c)
+                for c in cwes.split(";") if c.strip()
+            )
+            lines.append(_section("CWE", cwe_links))
+        if attacks:
+            atk_parts = []
+            for atk in attacks.split(";"):
+                atk = atk.strip()
+                import re as _re
+                m = _re.match(r"(T\d{4}(?:\.\d{3})?)\s*\((.*?)\)$", atk)
+                if m:
+                    tid, tname = m.group(1), m.group(2)
+                    atk_parts.append(_link(
+                        f"https://attack.mitre.org/techniques/{tid.replace('.','/')}/",
+                        f"{tid} {tname}"
+                    ))
+                else:
+                    atk_parts.append(h(atk))
+            lines.append(_section("ATT&CK TECHNIQUES", " &nbsp;·&nbsp; ".join(atk_parts)))
+        if ics_att:
+            ics_parts = []
+            for atk in ics_att.split(";"):
+                atk = atk.strip()
+                import re as _re2
+                m2 = _re2.match(r"(T\d{4})\s*\((.*?)\)$", atk)
+                if m2:
+                    tid, tname = m2.group(1), m2.group(2)
+                    ics_parts.append(_link(
+                        f"https://attack.mitre.org/techniques/{tid}/",
+                        f"{tid} {tname} (ICS)"
+                    ))
+                else:
+                    ics_parts.append(h(atk))
+            lines.append(_section("ICS ATT&CK TECHNIQUES", " &nbsp;·&nbsp; ".join(ics_parts)))
+        if d3fend:
+            d3_parts = []
+            for cm in d3fend.split(";"):
+                cm = cm.strip()
+                if cm:
+                    slug = cm.replace(" ","")
+                    d3_parts.append(_link(f"https://d3fend.mitre.org/technique/d3f:{slug}/", cm))
+            lines.append(_section("D3FEND COUNTERMEASURES", " &nbsp;·&nbsp; ".join(d3_parts)))
+        if nist:
+            nist_parts = []
+            for ctrl in nist.split(";"):
+                ctrl = ctrl.strip()
+                ctrl_id = ctrl.split()[0] if ctrl.split() else ctrl
+                nist_parts.append(_link(
+                    f"https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl_id}",
+                    ctrl_id
+                ))
+            lines.append(_section("NIST 800-53 CONTROLS", " &nbsp;·&nbsp; ".join(nist_parts)))
+
+        meta_parts = []
+        if pub:    meta_parts.append(f"Publisher: {h(pub)}")
+        if idate:  meta_parts.append(f"Installed: {h(idate)}")
+        if patch_age: meta_parts.append(f"Patch Age: {h(patch_age)} days")
+        if conf:   meta_parts.append(f"Version Confirmed: {h(conf)}")
+        if meta_parts:
+            lines.append(_section("INVENTORY", " &nbsp;|&nbsp; ".join(meta_parts)))
+
+        # Links
+        link_parts = [_link(nvd_url, "NVD Advisory")]
+        if adv_url:
+            link_parts.append(_link(adv_url, adv_nm or "Vendor Advisory"))
+        lines.append(_section("REFERENCES", " &nbsp;|&nbsp; ".join(link_parts)))
+        lines.append("</div>")
+        return "".join(lines)
+
+    # ------------------------------------------------------------------
+    # Version check
+    # ------------------------------------------------------------------
+    def _check_version(self) -> None:
+        try:
+            update = check_for_update()
+            if update:
+                self._append_log(
+                    f"🔔 Update available: Draugr v{update['version']} — {update['url']}",
+                    "warn"
+                )
+        except Exception:
+            pass
         if self.worker:
             self._append_log("Stop requested ...", "info")
             self.worker.requestInterruption()
@@ -7614,6 +8110,480 @@ class CVEScannerWindow(QMainWindow):
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
         dlg.exec()
+
+
+    # ------------------------------------------------------------------
+    # Theme switcher
+    # ------------------------------------------------------------------
+    def _change_theme(self) -> None:
+        if not HAS_THEMES:
+            QMessageBox.information(self, "Theme", "draugr_themes.py not found — using default theme.")
+            return
+        from PyQt6.QtWidgets import QDialog, QListWidget
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Theme")
+        dlg.setFixedSize(300, 200)
+        layout = QVBoxLayout(dlg)
+        lw = QListWidget()
+        lw.setStyleSheet(
+            f"QListWidget {{ background:{C.BG_INPUT}; color:{C.FG}; border:1px solid {C.BORDER}; }}"
+            f"QListWidget::item:selected {{ background:{C.ACCENT}; }}"
+        )
+        from draugr_themes import THEMES, get_theme_name
+        current = get_theme_name()
+        for key, th in THEMES.items():
+            lw.addItem(th["name"])
+            if key == current:
+                lw.setCurrentRow(lw.count() - 1)
+        layout.addWidget(QLabel("Select a theme (takes effect on restart):"))
+        layout.addWidget(lw)
+        btn_layout = QHBoxLayout()
+        btn_s = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                 f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 14px; }}"
+                 f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+        ok_btn = QPushButton("Apply")
+        ok_btn.setStyleSheet(btn_s)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(btn_s)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        cancel_btn.clicked.connect(dlg.reject)
+        def _apply():
+            idx = lw.currentRow()
+            if idx >= 0:
+                key = list(THEMES.keys())[idx]
+                set_theme(key)
+                QMessageBox.information(dlg, "Theme", f"Theme set to '{THEMES[key]['name']}'. Restart Draugr to apply.")
+            dlg.accept()
+        ok_btn.clicked.connect(_apply)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
+    # CPE confidence threshold
+    # ------------------------------------------------------------------
+    def _set_confidence_threshold(self) -> None:
+        global _CPE_CONFIDENCE_THRESHOLD
+        from PyQt6.QtWidgets import QDialog, QSlider, QDoubleSpinBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("CPE Confidence Threshold")
+        dlg.setFixedSize(380, 200)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+        layout = QVBoxLayout(dlg)
+        info = QLabel(
+            "Set the minimum CPE match confidence required for a CVE to be included in results.\n\n"
+            "Lower = more results, more false positives.\n"
+            "Higher = fewer results, fewer false positives.\n"
+            f"Current: {_CPE_CONFIDENCE_THRESHOLD:.0%}"
+        )
+        info.setStyleSheet(f"color:{C.FG_DIM}; font-size:11px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 0.5)
+        spin.setSingleStep(0.01)
+        spin.setDecimals(2)
+        spin.setValue(_CPE_CONFIDENCE_THRESHOLD)
+        spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; padding:4px 8px; }}"
+        )
+        layout.addWidget(spin)
+        btn_s = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                 f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 14px; }}"
+                 f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("Apply")
+        ok_btn.setStyleSheet(btn_s)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(btn_s)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        cancel_btn.clicked.connect(dlg.reject)
+        def _apply():
+            _CPE_CONFIDENCE_THRESHOLD = spin.value()
+            if HAS_CACHE:
+                try:
+                    prefs = {}
+                    from draugr_cache import _default_cache_dir
+                    p = _default_cache_dir() / "prefs.json"
+                    if p.exists():
+                        import json as _j
+                        prefs = _j.loads(p.read_text())
+                    prefs["cpe_confidence"] = _CPE_CONFIDENCE_THRESHOLD
+                    p.write_text(import_json := __import__("json").dumps(prefs, indent=2))
+                except Exception:
+                    pass
+            self._append_log(f"CPE confidence threshold set to {_CPE_CONFIDENCE_THRESHOLD:.0%}", "ok")
+            dlg.accept()
+        ok_btn.clicked.connect(_apply)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
+    # CPE mappings editor
+    # ------------------------------------------------------------------
+    def _edit_cpe_mappings(self) -> None:
+        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem
+        dlg = QDialog(self)
+        dlg.setWindowTitle("CPE Mappings Editor")
+        dlg.setMinimumSize(700, 420)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Learned CPE mappings (auto-saved from high-confidence scans) "
+            "and manual cpe_mappings.json entries. "
+            "Edit the 'CPE String' column to correct a mapping; delete rows to remove them."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{C.FG_DIM}; font-size:11px;")
+        layout.addWidget(info)
+
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["Software Name", "CPE String", "Confidence", "Hit Count"])
+        table.setStyleSheet(
+            f"QTableWidget {{ background:{C.BG_CARD}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; gridline-color:{C.BORDER}; }}"
+            f"QHeaderView::section {{ background:{C.BG_INPUT}; color:{C.FG_DIM}; "
+            f"border:1px solid {C.BORDER}; padding:4px; }}"
+        )
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+
+        # Load learned mappings
+        entries = []
+        if HAS_CACHE:
+            try:
+                db = _get_db()
+                entries = db.get_all_learned_cpes()
+            except Exception:
+                pass
+        # Also load manual cpe_mappings.json
+        try:
+            if os.path.isfile(CPE_MAPPING_DEFAULT):
+                with open(CPE_MAPPING_DEFAULT, "r", encoding="utf-8") as f:
+                    manual = json.load(f)
+                for k, v in manual.items():
+                    if not any(e["sw_key"] == k for e in entries):
+                        entries.append({"sw_key": k, "cpe_string": v, "confidence": 1.0, "hit_count": "manual"})
+        except Exception:
+            pass
+
+        for e in entries:
+            ri = table.rowCount()
+            table.insertRow(ri)
+            table.setItem(ri, 0, QTableWidgetItem(e["sw_key"]))
+            table.setItem(ri, 1, QTableWidgetItem(e["cpe_string"]))
+            table.setItem(ri, 2, QTableWidgetItem(f"{e['confidence']:.0%}" if isinstance(e['confidence'], float) else str(e['confidence'])))
+            table.setItem(ri, 3, QTableWidgetItem(str(e["hit_count"])))
+        table.resizeColumnsToContents()
+
+        btn_s = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                 f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 12px; }}"
+                 f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+        btn_layout = QHBoxLayout()
+
+        def _export():
+            path, _ = QFileDialog.getSaveFileName(dlg, "Export learned CPEs", "cpe_learned.json", "JSON (*.json)")
+            if path and HAS_CACHE:
+                try:
+                    n = _get_db().export_learned_cpes(path)
+                    QMessageBox.information(dlg, "Export", f"Exported {n} entries.")
+                except Exception as e:
+                    QMessageBox.critical(dlg, "Error", str(e))
+
+        export_btn = QPushButton("Export as JSON")
+        export_btn.setStyleSheet(btn_s)
+        export_btn.clicked.connect(_export)
+        btn_layout.addWidget(export_btn)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(btn_s)
+        close_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
+    # Scan profiles
+    # ------------------------------------------------------------------
+    def _manage_profiles(self) -> None:
+        from PyQt6.QtWidgets import QDialog, QListWidget, QListWidgetItem
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Scan Profiles")
+        dlg.setMinimumSize(500, 360)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+        layout = QVBoxLayout(dlg)
+        info = QLabel("Save the current configuration as a named profile, or load a saved profile.")
+        info.setStyleSheet(f"color:{C.FG_DIM}; font-size:11px;")
+        layout.addWidget(info)
+
+        lw = QListWidget()
+        lw.setStyleSheet(
+            f"QListWidget {{ background:{C.BG_CARD}; color:{C.FG}; border:1px solid {C.BORDER}; }}"
+            f"QListWidget::item:selected {{ background:{C.ACCENT}; color:#fff; }}"
+        )
+        for name in sorted(self._profiles.keys()):
+            lw.addItem(name)
+        layout.addWidget(lw)
+
+        btn_s = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                 f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 12px; }}"
+                 f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+        btn_layout = QHBoxLayout()
+
+        def _save_profile():
+            from PyQt6.QtWidgets import QInputDialog
+            name, ok = QInputDialog.getText(dlg, "Save Profile", "Profile name:")
+            if not ok or not name.strip():
+                return
+            self._profiles[name.strip()] = {
+                "sw_path":       self.sw_row.text(),
+                "out_path":      self.out_row.text(),
+                "kev_path":      self.kev_row.text(),
+                "cpe_path":      self.cpe_row.text(),
+                "resources_dir": self.resources_row.text(),
+                "api_key":       "",    # never save API keys in profiles
+                "show_medium":   self.chk_medium.isChecked(),
+                "show_low":      self.chk_low.isChecked(),
+            }
+            self._save_profiles()
+            lw.clear()
+            for n in sorted(self._profiles.keys()):
+                lw.addItem(n)
+            self._append_log(f"Profile saved: {name.strip()}", "ok")
+
+        def _load_profile():
+            items = lw.selectedItems()
+            if not items:
+                return
+            name = items[0].text()
+            p = self._profiles.get(name, {})
+            if p.get("sw_path"):
+                self.sw_row.setText(p["sw_path"])
+            if p.get("out_path"):
+                self.out_row.setText(p["out_path"])
+            if p.get("kev_path"):
+                self.kev_row.setText(p["kev_path"])
+            if p.get("cpe_path"):
+                self.cpe_row.setText(p["cpe_path"])
+            if p.get("resources_dir"):
+                self.resources_row.setText(p["resources_dir"])
+            self.chk_medium.setChecked(p.get("show_medium", True))
+            self.chk_low.setChecked(p.get("show_low", False))
+            self._append_log(f"Profile loaded: {name}", "ok")
+            dlg.accept()
+
+        def _delete_profile():
+            items = lw.selectedItems()
+            if not items:
+                return
+            name = items[0].text()
+            self._profiles.pop(name, None)
+            self._save_profiles()
+            for i in range(lw.count()):
+                if lw.item(i).text() == name:
+                    lw.takeItem(i)
+                    break
+
+        for label, slot in [("Save Current", _save_profile), ("Load", _load_profile), ("Delete", _delete_profile)]:
+            btn = QPushButton(label)
+            btn.setStyleSheet(btn_s)
+            btn.clicked.connect(slot)
+            btn_layout.addWidget(btn)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(btn_s)
+        close_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
+    # PDF export
+    # ------------------------------------------------------------------
+    def _export_pdf(self) -> None:
+        # Try WeasyPrint first, fall back to instructions
+        try:
+            import weasyprint
+            HAS_WEASYPRINT = True
+        except ImportError:
+            HAS_WEASYPRINT = False
+
+        if not HAS_WEASYPRINT:
+            QMessageBox.information(
+                self, "PDF Export",
+                "PDF export requires WeasyPrint.\n\n"
+                "Install it with:\n  pip install weasyprint\n\n"
+                "Alternatively, open any HTML report in your browser and use\n"
+                "File → Print → Save as PDF."
+            )
+            return
+
+        html_path, _ = QFileDialog.getOpenFileName(
+            self, "Select HTML Report to Convert", "", "HTML files (*.html)"
+        )
+        if not html_path:
+            return
+        pdf_path, _ = QFileDialog.getSaveFileName(
+            self, "Save PDF", html_path.replace(".html", ".pdf"), "PDF files (*.pdf)"
+        )
+        if not pdf_path:
+            return
+        try:
+            import weasyprint as wp
+            wp.HTML(filename=html_path).write_pdf(pdf_path)
+            QMessageBox.information(self, "PDF Export", f"PDF saved:\n{pdf_path}")
+            self._append_log(f"📄 PDF exported → {pdf_path}", "ok")
+        except Exception as e:
+            QMessageBox.critical(self, "PDF Export Error", str(e))
+
+    # ------------------------------------------------------------------
+    # Plugins manager
+    # ------------------------------------------------------------------
+    def _manage_plugins(self) -> None:
+        if not HAS_PLUGINS:
+            QMessageBox.warning(self, "Unavailable",
+                "draugr_plugins.py not found. Place it in the same directory as draugr.py.")
+            return
+
+        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem
+        ensure_plugins_dir()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Plugins Manager")
+        dlg.setMinimumSize(660, 380)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+        layout = QVBoxLayout(dlg)
+
+        plugins    = get_loaded_plugins()
+        errors     = get_load_errors()
+        plugins_dir_path = str(Path(os.path.dirname(os.path.abspath(__file__))) / "plugins")
+
+        info = QLabel(
+            f"Plugins directory: {plugins_dir_path}\n"
+            f"{len(plugins)} plugin(s) loaded. "
+            "Drop .py files into the plugins/ directory and restart to add plugins."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{C.FG_DIM}; font-size:11px;")
+        layout.addWidget(info)
+
+        table = QTableWidget(len(plugins), 4)
+        table.setHorizontalHeaderLabels(["Name", "Version", "Hooks", "File"])
+        table.setStyleSheet(
+            f"QTableWidget {{ background:{C.BG_CARD}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; gridline-color:{C.BORDER}; }}"
+            f"QHeaderView::section {{ background:{C.BG_INPUT}; color:{C.FG_DIM}; "
+            f"border:1px solid {C.BORDER}; padding:4px; }}"
+        )
+        table.horizontalHeader().setStretchLastSection(True)
+        for ri, p in enumerate(plugins):
+            hooks = ", ".join(h for h in ["enrich_row","score_modifier","on_scan_complete","report_section"]
+                              if p.get(h))
+            table.setItem(ri, 0, QTableWidgetItem(p["name"]))
+            table.setItem(ri, 1, QTableWidgetItem(p["version"]))
+            table.setItem(ri, 2, QTableWidgetItem(hooks or "none"))
+            table.setItem(ri, 3, QTableWidgetItem(Path(p["file"]).name))
+        layout.addWidget(table)
+
+        if errors:
+            err_label = QLabel(f"⚠ {len(errors)} plugin(s) failed to load:")
+            err_label.setStyleSheet(f"color:{C.RED}; font-size:11px;")
+            layout.addWidget(err_label)
+            err_box = QTextEdit("\n\n".join(errors))
+            err_box.setReadOnly(True)
+            err_box.setMaximumHeight(80)
+            err_box.setStyleSheet(
+                f"QTextEdit {{ background:{C.BG_INPUT}; color:{C.RED}; "
+                f"border:1px solid {C.BORDER}; font-size:10px; }}"
+            )
+            layout.addWidget(err_box)
+
+        btn_s = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                 f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 12px; }}"
+                 f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+        btn_layout = QHBoxLayout()
+
+        def _open_dir():
+            import subprocess
+            try:
+                if os.name == "nt":
+                    os.startfile(plugins_dir_path)
+                else:
+                    subprocess.Popen(["xdg-open", plugins_dir_path])
+            except Exception:
+                QMessageBox.information(dlg, "Plugins", f"Plugins directory:\n{plugins_dir_path}")
+
+        open_btn = QPushButton("Open Plugins Folder")
+        open_btn.setStyleSheet(btn_s)
+        open_btn.clicked.connect(_open_dir)
+        btn_layout.addWidget(open_btn)
+
+        def _reload():
+            load_plugins()
+            QMessageBox.information(dlg, "Reload", f"{len(get_loaded_plugins())} plugin(s) loaded.")
+            dlg.accept()
+            self._manage_plugins()
+
+        reload_btn = QPushButton("Reload Plugins")
+        reload_btn.setStyleSheet(btn_s)
+        reload_btn.clicked.connect(_reload)
+        btn_layout.addWidget(reload_btn)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(btn_s)
+        close_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
+    # KEV background check
+    # ------------------------------------------------------------------
+    def _check_kev_now(self) -> None:
+        """
+        Fetch the live CISA KEV feed and check if any CVEs from the last scan
+        are newly listed (not in the KEV at scan time but now listed).
+        """
+        if not self._scan_rows:
+            QMessageBox.information(self, "KEV Check",
+                "No scan results loaded. Run a scan first.")
+            return
+        try:
+            self._append_log("🔄 Fetching live CISA KEV feed…", "info")
+            from draugr_cache import _default_cache_dir
+            live_kev = fetch_kev_online()
+            if not live_kev:
+                QMessageBox.warning(self, "KEV Check", "Could not fetch the live KEV feed.")
+                return
+            scan_cve_ids = {str(r.get("CVE ID","")).upper() for r in self._scan_rows}
+            newly_kev    = [
+                cid for cid in scan_cve_ids
+                if cid in live_kev
+                and not any(
+                    str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+                    for r in self._scan_rows if r.get("CVE ID","").upper() == cid
+                )
+            ]
+            if newly_kev:
+                msg = (
+                    f"⚠ {len(newly_kev)} CVE(s) from your last scan have been "
+                    f"added to the CISA KEV catalog since the scan was run:\n\n"
+                    + "\n".join(f"  • {c}" for c in sorted(newly_kev)[:20])
+                )
+                self._append_log(msg, "warn")
+                QMessageBox.warning(self, "Newly KEV-Listed CVEs", msg)
+            else:
+                self._append_log("✓ No newly KEV-listed CVEs found in the last scan.", "ok")
+                QMessageBox.information(self, "KEV Check",
+                    "No new KEV listings found for CVEs in your last scan.")
+        except Exception as e:
+            self._append_log(f"KEV check error: {e}", "error")
+            QMessageBox.critical(self, "KEV Check Error", str(e))
 
 
 # ----------------------------------------------------------------------
@@ -8039,15 +9009,25 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(C.BG))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(C.FG))
-    palette.setColor(QPalette.ColorRole.Base, QColor(C.BG_INPUT))
-    palette.setColor(QPalette.ColorRole.Text, QColor(C.FG))
-    palette.setColor(QPalette.ColorRole.Button, QColor(C.BG_CARD))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor(C.FG))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(C.ACCENT))
-    app.setPalette(palette)
+    # Apply theme stylesheet
+    if HAS_THEMES:
+        app.setStyleSheet(qt_stylesheet())
+    else:
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(C.BG))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(C.FG))
+        palette.setColor(QPalette.ColorRole.Base, QColor(C.BG_INPUT))
+        palette.setColor(QPalette.ColorRole.Text, QColor(C.FG))
+        palette.setColor(QPalette.ColorRole.Button, QColor(C.BG_CARD))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(C.FG))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(C.ACCENT))
+        app.setPalette(palette)
+
+    # Load plugins on startup
+    if HAS_PLUGINS:
+        loaded = load_plugins()
+        if loaded:
+            print(f"[Draugr] {len(loaded)} plugin(s) loaded: {', '.join(p['name'] for p in loaded)}")
 
     # --- splash screen ---
     splash = DraugrSplash()
