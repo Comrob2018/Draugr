@@ -1,16 +1,31 @@
-try:
-    from draugr_fleet import build_fleet_report_from_db
-    HAS_FLEET = True
-except ImportError:
-    HAS_FLEET = False
-    build_fleet_report_from_db = None
+You are an expert PowerPoint designer. Create a single 16:9 slide that clearly explains what the **Advanced Cyber Defense – Weapon System Cyber Assessment Team** does. Follow these guidelines:
 
-try:
-    from draugr_alerts import check_alerts, dispatch_alerts, load_alert_config
-    HAS_ALERTS = True
-except ImportError:
-    HAS_ALERTS = False
-    def load_alert_config(): return {}
-    def check_alerts(*a, **kw): return []
-    def dispatch_alerts(*a, **kw): return {"email": 0, "webhook": 0}
+1. **Slide Title**
+   - Use a concise, action‑oriented title, e.g., “Advanced Cyber Defense – Weapon System Assessment”.
 
+2. **Layout**
+   - Split the slide into two columns:
+     * Left column: a brief mission statement (1‑2 lines) with a relevant icon (shield + circuit).
+     * Right column: 5–6 bullet points describing core activities.
+   - Add a footer with the team name and a subtle watermark of the organization’s logo.
+
+3. **Content – Core Activities (bullet points)**
+   - Conduct threat modeling and risk assessments for all weapon‑system software/hardware.
+   - Perform vulnerability scanning, penetration testing, and code review on embedded and networked components.
+   - Validate security architecture against DoD/NIAP standards and export‑control requirements.
+   - Provide remediation guidance, patch management, and secure‑development lifecycle (SDL) support.
+   - Integrate cyber‑resilience testing (e.g., red‑team/blue‑team exercises) into system‑acceptance phases.
+   - Generate actionable security assurance reports and brief senior leadership.
+
+4. **Styling**
+   - Corporate color palette: dark navy background, accent teal for icons and headings, white text.
+   - Use a modern, sans‑serif font (e.g., Calibri Light) – title 44 pt, bullets 28 pt.
+   - Include a small graphic of a stylized weapon system silhouette in the bottom‑right corner, partially transparent.
+
+5. **Tone & Audience**
+   - Formal, concise, and technical – intended for senior engineers and program managers.
+
+6. **Export**
+   - Provide the slide in PowerPoint (.pptx) format and also a PNG preview.
+
+Produce only the PowerPoint slide (no extra commentary). If any placeholder images are needed, name them “shield_icon.png”, “weapon_silhouette.png”, and “org_logo.png”.
