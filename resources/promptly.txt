@@ -1,1 +1,16 @@
+try:
+    from draugr_fleet import build_fleet_report_from_db
+    HAS_FLEET = True
+except ImportError:
+    HAS_FLEET = False
+    build_fleet_report_from_db = None
+
+try:
+    from draugr_alerts import check_alerts, dispatch_alerts, load_alert_config
+    HAS_ALERTS = True
+except ImportError:
+    HAS_ALERTS = False
+    def load_alert_config(): return {}
+    def check_alerts(*a, **kw): return []
+    def dispatch_alerts(*a, **kw): return {"email": 0, "webhook": 0}
 
