@@ -37,18 +37,61 @@ CPE MAPPING FILE (optional — cpe_mappings.json):
 # ----------------------------------------------------------------------
 import base64
 import csv
+import datetime
+import hashlib
 import html
 import json
 import os
 import re
 import sys
 import time
+import sqlite3
+import argparse
 from collections import defaultdict, Counter
 from pathlib import Path
 from packaging.version import Version, InvalidVersion
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus
 from resources.mitre_attack_scenarios import TECHNIQUE_SCENARIOS as SCENARIOS, get_tactics, get_impact
+
+# Draugr companion modules (imported with fallback so headless CLI still works)
+try:
+    from draugr_fleet import build_fleet_report_from_db
+    HAS_FLEET = True
+except ImportError:
+    HAS_FLEET = False
+
+try:
+    from draugr_alerts import check_alerts, dispatch_alerts, load_alert_config
+    HAS_ALERTS = True
+except ImportError:
+    HAS_ALERTS = False
+
+try:
+    from draugr_cache import DraugrDB, get_db as _get_db, extract_system_id
+    HAS_CACHE = True
+except ImportError:
+    HAS_CACHE = False
+    _get_db = None
+    extract_system_id = lambda f: Path(f).stem
+
+try:
+    from draugr_diff import compute_diff, build_diff_report, export_diff_csv, load_scan_csv
+    HAS_DIFF = True
+except ImportError:
+    HAS_DIFF = False
+
+try:
+    from draugr_advisories import resolve_advisory, enrich_rows_with_advisories
+    HAS_ADVISORIES = True
+except ImportError:
+    HAS_ADVISORIES = False
+
+try:
+    from draugr_poam import export_poam
+    HAS_POAM = True
+except ImportError:
+    HAS_POAM = False
 
 
 # ----------------------------------------------------------------------
@@ -173,7 +216,17 @@ def _build_nvd_url(base: str, params: Dict[str, Any]) -> str:
 
 
 def nvd_get_json(url: str, params: Dict[str, Any], timeout: int = 60, max_attempts: int = 4) -> Dict[str, Any]:
-    """Robust wrapper around NVD API calls with retry & rate‑limit handling."""
+    """Robust wrapper around NVD API calls with retry, rate-limit handling, and response caching."""
+    # ── Check cache first ─────────────────────────────────────────────
+    if HAS_CACHE:
+        try:
+            db = _get_db()
+            cached = db.get_nvd(url, params)
+            if cached is not None:
+                return cached
+        except Exception:
+            pass   # cache failure is non-fatal
+
     headers = {"User-Agent": USER_AGENT, "apiKey": NVD_API_KEY}
     request_url = _build_nvd_url(url, params)
     for attempt in range(1, max_attempts + 1):
@@ -189,14 +242,23 @@ def nvd_get_json(url: str, params: Dict[str, Any], timeout: int = 60, max_attemp
                 time.sleep(sleep_s)
                 continue
             r.raise_for_status()
-            return r.json()
-        except Exception as exc:  # pragma: no cover – network failures are hard to test
+            data = r.json()
+
+            # ── Store in cache ─────────────────────────────────────────
+            if HAS_CACHE:
+                try:
+                    _get_db().put_nvd(url, params, data)
+                except Exception:
+                    pass
+
+            return data
+        except Exception as exc:
             if attempt == max_attempts:
                 raise RuntimeError(
                     f"Failed NVD request for {url} with params={params!r}: {exc}"
                 ) from exc
             time.sleep(min(2 * attempt, 10))
-    raise RuntimeError("Unreachable code in nvd_get_json")  # safety
+    raise RuntimeError("Unreachable code in nvd_get_json")
 
 
 # ----------------------------------------------------------------------
@@ -218,24 +280,73 @@ def version_in_text(version: str, text: str) -> bool:
     return bool(v and v in t)
 
 
-def score_cpe_candidate(name: str, version: str, title: str, cpe_name: str) -> int:
-    """Heuristic scoring of a CPE entry against the target product."""
+def _strip_arch(name: str) -> str:
+    """Remove architecture suffixes like (x64), (x86), (ARM64) for CPE matching."""
+    return re.sub(r'\s*\((x64|x86|x86_64|arm64|arm|aarch64|win32|win64)\)', '', name, flags=re.IGNORECASE).strip()
+
+
+def score_cpe_candidate(
+    name: str,
+    version: str,
+    title: str,
+    cpe_name: str,
+    publisher: str = "",
+) -> Tuple[int, float]:
+    """
+    Heuristic scoring of a CPE entry against the target product.
+
+    Returns (raw_score, confidence_pct) where confidence_pct is 0.0–1.0.
+    Higher confidence means the CPE is more likely to be the correct match.
+    Publisher is used to narrow vendor matching when available.
+    """
     score = 0
-    n = normalize_text(name)
+    name_clean = normalize_text(_strip_arch(name))
     t = normalize_text(title)
     c = normalize_text(cpe_name)
 
-    for token in n.split():
-        if token in t or token in c:
+    # Token overlap
+    for token in name_clean.split():
+        if len(token) < 3:
+            continue
+        if token in t:
+            score += 3
+        if token in c:
             score += 3
 
+    # Full name match
+    if name_clean in t:
+        score += 8
+    if name_clean in c:
+        score += 5
+
+    # Version match (strongest signal)
     if version_in_text(version, title):
         score += 8
     if version_in_text(version, cpe_name):
-        score += 10
-    if n in t:
-        score += 5
-    return score
+        score += 12
+
+    # Publisher / vendor match
+    if publisher:
+        pub_norm = normalize_text(publisher)
+        pub_tokens = [t for t in pub_norm.split() if len(t) > 3]
+        for pt in pub_tokens:
+            if pt in c:
+                score += 6
+                break
+        # Extract vendor field from CPE (cpe:2.3:a:vendor:product:...)
+        cpe_parts = cpe_name.split(":")
+        if len(cpe_parts) >= 5:
+            cpe_vendor = cpe_parts[3].lower()
+            for pt in pub_tokens:
+                if pt in cpe_vendor or cpe_vendor in pt:
+                    score += 8
+                    break
+
+    # Compute confidence as a fraction of the theoretical maximum
+    max_possible = 3 * max(len(name_clean.split()), 1) + 8 + 5 + 12 + 8 + 14
+    confidence = min(score / max_possible, 1.0)
+
+    return score, confidence
 
 
 def search_cpe_candidates(
@@ -243,46 +354,51 @@ def search_cpe_candidates(
     version: str,
     max_candidates: int = 5,
     cpe_mappings: Optional[Dict[str, str]] = None,
+    publisher: str = "",
+    min_confidence: float = 0.05,
 ) -> List[Dict[str, str]]:
     """
-    Return the top‑scoring CPE entries for *name*/*version*.
+    Return the top-scoring CPE entries for name/version.
 
-    If *cpe_mappings* contains an override for *name*, use it directly
-    instead of querying the NVD CPE dictionary — this is far more precise.
+    If cpe_mappings contains an override for name, use it directly.
+    Publisher is used to improve vendor matching accuracy.
+    min_confidence filters out low-quality matches (0.0–1.0).
+    Each returned entry includes a 'confidence' key (0.0–1.0).
     """
+    # Architecture-stripped name for CPE matching
+    name_clean = _strip_arch(name)
+
     # --- Check local override first ---
     if cpe_mappings:
-        key = normalize_text(name)
-        vp = cpe_mappings.get(key)
+        key = normalize_text(name_clean)
+        vp  = cpe_mappings.get(key) or cpe_mappings.get(normalize_text(name))
         if vp:
-            # Build a wildcard CPE (version = *) so the CVE search returns
-            # all CVEs for that product; version filtering happens later.
             cpe = cpe_name_from_mapping(vp)
-            return [{"cpeName": cpe, "title": f"{name} (local mapping)"}]
+            return [{"cpeName": cpe, "title": f"{name} (local mapping)", "confidence": 1.0}]
 
-    # --- Online NVD CPE search (heuristic) ---
-    params = {"keywordSearch": name, "resultsPerPage": 100}
-    data = nvd_get_json(NVD_CPE_URL, params)
+    # --- Online NVD CPE search ---
+    params = {"keywordSearch": name_clean, "resultsPerPage": 100}
+    data   = nvd_get_json(NVD_CPE_URL, params)
     products = data.get("products", []) or []
 
-    candidates: List[Tuple[int, Dict[str, str]]] = []
+    candidates: List[Tuple[int, float, Dict[str, str]]] = []
     for item in products:
-        cpe = item.get("cpe", {}) if isinstance(item, dict) else {}
+        cpe      = item.get("cpe", {}) if isinstance(item, dict) else {}
         cpe_name = cpe.get("cpeName", "")
-        title = cpe.get("title", "")
+        title    = cpe.get("title", "")
         if not cpe_name:
             continue
 
-        sc = score_cpe_candidate(name, version, title, cpe_name)
-        if sc <= 0:
+        sc, conf = score_cpe_candidate(name_clean, version, title, cpe_name, publisher)
+        if sc <= 0 or conf < min_confidence:
             continue
-        candidates.append((sc, {"cpeName": cpe_name, "title": title}))
+        candidates.append((sc, conf, {"cpeName": cpe_name, "title": title, "confidence": round(conf, 3)}))
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    seen = set()
+    seen: set = set()
     best: List[Dict[str, str]] = []
-    for _, entry in candidates:
+    for _, _, entry in candidates:
         cpe_name = entry["cpeName"]
         if cpe_name in seen:
             continue
@@ -554,35 +670,65 @@ def find_cves_for_software(
     max_per: int = 0,
     kev_index: Optional[Dict[str, Dict[str, Any]]] = None,
     cpe_mappings: Optional[Dict[str, str]] = None,
+    publisher: str = "",
 ) -> List[Dict[str, Any]]:
     """
-    High‑level helper used by the UI.
-    Returns a de‑duplicated list of CVE dicts for *name*/*version*.
-    1) CPE‑based lookup (most precise — uses local mapping if available).
+    High-level helper used by the UI and CLI.
+    Returns a de-duplicated list of CVE dicts for name/version.
+    1) CPE-based lookup (most precise — uses local mapping if available).
     2) Keyword fallback (covers imperfect CPE mappings).
-    ``max_per`` limits total results (0 = no limit).
+    Publisher is passed to CPE scoring for vendor-aware matching.
+    max_per limits total results (0 = no limit).
     """
-    seen: set[str] = set()
+    seen: set = set()
     results: List[Dict[str, Any]] = []
 
-    for candidate in search_cpe_candidates(name, version, cpe_mappings=cpe_mappings):
+    for candidate in search_cpe_candidates(
+        name, version,
+        cpe_mappings=cpe_mappings,
+        publisher=publisher,
+    ):
+        # Skip very low-confidence matches (below 3%) unless it's a local mapping
+        conf = float(candidate.get("confidence", 1.0))
+        if conf < 0.03 and "(local mapping)" not in candidate.get("title", ""):
+            continue
+
+        # ── Auto-learn high-confidence CPE matches ─────────────────────
+        if HAS_CACHE and conf >= 0.35:
+            try:
+                cpe_str = candidate["cpeName"]
+                parts   = cpe_str.split(":")
+                if len(parts) >= 5:
+                    vp = f"{parts[3]}:{parts[4]}"
+                    _get_db().learn_cpe(name, vp, conf)
+            except Exception:
+                pass
+
         for cve in iter_cves_by_cpe(candidate["cpeName"], kev_index=kev_index):
             cve_id = cve["cve_id"]
             if cve_id in seen:
                 continue
             seen.add(cve_id)
+            cve["cpe_confidence"] = conf
             results.append(cve)
             if 0 < max_per <= len(results):
                 return results
 
     # Skip keyword fallback if we had a precise local mapping
-    used_local = bool(cpe_mappings and normalize_text(name) in cpe_mappings)
+    name_clean = _strip_arch(name)
+    used_local = bool(
+        cpe_mappings and (
+            normalize_text(name_clean) in cpe_mappings or
+            normalize_text(name) in cpe_mappings
+        )
+    )
     if not used_local:
         for cve in iter_cves_by_keyword(name, version, kev_index=kev_index):
             cve_id = cve["cve_id"]
             if cve_id in seen:
                 continue
             seen.add(cve_id)
+            cve["cpe_confidence"] = 0.0   # keyword match — unscored
             results.append(cve)
             if 0 < max_per <= len(results):
                 return results
@@ -1463,6 +1609,7 @@ def compute_risk_score(
     epss: Dict[str, str],
     version_confirmed: Optional[bool],
     has_public_exploit: bool,
+    patch_age_days: Optional[int] = None,
 ) -> Tuple[float, str]:
     """
     Compute a weighted risk score (0–100) for a single CVE.
@@ -1474,16 +1621,22 @@ def compute_risk_score(
         Public exploit available    → 10%  (binary: 0 or 100)
         Version confirmed           → 10%  (confirmed=100, unverified=50, N/A=0)
 
+    Patch age multiplier (applied after base score):
+        ≥180 days unpatched         → ×1.15 (capped at 100)
+        ≥90 days unpatched          → ×1.08
+        ≥30 days unpatched          → ×1.03
+        <30 days or unknown         → ×1.00 (no change)
+
     Returns (score_float, severity_label).
     """
     # --- CVSS component (35%) ---
-    cvss_raw = _coerce_float(cve.get("cvss_base_score")) or 0.0
+    cvss_raw  = _coerce_float(cve.get("cvss_base_score")) or 0.0
     cvss_norm = (cvss_raw / 10.0) * 100.0
 
     # --- EPSS component (25%) ---
     epss_raw_str = epss.get("epss_score", "").replace("%", "")
     try:
-        epss_pct = float(epss_raw_str)  # already 0–100 from fmt_pct
+        epss_pct = float(epss_raw_str)
     except (ValueError, TypeError):
         epss_pct = 0.0
 
@@ -1497,9 +1650,9 @@ def compute_risk_score(
     if version_confirmed is True:
         ver_val = 100.0
     elif version_confirmed is None:
-        ver_val = 50.0    # unverified – can't rule out
+        ver_val = 50.0
     else:
-        ver_val = 0.0     # confirmed NOT affected
+        ver_val = 0.0
 
     score = (
         cvss_norm     * 0.35
@@ -1508,6 +1661,16 @@ def compute_risk_score(
         + exploit_val * 0.10
         + ver_val     * 0.10
     )
+
+    # --- Patch age multiplier ---
+    if patch_age_days is not None and patch_age_days > 0:
+        if patch_age_days >= 180:
+            score *= 1.15
+        elif patch_age_days >= 90:
+            score *= 1.08
+        elif patch_age_days >= 30:
+            score *= 1.03
+
     score = min(max(score, 0.0), 100.0)
 
     if score >= 80:
@@ -5778,7 +5941,8 @@ class ScanWorker(QThread):
     def __init__(self, software, kev_path, api_key, output_path, cpe_mapping_path="",
                  show_medium=True, show_low=True, resources_dir="", executive_report_path="", comp_report_path="",
                  error_log_path="", scan_log_path="", write_logs=True,
-                 defensive_report_path="", redteam_report_path="", otx_api_key=""):
+                 defensive_report_path="", redteam_report_path="", otx_api_key="",
+                 input_file="", system_id=""):
         super().__init__()
         self.software = software
         self.kev_path = kev_path
@@ -5796,6 +5960,8 @@ class ScanWorker(QThread):
         self.defensive_report_path = defensive_report_path
         self.redteam_report_path = redteam_report_path
         self.otx_api_key = otx_api_key
+        self.input_file  = input_file
+        self.system_id   = system_id or (extract_system_id(input_file) if input_file else "unknown")
         self._scan_log_lines:  List[str] = []
         self._error_log_lines: List[str] = []
 
@@ -5880,12 +6046,43 @@ class ScanWorker(QThread):
         otx_intel_results: Dict[str, Any] = {}
         total = len(self.software)
 
+        # ── Scan resume / cache setup ──────────────────────────────────
+        db = None
+        session_id = None
+        if HAS_CACHE:
+            try:
+                db = _get_db()
+                session_id = db.session_id_for(self.software)
+                completed = db.completed_keys(session_id)
+                resume_count = len(completed)
+                if resume_count:
+                    self._emit_log(
+                        f"♻ Resume: {resume_count} software item(s) already cached "
+                        f"from a previous session — skipping re-scan.", "ok"
+                    )
+                    # Pre-load cached rows
+                    for (name, version, publisher, install_date) in self.software:
+                        cached = db.get_cached_rows(session_id, name, version, publisher)
+                        if cached:
+                            all_rows.extend(cached)
+            except Exception as e:
+                self._emit_log(f"Cache unavailable: {e} — running without cache.", "warn")
+                db = None
+
         for idx, (name, version, publisher, install_date) in enumerate(self.software, 1):
 
             if self.isInterruptionRequested():
                 self._emit_log("Scan cancelled by user", "warning")
                 self.status_signal.emit("Cancelled by user")
                 break
+
+            # ── Check resume cache ─────────────────────────────────────
+            if db and session_id:
+                cached = db.get_cached_rows(session_id, name, version, publisher)
+                if cached is not None:
+                    self._emit_log(f"[{idx}/{total}] ♻ {name} {version} — loaded from cache", "dim")
+                    self.progress_signal.emit(idx, total)
+                    continue   # rows already loaded above
 
             label = f"{name} {version}".strip()
             self._emit_log(f"[{idx}/{total}] Querying NVD for: {label}", "info")
@@ -5896,7 +6093,10 @@ class ScanWorker(QThread):
             # Retrieve CVEs
             # -----------------------------------------------------------------
             cves = find_cves_for_software(
-                name, version, kev_index=kev_index, cpe_mappings=cpe_mappings,
+                name, version,
+                kev_index=kev_index,
+                cpe_mappings=cpe_mappings,
+                publisher=publisher,
             )
             if not cves:
                 self._emit_log("✓ No CVEs found.", "ok")
@@ -5987,9 +6187,28 @@ class ScanWorker(QThread):
                     sources = set(e.get("source", "") for e in vulners_exploits)
                     exploit_sources.extend(s for s in sources if s)
 
+                # ---- false positive suppression ----
+                if db and db.is_false_positive(cid, name):
+                    self._emit_log(f"  ↷ {cid} suppressed (false positive list)", "dim")
+                    continue
+
+                # ---- patch age for risk multiplier ----
+                patch_age_int: Optional[int] = None
+                if install_date:
+                    try:
+                        idate_obj = datetime.datetime.strptime(install_date, "%Y-%m-%d").date()
+                        pub_raw   = str(cve.get("published", "") or "")[:10]
+                        if pub_raw:
+                            cve_date_obj = datetime.datetime.strptime(pub_raw, "%Y-%m-%d").date()
+                            if idate_obj > cve_date_obj:
+                                patch_age_int = (datetime.date.today() - idate_obj).days
+                    except (ValueError, TypeError):
+                        pass
+
                 # ---- risk score ----
                 risk_score, risk_label = compute_risk_score(
                     cve, epss, affected, has_exploit,
+                    patch_age_days=patch_age_int,
                 )
 
                 # Use CVSS severity when available; fall back to risk label for unscored CVEs
@@ -6024,26 +6243,46 @@ class ScanWorker(QThread):
                 patch_age_days = ""
                 if install_date:
                     try:
-                        import datetime as _dt
-                        idate_obj = _dt.datetime.strptime(install_date, "%Y-%m-%d").date()
-                        pub_raw   = str(cve.get("published", "") or "")[:10]
-                        if pub_raw:
-                            cve_date_obj = _dt.datetime.strptime(pub_raw, "%Y-%m-%d").date()
-                            if idate_obj >= cve_date_obj:
-                                # Installed after CVE published — not vulnerable at install time
+                        idate_obj2 = datetime.datetime.strptime(install_date, "%Y-%m-%d").date()
+                        pub_raw2   = str(cve.get("published", "") or "")[:10]
+                        if pub_raw2:
+                            cve_date_obj2 = datetime.datetime.strptime(pub_raw2, "%Y-%m-%d").date()
+                            if idate_obj2 >= cve_date_obj2:
                                 patch_age_days = "0 (installed after CVE published)"
                             else:
-                                delta = (_dt.date.today() - idate_obj).days
-                                patch_age_days = str(delta)
+                                delta2 = (datetime.date.today() - idate_obj2).days
+                                patch_age_days = str(delta2)
                     except (ValueError, TypeError):
                         patch_age_days = ""
 
-                all_rows.append({
+                # ---- vendor advisory ----
+                advisory_url  = ""
+                advisory_name = ""
+                if HAS_ADVISORIES:
+                    try:
+                        adv = resolve_advisory(publisher, name, cid)
+                        if adv:
+                            advisory_url  = adv.get("url", "")
+                            advisory_name = adv.get("name", "")
+                    except Exception:
+                        pass
+
+                # ---- CPE match confidence ----
+                cpe_conf = cve.get("cpe_confidence", "")
+                if isinstance(cpe_conf, float) and cpe_conf > 0:
+                    cpe_conf_str = f"{cpe_conf:.0%}"
+                else:
+                    cpe_conf_str = "keyword match"
+
+                row_dict = {
                     "Software Name": name,
                     "Software Version": version,
                     "Publisher": publisher,
                     "Install Date": install_date,
                     "Patch Age (Days)": patch_age_days,
+                    "CPE Match Confidence": cpe_conf_str,
+                    "Vendor Advisory URL": advisory_url,
+                    "Vendor Advisory Name": advisory_name,
                     "CVE ID": cid,
                     "Description": cve.get("description", ""),
                     "CVE Date": cve.get("published", ""),
@@ -6071,7 +6310,8 @@ class ScanWorker(QThread):
                     "D3FEND Countermeasures": d3fend_str,
                     "NIST 800-53 Controls": nist_str,
                     "NVD URL": nvd_url,
-                })
+                }
+                all_rows.append(row_dict)
 
                 risk_entries.append((risk_score, risk_label, cid))
 
@@ -6200,6 +6440,15 @@ class ScanWorker(QThread):
             delay = 0.6 if self.api_key else RATE_LIMIT_DELAY
             self._emit_log(f"Rate‑limit pause ({delay}s) …", "dim")
             time.sleep(delay)
+
+            # ── Save this item's rows to the scan cache ────────────────
+            if db and session_id:
+                try:
+                    sw_rows_for_cache = [r for r in all_rows if r.get("Software Name") == name and r.get("Software Version") == version]
+                    db.put_cached_rows(session_id, name, version, publisher, sw_rows_for_cache)
+                except Exception:
+                    pass
+
             self.progress_signal.emit(idx, total)  # mark this item complete
 
         # Final progress — ensure bar shows 100%
@@ -6216,6 +6465,9 @@ class ScanWorker(QThread):
             "Publisher",
             "Install Date",
             "Patch Age (Days)",
+            "CPE Match Confidence",
+            "Vendor Advisory URL",
+            "Vendor Advisory Name",
             "CVE ID",
             "Description",
             "Risk Score",
@@ -6283,6 +6535,78 @@ class ScanWorker(QThread):
                     )
                     with open(self.redteam_report_path, "w", encoding="utf-8") as f:
                         f.write(redteam_html)
+
+                # ── POA&M XLSX export ──────────────────────────────────
+                if HAS_POAM and self.defensive_report_path:
+                    try:
+                        poam_path = str(self.defensive_report_path).replace(
+                            "_defensive_report.html", "_poam.xlsx"
+                        )
+                        n_poam = export_poam(
+                            all_rows,
+                            poam_path,
+                            system_name=str(Path(self.output_path).stem),
+                        )
+                        self._emit_log(
+                            f"✅ POA&M Export   → {poam_path} ({n_poam} entries)", "ok"
+                        )
+                    except Exception as e:
+                        self._emit_log(f"⚠ POA&M export failed: {e}", "warn")
+
+                # ── Clear resume cache on successful completion ────────
+                if db and session_id:
+                    try:
+                        db.clear_session(session_id)
+                    except Exception:
+                        pass
+
+                # ── Save to scan history (trend tracking) ─────────────
+                if db and all_rows:
+                    try:
+                        is_new_system = len(db.get_scan_history(self.system_id, limit=1)) == 0
+                        db.save_scan(
+                            system_id=self.system_id,
+                            input_file=self.input_file or self.output_path,
+                            rows=all_rows,
+                            system_label=self.system_id,
+                        )
+                        self._emit_log(
+                            f"📈 Scan history saved for system: {self.system_id}", "ok"
+                        )
+                    except Exception as e:
+                        self._emit_log(f"⚠ Trend save failed: {e}", "warn")
+                        is_new_system = False
+
+                    # ── Check and dispatch alerts ──────────────────────
+                    if HAS_ALERTS:
+                        try:
+                            alert_cfg  = load_alert_config()
+                            alerts     = check_alerts(
+                                all_rows, self.system_id,
+                                is_new_system=is_new_system,
+                                cfg=alert_cfg,
+                            )
+                            if alerts:
+                                sent = dispatch_alerts(alerts, alert_cfg)
+                                self._emit_log(
+                                    f"🔔 {len(alerts)} alert(s) dispatched "
+                                    f"(email:{sent['email']}, webhook:{sent['webhook']})", "ok"
+                                )
+                        except Exception as e:
+                            self._emit_log(f"⚠ Alert dispatch failed: {e}", "warn")
+
+                    # ── Fleet report ───────────────────────────────────
+                    if HAS_FLEET and self.defensive_report_path:
+                        try:
+                            fleet_path = str(self.defensive_report_path).replace(
+                                "_defensive_report.html", "_fleet_report.html"
+                            )
+                            fleet_html = build_fleet_report_from_db(db)
+                            with open(fleet_path, "w", encoding="utf-8") as f:
+                                f.write(fleet_html)
+                            self._emit_log(f"🌐 Fleet Report    → {fleet_path}", "ok")
+                        except Exception as e:
+                            self._emit_log(f"⚠ Fleet report failed: {e}", "warn")
 
                 written = [
                     f"✅ Executive Report → {self.executive_report_path}",
@@ -6497,11 +6821,29 @@ class CVEScannerWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.setStyleSheet(ACTION_BTN_STYLE)
 
+        self.diff_btn = QPushButton("Δ   Compare Scans")
+        self.diff_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.diff_btn.setFixedSize(160, 44)
+        self.diff_btn.setToolTip("Compare two Draugr output CSVs and generate a delta report")
+        self.diff_btn.setStyleSheet(ACTION_BTN_STYLE.replace(C.RED, C.BLUE))
+
+        self.trend_btn = QPushButton("📈  Scan History")
+        self.trend_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.trend_btn.setFixedSize(150, 44)
+        self.trend_btn.setToolTip("View scan history and trends across all systems")
+        self.trend_btn.setStyleSheet(ACTION_BTN_STYLE.replace(C.RED, "#2a7a2a"))
+
         btn_row.addWidget(self.scan_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.stop_btn)
+        btn_row.addSpacing(14)
+        btn_row.addWidget(self.diff_btn)
+        btn_row.addSpacing(5)
+        btn_row.addWidget(self.trend_btn)
         self.scan_btn.clicked.connect(lambda: self._start_scan(generate_executive_report=True))
         self.stop_btn.clicked.connect(self._stop_scan)
+        self.diff_btn.clicked.connect(self._run_diff)
+        self.trend_btn.clicked.connect(self._view_scan_history)
         btn_row.addStretch()
         root.addLayout(btn_row)
 
@@ -6731,6 +7073,18 @@ class CVEScannerWindow(QMainWindow):
         self._act_write_logs.setChecked(True)
         settings_menu.addAction(self._act_write_logs)
 
+        settings_menu.addSeparator()
+
+        act_fp = QAction("False Positive Suppression…", self)
+        act_fp.setToolTip("Manage CVE false positive suppression list")
+        act_fp.triggered.connect(self._manage_false_positives)
+        settings_menu.addAction(act_fp)
+
+        act_alerts = QAction("Alert Configuration…", self)
+        act_alerts.setToolTip("Configure email and webhook alerting")
+        act_alerts.triggered.connect(self._configure_alerts)
+        settings_menu.addAction(act_alerts)
+
     # --------------------------------------------------------------
     # Helper slots
     # --------------------------------------------------------------
@@ -6807,7 +7161,7 @@ class CVEScannerWindow(QMainWindow):
                 error_log_path = log_dir /str(out_base.with_name(f"{out_base.stem}_error.log"))
                 scan_log_path = log_dir /str(out_base.with_name(f"{out_base.stem}_scan.log"))
         try:
-            software = parse_software_list(sw_path)
+            software = parse_software_input(sw_path)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to parse software list:\n{exc}")
             return
@@ -6843,6 +7197,8 @@ class CVEScannerWindow(QMainWindow):
             defensive_report_path=defensive_report_path,
             redteam_report_path=redteam_report_path,
             otx_api_key=otx_api_key,
+            input_file=sw_path,
+            system_id=extract_system_id(sw_path) if HAS_CACHE else "",
         )
         self.worker.log_signal.connect(self._append_log) 
         self.worker.progress_signal.connect(self._update_progress)
@@ -6856,6 +7212,408 @@ class CVEScannerWindow(QMainWindow):
             self.worker.requestInterruption()
             self.stop_btn.setEnabled(False)
 
+    # ------------------------------------------------------------------
+    # Diff / Compare Scans
+    # ------------------------------------------------------------------
+    def _run_diff(self):
+        if not HAS_DIFF:
+            QMessageBox.warning(self, "Unavailable",
+                "draugr_diff.py not found. Place it in the same directory as draugr.py.")
+            return
+
+        old_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Previous Scan CSV", "", "CSV files (*.csv);;All files (*)"
+        )
+        if not old_path:
+            return
+        new_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Current Scan CSV", "", "CSV files (*.csv);;All files (*)"
+        )
+        if not new_path:
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if not out_dir:
+            return
+
+        try:
+            old_rows = load_scan_csv(old_path)
+            new_rows = load_scan_csv(new_path)
+            diff     = compute_diff(old_rows, new_rows)
+            stats    = diff["stats"]
+
+            stem          = Path(new_path).stem
+            diff_html     = Path(out_dir) / f"{stem}_diff.html"
+            diff_csv_out  = Path(out_dir) / f"{stem}_diff.csv"
+
+            with open(diff_html, "w", encoding="utf-8") as f:
+                f.write(build_diff_report(
+                    diff,
+                    old_label=Path(old_path).name,
+                    new_label=Path(new_path).name,
+                ))
+            n_csv = export_diff_csv(diff, str(diff_csv_out))
+
+            QMessageBox.information(self, "Diff Complete",
+                f"Delta report generated:\n\n"
+                f"  New findings:  {stats['new_findings']}\n"
+                f"  Resolved:      {stats['resolved']}\n"
+                f"  Worsened:      {stats['worsened']}\n"
+                f"  Improved:      {stats['improved']}\n"
+                f"  Newly KEV:     {stats['newly_kev']}\n\n"
+                f"HTML: {diff_html}\n"
+                f"CSV:  {diff_csv_out}"
+            )
+            self._append_log(
+                f"Δ Diff complete: {stats['new_findings']} new, {stats['resolved']} resolved → {diff_html}",
+                "ok"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Diff Error", str(e))
+
+    # ------------------------------------------------------------------
+    # False Positive Manager
+    # ------------------------------------------------------------------
+    def _manage_false_positives(self):
+        if not HAS_CACHE:
+            QMessageBox.warning(self, "Unavailable",
+                "draugr_cache.py not found. Place it in the same directory as draugr.py.")
+            return
+
+        try:
+            db  = _get_db()
+            fps = db.all_false_positives()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not load false positives:\n{e}")
+            return
+
+        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QDialogButtonBox
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("False Positive Suppression List")
+        dlg.setMinimumSize(720, 400)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "CVEs in this list are suppressed and will not appear in scan results.\n"
+            "Add entries manually or import from a JSON file."
+        )
+        info.setStyleSheet(f"color:{C.FG_DIM}; font-size:11px;")
+        layout.addWidget(info)
+
+        table = QTableWidget(len(fps), 3)
+        table.setHorizontalHeaderLabels(["CVE ID", "Software Name", "Reason"])
+        table.setStyleSheet(
+            f"QTableWidget {{ background:{C.BG_CARD}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; gridline-color:{C.BORDER}; }}"
+            f"QHeaderView::section {{ background:{C.BG_INPUT}; color:{C.FG_DIM}; "
+            f"border:1px solid {C.BORDER}; padding:4px; }}"
+        )
+        table.horizontalHeader().setStretchLastSection(True)
+        for row_i, fp in enumerate(fps):
+            table.setItem(row_i, 0, QTableWidgetItem(fp["cve_id"]))
+            table.setItem(row_i, 1, QTableWidgetItem(fp["sw_name"]))
+            table.setItem(row_i, 2, QTableWidgetItem(fp.get("reason", "")))
+        layout.addWidget(table)
+
+        btn_layout = QHBoxLayout()
+
+        def _add_fp():
+            cve_id, ok1 = __import__("PyQt6.QtWidgets", fromlist=["QInputDialog"]).QInputDialog.getText(
+                dlg, "Add False Positive", "CVE ID (e.g. CVE-2024-12345):"
+            )
+            if not ok1 or not cve_id.strip():
+                return
+            sw_name, ok2 = __import__("PyQt6.QtWidgets", fromlist=["QInputDialog"]).QInputDialog.getText(
+                dlg, "Add False Positive", "Software name:"
+            )
+            if not ok2:
+                return
+            reason, _ = __import__("PyQt6.QtWidgets", fromlist=["QInputDialog"]).QInputDialog.getText(
+                dlg, "Add False Positive", "Reason (optional):"
+            )
+            try:
+                db.add_false_positive(cve_id.strip(), sw_name.strip(), reason.strip())
+                self._append_log(f"False positive added: {cve_id.strip()} / {sw_name.strip()}", "ok")
+                dlg.accept()
+                self._manage_false_positives()
+            except Exception as e:
+                QMessageBox.critical(dlg, "Error", str(e))
+
+        def _import_fp():
+            path, _ = QFileDialog.getOpenFileName(
+                dlg, "Import False Positives JSON", "", "JSON files (*.json)"
+            )
+            if not path:
+                return
+            try:
+                n = db.import_false_positives(path)
+                QMessageBox.information(dlg, "Import Complete", f"Imported {n} entries.")
+                dlg.accept()
+                self._manage_false_positives()
+            except Exception as e:
+                QMessageBox.critical(dlg, "Import Error", str(e))
+
+        def _export_fp():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, "Export False Positives JSON", "false_positives.json", "JSON files (*.json)"
+            )
+            if not path:
+                return
+            try:
+                n = db.export_false_positives(path)
+                QMessageBox.information(dlg, "Export Complete", f"Exported {n} entries to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(dlg, "Export Error", str(e))
+
+        btn_style = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                     f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 12px; }}"
+                     f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+
+        for label, slot in [("Add Entry", _add_fp), ("Import JSON", _import_fp), ("Export JSON", _export_fp)]:
+            btn = QPushButton(label)
+            btn.setStyleSheet(btn_style)
+            btn.clicked.connect(slot)
+            btn_layout.addWidget(btn)
+
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(btn_style)
+        close_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        dlg.exec()
+
+    # ------------------------------------------------------------------
+    # Scan History / Trend viewer
+    # ------------------------------------------------------------------
+    def _view_scan_history(self):
+        if not HAS_CACHE:
+            QMessageBox.warning(self, "Unavailable",
+                "draugr_cache.py not found. Place it in the same directory as draugr.py.")
+            return
+        try:
+            db      = _get_db()
+            systems = db.get_all_systems()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not load scan history:\n{e}")
+            return
+
+        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QComboBox
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Scan History & Trend Tracking")
+        dlg.setMinimumSize(860, 500)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(f"{len(systems)} system(s) tracked in scan history database.")
+        info.setStyleSheet(f"color:{C.FG_DIM}; font-size:11px;")
+        layout.addWidget(info)
+
+        sel_row = QHBoxLayout()
+        sel_lbl = QLabel("System:")
+        sel_lbl.setStyleSheet(f"color:{C.FG_DIM}; font-size:12px;")
+        combo   = QComboBox()
+        combo.setStyleSheet(
+            f"QComboBox {{ background:{C.BG_INPUT}; color:{C.FG}; border:1px solid {C.BORDER}; "
+            f"border-radius:4px; padding:4px 8px; }}"
+        )
+        for s in systems:
+            combo.addItem(f"{s['system_label']} ({s['scan_count']} scans)", s["system_id"])
+        sel_row.addWidget(sel_lbl)
+        sel_row.addWidget(combo, 1)
+        layout.addLayout(sel_row)
+
+        table = QTableWidget(0, 7)
+        table.setHorizontalHeaderLabels([
+            "Scan Date", "Total CVEs", "Critical", "High", "KEV", "Max Risk", "Input File"
+        ])
+        table.setStyleSheet(
+            f"QTableWidget {{ background:{C.BG_CARD}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; gridline-color:{C.BORDER}; }}"
+            f"QHeaderView::section {{ background:{C.BG_INPUT}; color:{C.FG_DIM}; "
+            f"border:1px solid {C.BORDER}; padding:4px; }}"
+        )
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+
+        def _load_history(idx: int):
+            sid  = combo.itemData(idx)
+            hist = db.get_scan_history(sid, limit=30)
+            table.setRowCount(len(hist))
+            for row_i, h in enumerate(hist):
+                table.setItem(row_i, 0, QTableWidgetItem(h.get("scan_date","")))
+                table.setItem(row_i, 1, QTableWidgetItem(str(h.get("total_cves",0))))
+                table.setItem(row_i, 2, QTableWidgetItem(str(h.get("critical",0))))
+                table.setItem(row_i, 3, QTableWidgetItem(str(h.get("high",0))))
+                table.setItem(row_i, 4, QTableWidgetItem(str(h.get("kev_count",0))))
+                table.setItem(row_i, 5, QTableWidgetItem(f"{h.get('max_risk',0.0):.1f}"))
+                table.setItem(row_i, 6, QTableWidgetItem(
+                    str(Path(h.get("input_file","")).name)
+                ))
+
+        combo.currentIndexChanged.connect(_load_history)
+        if systems:
+            _load_history(0)
+
+        btn_layout = QHBoxLayout()
+        btn_style  = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                      f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 12px; }}"
+                      f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+
+        def _export_fleet():
+            if not HAS_FLEET:
+                QMessageBox.warning(dlg, "Unavailable", "draugr_fleet.py not found.")
+                return
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, "Save Fleet Report", "draugr_fleet_report.html", "HTML files (*.html)"
+            )
+            if not path:
+                return
+            try:
+                fleet_html = build_fleet_report_from_db(db)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(fleet_html)
+                QMessageBox.information(dlg, "Export Complete", f"Fleet report saved:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(dlg, "Export Error", str(e))
+
+        fleet_btn = QPushButton("Export Fleet Report")
+        fleet_btn.setStyleSheet(btn_style)
+        fleet_btn.clicked.connect(_export_fleet)
+        btn_layout.addWidget(fleet_btn)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(btn_style)
+        close_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
+    # Alert configuration
+    # ------------------------------------------------------------------
+    def _configure_alerts(self):
+        if not HAS_ALERTS:
+            QMessageBox.warning(self, "Unavailable",
+                "draugr_alerts.py not found. Place it in the same directory as draugr.py.")
+            return
+
+        from PyQt6.QtWidgets import QDialog
+
+        cfg = load_alert_config()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Alert Configuration")
+        dlg.setMinimumSize(540, 580)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+        layout = QVBoxLayout(dlg)
+
+        lbl_style  = f"color:{C.FG_DIM}; font-size:11px;"
+        field_style = (f"QLineEdit {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                       f"border:1px solid {C.BORDER}; border-radius:4px; padding:4px 8px; }}"
+                       f"QCheckBox {{ color:{C.FG_DIM}; font-size:12px; }}")
+
+        def _section(title: str):
+            lbl = QLabel(title)
+            lbl.setStyleSheet(f"color:{C.ACCENT}; font-size:11px; font-weight:600; "
+                              f"letter-spacing:1px; padding-top:10px;")
+            layout.addWidget(lbl)
+
+        def _field(label: str, value: str, placeholder: str = "", password: bool = False) -> QLineEdit:
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setFixedWidth(160)
+            lbl.setStyleSheet(lbl_style)
+            inp = QLineEdit(value)
+            inp.setPlaceholderText(placeholder)
+            inp.setStyleSheet(field_style)
+            if password:
+                inp.setEchoMode(QLineEdit.EchoMode.Password)
+            row.addWidget(lbl)
+            row.addWidget(inp, 1)
+            layout.addLayout(row)
+            return inp
+
+        def _check(label: str, checked: bool) -> QCheckBox:
+            cb = QCheckBox(label)
+            cb.setChecked(checked)
+            cb.setStyleSheet(field_style)
+            layout.addWidget(cb)
+            return cb
+
+        _section("GENERAL")
+        chk_enabled    = _check("Enable alerting", cfg.get("enabled", False))
+        chk_kev        = _check("Alert on KEV findings", cfg.get("alert_on_kev", True))
+        chk_new_system = _check("Alert on new system (first scan)", cfg.get("alert_on_new_system", True))
+
+        _section("SMTP EMAIL")
+        chk_smtp = _check("Enable email alerts", cfg.get("smtp",{}).get("enabled", False))
+        f_host   = _field("SMTP Host",      cfg.get("smtp",{}).get("host",""),     "smtp.gmail.com")
+        f_port   = _field("SMTP Port",      str(cfg.get("smtp",{}).get("port",587)), "587")
+        f_user   = _field("Username",       cfg.get("smtp",{}).get("username",""), "you@example.com")
+        f_pass   = _field("Password",       cfg.get("smtp",{}).get("password",""), "", password=True)
+        f_from   = _field("From",           cfg.get("smtp",{}).get("from_addr",""), "draugr@example.com")
+        f_to     = _field("To (comma-sep)", ", ".join(cfg.get("smtp",{}).get("to_addrs",[])), "a@b.com, c@d.com")
+
+        _section("WEBHOOK")
+        chk_wh    = _check("Enable webhook alerts", cfg.get("webhook",{}).get("enabled", False))
+        f_url     = _field("Webhook URL",   cfg.get("webhook",{}).get("url",""),   "https://hooks.slack.com/...")
+        f_wh_type = _field("Type",          cfg.get("webhook",{}).get("type","slack"), "slack / teams / generic")
+        f_mention = _field("Mention",       cfg.get("webhook",{}).get("mention",""), "@channel")
+
+        btn_layout = QHBoxLayout()
+        btn_style  = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                      f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 14px; }}"
+                      f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+
+        def _save():
+            to_list = [a.strip() for a in f_to.text().split(",") if a.strip()]
+            new_cfg = {
+                "enabled":             chk_enabled.isChecked(),
+                "alert_on_kev":        chk_kev.isChecked(),
+                "alert_on_new_system": chk_new_system.isChecked(),
+                "risk_threshold":      cfg.get("risk_threshold", 80.0),
+                "kev_threshold":       cfg.get("kev_threshold", 1),
+                "smtp": {
+                    "enabled":   chk_smtp.isChecked(),
+                    "host":      f_host.text().strip(),
+                    "port":      int(f_port.text().strip() or 587),
+                    "use_tls":   True,
+                    "username":  f_user.text().strip(),
+                    "password":  f_pass.text(),
+                    "from_addr": f_from.text().strip(),
+                    "to_addrs":  to_list,
+                },
+                "webhook": {
+                    "enabled": chk_wh.isChecked(),
+                    "url":     f_url.text().strip(),
+                    "type":    f_wh_type.text().strip() or "generic",
+                    "headers": {},
+                    "mention": f_mention.text().strip(),
+                },
+            }
+            try:
+                from draugr_alerts import save_alert_config
+                save_alert_config(new_cfg)
+                QMessageBox.information(dlg, "Saved", "Alert configuration saved.")
+                dlg.accept()
+            except Exception as e:
+                QMessageBox.critical(dlg, "Save Error", str(e))
+
+        save_btn  = QPushButton("Save")
+        save_btn.setStyleSheet(btn_style)
+        save_btn.clicked.connect(_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(btn_style)
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        dlg.exec()
 
 
 # ----------------------------------------------------------------------
@@ -7023,7 +7781,254 @@ class DraugrSplash(QSplashScreen):
 # ----------------------------------------------------------------------
 # Application entry point
 # ----------------------------------------------------------------------
+# ======================================================================
+#  SBOM / multi-host import helpers
+# ======================================================================
+
+def parse_sbom_cyclonedx(path: str) -> List[Tuple[str, str, str, str]]:
+    """
+    Parse a CycloneDX SBOM (JSON format) into (name, version, publisher, "") tuples.
+    Supports CycloneDX 1.4 and 1.5 component arrays.
+    """
+    with open(path, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+
+    entries: List[Tuple[str, str, str, str]] = []
+    components = data.get("components", [])
+    if not components and "metadata" in data:
+        # Some CycloneDX docs nest components under metadata.component
+        meta_comp = data.get("metadata", {}).get("component", {})
+        if meta_comp:
+            components = [meta_comp]
+
+    for comp in components:
+        if not isinstance(comp, dict):
+            continue
+        name      = str(comp.get("name", "") or "").strip()
+        version   = str(comp.get("version", "") or "").strip()
+        publisher = str(comp.get("publisher", "") or comp.get("group", "") or "").strip()
+        if name:
+            entries.append((name, version, publisher, ""))
+        # Recurse into sub-components
+        for sub in comp.get("components", []):
+            sub_name    = str(sub.get("name", "") or "").strip()
+            sub_version = str(sub.get("version", "") or "").strip()
+            sub_pub     = str(sub.get("publisher", "") or "").strip()
+            if sub_name:
+                entries.append((sub_name, sub_version, sub_pub, ""))
+
+    return entries
+
+
+def parse_sbom_spdx(path: str) -> List[Tuple[str, str, str, str]]:
+    """
+    Parse an SPDX SBOM (JSON format, SPDX 2.3) into (name, version, publisher, "") tuples.
+    """
+    with open(path, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+
+    entries: List[Tuple[str, str, str, str]] = []
+    packages = data.get("packages", [])
+    for pkg in packages:
+        if not isinstance(pkg, dict):
+            continue
+        name      = str(pkg.get("name", "") or "").strip()
+        version   = str(pkg.get("versionInfo", "") or "").strip()
+        # SPDX originator field: "Organization: Acme Corp" or "Tool: draugr"
+        originator = str(pkg.get("originator", "") or "").strip()
+        publisher  = originator.split(":", 1)[1].strip() if ":" in originator else originator
+        if name and name != "NOASSERTION":
+            entries.append((name, version, publisher, ""))
+
+    return entries
+
+
+def parse_software_input(path: str) -> List[Tuple[str, str, str, str]]:
+    """
+    Auto-detect input format and dispatch to the correct parser.
+    Supports: CSV/TXT (inventory lists), CycloneDX JSON, SPDX JSON.
+    """
+    path_lower = path.lower()
+
+    # Try SBOM formats based on extension or content sniff
+    if path_lower.endswith(".json"):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                peek = json.load(f)
+            # CycloneDX detection
+            if peek.get("bomFormat", "").lower() == "cyclonedx" or "components" in peek:
+                return parse_sbom_cyclonedx(path)
+            # SPDX detection
+            if "SPDX" in str(peek.get("spdxVersion", "")) or "packages" in peek:
+                return parse_sbom_spdx(path)
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Default: CSV / plain-text inventory
+    return parse_software_list(path)
+
+
+def aggregate_multi_host(
+    host_files: List[str],
+) -> Dict[str, List[Tuple[str, str, str, str]]]:
+    """
+    Parse multiple inventory files and return a dict mapping
+    hostname → list of (name, version, publisher, install_date) tuples.
+    Hostname is inferred from the filename stem.
+    """
+    hosts: Dict[str, List[Tuple[str, str, str, str]]] = {}
+    for path in host_files:
+        stem     = Path(path).stem
+        hostname = re.sub(r"_(software|agent|inventory|scan).*", "", stem, flags=re.IGNORECASE)
+        entries  = parse_software_input(path)
+        hosts[hostname] = entries
+    return hosts
+
+
+# ======================================================================
+#  Headless CLI mode
+# ======================================================================
+
+def _run_headless_scan(args: argparse.Namespace) -> int:
+    """
+    Run a full Draugr scan from the command line without the GUI.
+    Returns 0 on success, 1 on failure.
+    """
+    import traceback
+
+    print(f"[Draugr CLI] Software input: {args.input}")
+    print(f"[Draugr CLI] Output dir:     {args.output}")
+
+    # Parse software list
+    try:
+        if args.multi_host:
+            host_map  = aggregate_multi_host(args.input)
+            # Flatten with host tag embedded in publisher field for now
+            software: List[Tuple[str, str, str, str]] = []
+            for host, entries in host_map.items():
+                for name, version, publisher, idate in entries:
+                    pub = f"{publisher} [{host}]" if publisher else f"[{host}]"
+                    software.append((name, version, pub, idate))
+            print(f"[Draugr CLI] Multi-host mode: {len(host_map)} hosts, {len(software)} total entries")
+        else:
+            software = parse_software_input(args.input[0] if isinstance(args.input, list) else args.input)
+            print(f"[Draugr CLI] {len(software)} software entries loaded")
+    except Exception as e:
+        print(f"[Draugr CLI] ERROR parsing input: {e}")
+        return 1
+
+    if not software:
+        print("[Draugr CLI] No software entries found — check your input file.")
+        return 1
+
+    # Setup output paths
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = out_dir / "reports"
+    report_dir.mkdir(exist_ok=True)
+    log_dir = out_dir / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    stem = Path(args.input[0] if isinstance(args.input, list) else args.input).stem
+    csv_path      = report_dir / f"{stem}.csv"
+    exec_path     = report_dir / f"{stem}_executive_report.html"
+    tech_path     = report_dir / f"{stem}_technical_report.html"
+    def_path      = report_dir / f"{stem}_defensive_report.html"
+    rt_path       = report_dir / f"{stem}_redteam_report.html"
+    scan_log_path = log_dir / f"{stem}_scan.log"
+    err_log_path  = log_dir / f"{stem}_error.log"
+
+    # Run scan in this thread (CLI mode — no Qt event loop)
+    worker = ScanWorker(
+        software=software,
+        kev_path=args.kev or "",
+        api_key=args.api_key or "",
+        output_path=str(csv_path),
+        cpe_mapping_path=args.cpe_map or "",
+        show_medium=True,
+        show_low=True,
+        resources_dir=args.resources or "",
+        executive_report_path=str(exec_path),
+        comp_report_path=str(tech_path),
+        defensive_report_path=str(def_path),
+        redteam_report_path=str(rt_path),
+        error_log_path=str(err_log_path),
+        scan_log_path=str(scan_log_path),
+        write_logs=True,
+        otx_api_key=args.otx_key or "",
+    )
+
+    # Connect signals to print output
+    worker.log_signal.connect(lambda msg, level: print(f"  [{level.upper():7}] {msg}"))
+    worker.status_signal.connect(lambda s: print(f"  [STATUS ] {s}"))
+    worker.progress_signal.connect(
+        lambda cur, tot: print(f"  [PROG   ] {cur}/{tot}", end="\r")
+    )
+
+    finished = [False]
+    def _done():
+        finished[0] = True
+    worker.finished_signal.connect(_done)
+
+    # Run in the current thread (QThread.run() directly)
+    try:
+        worker.run()
+    except Exception as e:
+        print(f"\n[Draugr CLI] SCAN ERROR: {e}")
+        traceback.print_exc()
+        return 1
+
+    # Diff mode
+    if args.diff and HAS_DIFF:
+        try:
+            print(f"\n[Draugr CLI] Computing diff: {args.diff} → {csv_path}")
+            old_rows = load_scan_csv(args.diff)
+            new_rows = load_scan_csv(str(csv_path))
+            diff     = compute_diff(old_rows, new_rows)
+            diff_html_path = report_dir / f"{stem}_diff.html"
+            diff_csv_path  = report_dir / f"{stem}_diff.csv"
+            with open(diff_html_path, "w", encoding="utf-8") as f:
+                f.write(build_diff_report(
+                    diff,
+                    old_label=Path(args.diff).name,
+                    new_label=csv_path.name,
+                ))
+            n_csv = export_diff_csv(diff, str(diff_csv_path))
+            stats = diff["stats"]
+            print(f"[Draugr CLI] Diff: {stats['new_findings']} new, "
+                  f"{stats['resolved']} resolved, {stats['worsened']} worsened, "
+                  f"{stats['improved']} improved")
+            print(f"[Draugr CLI] Diff report → {diff_html_path}")
+        except Exception as e:
+            print(f"[Draugr CLI] Diff failed: {e}")
+
+    print(f"\n[Draugr CLI] Scan complete. Outputs in: {out_dir}")
+    return 0
+
+
 def main():
+    # ── CLI argument check (headless mode) ────────────────────────────
+    # If --scan flag is present, run headless without starting Qt
+    if "--scan" in sys.argv or "--help" in sys.argv:
+        parser = argparse.ArgumentParser(
+            prog="draugr",
+            description="Draugr Threat Intelligence System — headless CLI mode",
+        )
+        parser.add_argument("--scan",      required=True, help="Path to software list / SBOM / CSV")
+        parser.add_argument("--output",    required=True, help="Output directory")
+        parser.add_argument("--kev",       default="",    help="Path to KEV JSON file (optional)")
+        parser.add_argument("--cpe-map",   default="",    dest="cpe_map", help="Path to CPE mappings JSON (optional)")
+        parser.add_argument("--api-key",   default="",    dest="api_key", help="NVD API key (optional)")
+        parser.add_argument("--otx-key",   default="",    dest="otx_key", help="OTX API key (optional)")
+        parser.add_argument("--resources", default="",    help="Path to enrichment DBs folder (optional)")
+        parser.add_argument("--diff",      default="",    help="Previous scan CSV to diff against (optional)")
+        parser.add_argument("--multi-host",action="store_true", dest="multi_host",
+                            help="Treat --scan as glob/list of per-host CSVs and aggregate")
+        args = parser.parse_args()
+        args.input = args.scan
+        sys.exit(_run_headless_scan(args))
+
+    # ── GUI mode ───────────────────────────────────────────────────────
     if requests is None:
         print("ERROR: 'requests' library is required.\n  pip install requests")
         sys.exit(1)
