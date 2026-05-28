@@ -65,6 +65,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "alert_on_new_system": True,
     "risk_threshold": 80.0,
     "kev_threshold": 1,
+    "suppression_hours": 24,      # re-alert suppression window per (alert_type, cve_id, system_id)
     "smtp": {
         "enabled": False,
         "host": "",
@@ -115,6 +116,84 @@ def create_default_config() -> Path:
     if not path.exists():
         save_alert_config(_DEFAULT_CONFIG)
     return path
+
+
+# ------------------------------------------------------------------
+# Alert suppression — prevents the same alert firing every scan cycle
+# until the finding is resolved.
+# Stored as a JSON dict: {suppression_key: last_alerted_timestamp}
+# ------------------------------------------------------------------
+def _suppression_path() -> Path:
+    return Path(os.path.dirname(os.path.abspath(__file__))) / "draugr_alert_suppression.json"
+
+
+def _load_suppression() -> Dict[str, float]:
+    path = _suppression_path()
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_suppression(store: Dict[str, float]) -> None:
+    try:
+        with open(_suppression_path(), "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2)
+    except OSError:
+        pass
+
+
+def _suppression_key(alert_type: str, system_id: str, cve_id: str = "") -> str:
+    """Stable key for one (alert_type, system, cve) combination."""
+    return f"{alert_type}|{system_id}|{cve_id}"
+
+
+def is_suppressed(alert_type: str, system_id: str, cve_id: str,
+                  suppression_hours: float, store: Dict[str, float]) -> bool:
+    """Return True if this alert fired within the suppression window."""
+    import time
+    key = _suppression_key(alert_type, system_id, cve_id)
+    last = store.get(key)
+    if last is None:
+        return False
+    return (time.time() - last) < suppression_hours * 3600
+
+
+def record_alerts_sent(alerts: List[Dict[str, Any]],
+                       store: Dict[str, float]) -> Dict[str, float]:
+    """
+    Stamp each CVE in each dispatched alert with the current timestamp.
+    Returns the updated store (caller should persist it).
+    """
+    import time
+    now = time.time()
+    for alert in alerts:
+        atype     = alert.get("type", "")
+        system_id = alert.get("system_id", "")
+        for row in alert.get("rows", []):
+            cid = str(row.get("CVE ID", "") or "")
+            key = _suppression_key(atype, system_id, cid)
+            store[key] = now
+        # Also stamp the alert-level key (covers new_system / newly_kev alerts)
+        store[_suppression_key(atype, system_id, "")] = now
+    return store
+
+
+def purge_suppression_store(suppression_hours: float) -> int:
+    """
+    Remove entries older than the suppression window.
+    Returns count of entries removed. Call periodically (e.g. at scan start).
+    """
+    import time
+    store    = _load_suppression()
+    cutoff   = time.time() - suppression_hours * 3600
+    original = len(store)
+    store    = {k: v for k, v in store.items() if v >= cutoff}
+    _save_suppression(store)
+    return original - len(store)
 
 
 # ------------------------------------------------------------------
@@ -619,7 +698,7 @@ def check_alerts(
 ) -> List[Dict[str, Any]]:
     """
     Evaluate alert conditions against scan results.
-    Returns a list of rich alert dicts.
+    Returns a list of rich alert dicts, with already-suppressed CVEs filtered out.
     """
     if cfg is None:
         cfg = load_alert_config()
@@ -627,104 +706,121 @@ def check_alerts(
         return []
 
     alerts: List[Dict[str, Any]] = []
-    threshold  = float(cfg.get("risk_threshold", 80.0))
-    kev_thresh = int(cfg.get("kev_threshold", 1))
+    threshold         = float(cfg.get("risk_threshold", 80.0))
+    kev_thresh        = int(cfg.get("kev_threshold", 1))
+    suppression_hours = float(cfg.get("suppression_hours", 24))
+    sup_store         = _load_suppression()
+
+    def _unsuppressed(atype: str, row_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return only rows not already suppressed for this alert type + system."""
+        return [
+            r for r in row_list
+            if not is_suppressed(
+                atype, system_id, str(r.get("CVE ID", "") or ""),
+                suppression_hours, sup_store
+            )
+        ]
 
     kev_rows  = sorted(
-        [r for r in rows if str(r.get("Known Exploited Vulnerability","")).upper() == "YES"],
-        key=lambda r: -float(str(r.get("Risk Score",0) or 0))
+        [r for r in rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES"],
+        key=lambda r: -float(str(r.get("Risk Score", 0) or 0))
     )
     high_risk = sorted(
-        [r for r in rows if float(str(r.get("Risk Score",0) or 0)) >= threshold],
-        key=lambda r: -float(str(r.get("Risk Score",0) or 0))
+        [r for r in rows if float(str(r.get("Risk Score", 0) or 0)) >= threshold],
+        key=lambda r: -float(str(r.get("Risk Score", 0) or 0))
     )
 
     # ── KEV alert ─────────────────────────────────────────────────────
-    if cfg.get("alert_on_kev", True) and len(kev_rows) >= kev_thresh:
-        top = kev_rows[:8]
-        body = _plain_body(
-            "KEV ALERT", system_id, top,
-            extra_lines=[
-                f"⚠ {len(kev_rows)} CVE(s) have confirmed active exploitation (CISA KEV).",
-                "REQUIRED: Patch all KEV-listed findings within 24–72 hours.",
-                "CISA BOD 22-01 mandates remediation for federal agencies.",
-            ]
-        )
-        alerts.append({
-            "type":      "kev",
-            "title":     f"[DRAUGR] {len(kev_rows)} KEV-listed CVE(s) on {system_id}",
-            "body":      body,
-            "severity":  "CRITICAL",
-            "system_id": system_id,
-            "count":     len(kev_rows),
-            "rows":      top,
-        })
+    if cfg.get("alert_on_kev", True):
+        unsup_kev = _unsuppressed("kev", kev_rows)
+        if len(unsup_kev) >= kev_thresh:
+            top = unsup_kev[:8]
+            body = _plain_body(
+                "KEV ALERT", system_id, top,
+                extra_lines=[
+                    f"⚠ {len(unsup_kev)} CVE(s) have confirmed active exploitation (CISA KEV).",
+                    "REQUIRED: Patch all KEV-listed findings within 24–72 hours.",
+                    "CISA BOD 22-01 mandates remediation for federal agencies.",
+                ]
+            )
+            alerts.append({
+                "type":      "kev",
+                "title":     f"[DRAUGR] {len(unsup_kev)} KEV-listed CVE(s) on {system_id}",
+                "body":      body,
+                "severity":  "CRITICAL",
+                "system_id": system_id,
+                "count":     len(unsup_kev),
+                "rows":      top,
+            })
 
     # ── High-risk alert ───────────────────────────────────────────────
-    # Exclude KEV rows already covered above
-    kev_ids   = {r.get("CVE ID","") for r in kev_rows}
-    high_only = [r for r in high_risk if r.get("CVE ID","") not in kev_ids]
-    if high_only:
-        top_hr = high_only[:8]
+    kev_ids   = {r.get("CVE ID", "") for r in kev_rows}
+    high_only = [r for r in high_risk if r.get("CVE ID", "") not in kev_ids]
+    unsup_hr  = _unsuppressed("high_risk", high_only)
+    if unsup_hr:
+        top_hr = unsup_hr[:8]
         body = _plain_body(
             "HIGH RISK ALERT", system_id, top_hr,
             extra_lines=[
-                f"🟠 {len(high_only)} CVE(s) exceeded risk threshold ({threshold}).",
+                f"🟠 {len(unsup_hr)} CVE(s) exceeded risk threshold ({threshold}).",
                 "Risk score incorporates CVSS, EPSS, KEV status, and patch age.",
                 "Review and patch according to your vulnerability management SLA.",
             ]
         )
         alerts.append({
             "type":      "high_risk",
-            "title":     f"[DRAUGR] {len(high_only)} high-risk CVE(s) on {system_id} (score ≥{threshold:.0f})",
+            "title":     f"[DRAUGR] {len(unsup_hr)} high-risk CVE(s) on {system_id} (score ≥{threshold:.0f})",
             "body":      body,
             "severity":  "HIGH",
             "system_id": system_id,
-            "count":     len(high_only),
+            "count":     len(unsup_hr),
             "rows":      top_hr,
         })
 
     # ── New system alert ──────────────────────────────────────────────
     if cfg.get("alert_on_new_system", True) and is_new_system:
-        top_new = sorted(rows, key=lambda r: -float(str(r.get("Risk Score",0) or 0)))[:5]
-        body = _plain_body(
-            "NEW SYSTEM DETECTED", system_id, top_new,
-            extra_lines=[
-                f"🆕 New system scanned for the first time: {system_id}",
-                f"Total findings: {len(rows)}  |  KEV: {len(kev_rows)}  |  High-risk: {len(high_risk)}",
-                "Review the full Draugr report and establish a remediation baseline.",
-            ]
-        )
-        alerts.append({
-            "type":      "new_system",
-            "title":     f"[DRAUGR] New system detected: {system_id}",
-            "body":      body,
-            "severity":  "INFO",
-            "system_id": system_id,
-            "count":     1,
-            "rows":      top_new,
-        })
+        # New system alerts are not CVE-level suppressed — the system itself is new
+        if not is_suppressed("new_system", system_id, "", suppression_hours, sup_store):
+            top_new = sorted(rows, key=lambda r: -float(str(r.get("Risk Score", 0) or 0)))[:5]
+            body = _plain_body(
+                "NEW SYSTEM DETECTED", system_id, top_new,
+                extra_lines=[
+                    f"🆕 New system scanned for the first time: {system_id}",
+                    f"Total findings: {len(rows)}  |  KEV: {len(kev_rows)}  |  High-risk: {len(high_risk)}",
+                    "Review the full Draugr report and establish a remediation baseline.",
+                ]
+            )
+            alerts.append({
+                "type":      "new_system",
+                "title":     f"[DRAUGR] New system detected: {system_id}",
+                "body":      body,
+                "severity":  "INFO",
+                "system_id": system_id,
+                "count":     1,
+                "rows":      top_new,
+            })
 
     # ── Newly KEV-listed (from diff) ──────────────────────────────────
     if diff:
         newly_kev = diff.get("newly_kev", [])
-        if newly_kev:
-            top_nk = sorted(newly_kev, key=lambda r: -float(str(r.get("Risk Score",0) or 0)))[:8]
+        unsup_nk  = _unsuppressed("newly_kev", newly_kev)
+        if unsup_nk:
+            top_nk = sorted(unsup_nk, key=lambda r: -float(str(r.get("Risk Score", 0) or 0)))[:8]
             body = _plain_body(
                 "NEWLY KEV-LISTED", system_id, top_nk,
                 extra_lines=[
-                    f"🚨 {len(newly_kev)} CVE(s) were added to CISA KEV since your last scan.",
+                    f"🚨 {len(unsup_nk)} CVE(s) were added to CISA KEV since your last scan.",
                     "These were NOT confirmed exploited at the time of your previous scan.",
                     "Treat with the same urgency as KEV findings: patch within 24–72 hours.",
                 ]
             )
             alerts.append({
                 "type":      "newly_kev",
-                "title":     f"[DRAUGR] {len(newly_kev)} CVE(s) newly KEV-listed on {system_id}",
+                "title":     f"[DRAUGR] {len(unsup_nk)} CVE(s) newly KEV-listed on {system_id}",
                 "body":      body,
                 "severity":  "CRITICAL",
                 "system_id": system_id,
-                "count":     len(newly_kev),
+                "count":     len(unsup_nk),
                 "rows":      top_nk,
             })
 
@@ -839,7 +935,7 @@ def dispatch_alerts(
     alerts: List[Dict[str, Any]],
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, int]:
-    """Send all alerts via configured channels."""
+    """Send all alerts via configured channels and record them in the suppression store."""
     if cfg is None:
         cfg = load_alert_config()
     if not cfg.get("enabled", False) or not alerts:
@@ -847,12 +943,30 @@ def dispatch_alerts(
 
     email_sent   = 0
     webhook_sent = 0
+    sent_alerts: List[Dict[str, Any]] = []
+
     for alert in alerts:
+        dispatched = False
         if cfg.get("smtp", {}).get("enabled"):
             if send_email_alert(alert, cfg):
                 email_sent += 1
+                dispatched = True
         if cfg.get("webhook", {}).get("enabled"):
             if send_webhook_alert(alert, cfg):
                 webhook_sent += 1
+                dispatched = True
+        if dispatched:
+            sent_alerts.append(alert)
+
+    # Persist suppression timestamps for every successfully dispatched alert
+    if sent_alerts:
+        sup_store = _load_suppression()
+        sup_store = record_alerts_sent(sent_alerts, sup_store)
+        # Purge stale entries while we have the store open
+        suppression_hours = float(cfg.get("suppression_hours", 24))
+        import time
+        cutoff    = time.time() - suppression_hours * 3600
+        sup_store = {k: v for k, v in sup_store.items() if v >= cutoff}
+        _save_suppression(sup_store)
 
     return {"email": email_sent, "webhook": webhook_sent}
