@@ -1592,6 +1592,15 @@ def query_otx_for_cves(
         if gn_data.get("riot"):
             score += 1   # known scanner context
 
+        # Populate cache with raw data so report formatters can read
+        # GreyNoise/CIRCL signal (GreyNoise labels, CIRCL enrichment sections).
+        # Previously the raw responses were discarded here and the cache was
+        # never written, so those report sections always rendered empty.
+        _THREAT_INTEL_CACHE[cve_id] = {
+            "circl":     circl_data,
+            "greynoise": gn_data,
+        }
+
         if score > 0:
             scores[cve_id] = score
 
@@ -1601,10 +1610,13 @@ def query_otx_for_cves(
 
 
 # ----------------------------------------------------------------------
-# Enrichment cache — so CIRCL/GN data gathered in query_otx_for_cves
-# can be re-used when formatting the report without a second round-trip.
+# Enrichment cache — declared in draugr_reports.py so both modules share
+# the same dict object. Populated here during scan; read by report builders.
 # ----------------------------------------------------------------------
-_THREAT_INTEL_CACHE: Dict[str, Dict[str, Any]] = {}
+try:
+    from draugr_reports import _THREAT_INTEL_CACHE
+except ImportError:
+    _THREAT_INTEL_CACHE: Dict[str, Dict[str, Any]] = {}  # type: ignore
 
 
 def _get_cached_intel(cve_id: str) -> Dict[str, Any]:
