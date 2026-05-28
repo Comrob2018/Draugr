@@ -944,13 +944,16 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     text-transform: uppercase;
     letter-spacing: 1px;
 }}
-.toc ol {{
+.toc ol, .toc ul {{
     padding-left: 20px;
     margin: 0;
 }}
 .toc li {{
     padding: 2px 0;
     list-style: decimal;
+}}
+.toc ul > li {{
+    list-style: none;
 }}
 .toc li::before {{
     content: none;
@@ -2436,7 +2439,7 @@ def build_defensive_report(
         for (n, v) in sorted(grouped.keys(), key=lambda x: x[0].lower())
     )
     toc_html = (
-        '<h2>Contents</h2><ol>'
+        '<h2>Contents</h2><ul>'
         '<li><a href="#1-executive-technical-summary">1. Executive Technical Summary</a></li>'
         '<li><a href="#2-asset-and-system-overview">2. Asset and System Overview</a></li>'
         '<li><a href="#3-severity-distribution-and-risk-scoring">3. Severity Distribution and Risk Scoring</a></li>'
@@ -2453,7 +2456,7 @@ def build_defensive_report(
         '<li><a href="#13-security-control-gaps">13. Security Control Gaps</a></li>'
         '<li><a href="#14-recommended-remediation-prioritization">14. Recommended Remediation Prioritization</a></li>'
         '<li><a href="#15-residual-risk-discussion">15. Residual Risk Discussion</a></li>'
-        '</ol>'
+        '</ul>'
     )
 
     lines: List[str] = []
@@ -3503,14 +3506,14 @@ def build_redteam_report(
 
     # TOC
     toc_html = (
-        '<h2>Contents</h2><ol>'
+        '<h2>Contents</h2><ul>'
         '<li><a href="#section-1-engagement-recommendations">Section 1 — Engagement Recommendations</a></li>'
         '<li><a href="#section-2-target-priority-ranking">Section 2 — Target Priority Ranking</a></li>'
         '<li><a href="#section-3-per-target-attack-profiles">Section 3 — Per-Target Attack Profiles</a></li>'
         '<li><a href="#section-4-exploit-inventory">Section 4 — Exploit Inventory</a></li>'
         '<li><a href="#section-5-threat-intelligence-summary">Section 5 — Threat Intelligence Summary</a></li>'
         '<li><a href="#section-6-highest-epss-probability-cves">Section 6 — Highest EPSS Probability CVEs</a></li>'
-        '</ol>'
+        '</ul>'
     )
 
     lines: List[str] = [
