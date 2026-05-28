@@ -157,195 +157,6 @@ def _scenario_template(attack_id: str, attack_name: str, software_name: str, cve
         f"{attack_id} ({attack_name}), creating a path to compromise, disruption, or data loss."
     )
 
-
-def _format_threat_map(rows: List[Dict[str, Any]]) -> str:
-    """Build an indented text threat map for one software item."""
-    lines: List[str] = []
-    for row in rows[:10]:
-        cve_id = row.get("CVE ID", "")
-        risk = row.get("Risk Score", "")
-        risk_level = row.get("Risk Level", "")
-        cwes = _split_multi(row.get("CWE", ""))
-        attacks = _split_multi(row.get("ATT&CK Techniques", ""))
-        d3f = _split_multi(row.get("D3FEND Countermeasures", ""))
-        nist = _split_multi(row.get("NIST 800-53 Controls", ""))
-
-        lines.append(f"- {cve_id}  [Risk: {risk} | {risk_level}]")
-
-        if cwes:
-            for cwe in cwes[:5]:
-                lines.append(f"  - CWE: {cwe}")
-
-        if attacks:
-            for attack in attacks[:5]:
-                lines.append(f"    - ATT&CK: {attack}")
-
-        if d3f:
-            for d in d3f[:5]:
-                lines.append(f"      - D3FEND: {d}")
-
-        if nist:
-            for n in nist[:5]:
-                lines.append(f"      - NIST: {n}")
-
-    return "\n".join(lines) if lines else "- No mapped threats identified."
-
-
-def _format_top_cves(rows: List[Dict[str, Any]], limit) -> str:
-    limit = None if limit == 0 else limit
-    lines: List[str] = []
-    for row in rows[:limit]:
-        cve_id = row.get("CVE ID", "")
-        desc = str(row.get("Description", "") or "").strip()
-        if not desc:
-            desc = "No description available in report row."
-
-        lines.append(f"### {cve_id}")
-        lines.append(f"- Risk Score: {row.get('Risk Score', '')} ({row.get('Risk Level', '')})")
-        lines.append(f"- CVSS: {row.get('CVSS Base Score', '')} ({row.get('CVSS Severity', '')})")
-        lines.append(f"- Description: {desc}")
-        lines.append(f"- KEV: {row.get('Known Exploited Vulnerability', 'No')}")
-        lines.append(f"- Public Exploit: {row.get('Public Exploit', 'No')}")
-        lines.append(f"- EPSS: {row.get('EPSS Score', '')}")
-        lines.append(f"- Version Confirmed: {row.get('Version Confirmed', '')}")
-        lines.append(f"- Published: {row.get('CVE Date', '')}")
-        lines.append(f"- Exploit Sources: {row.get('Exploit Sources', '') or 'None'}")
-        lines.append(f"- ATT&CK Techniques: {row.get('ATT&CK Techniques', '') or 'None'}")
-        lines.append(f"- D3FEND Countermeasures: {row.get("D3FEND Countermeasures", '') or 'None'}")
-        lines.append(f"- NIST 800-53 Controls: {row.get("NIST 800-53 Controls", "") or 'None'}")
-        # --- Threat intelligence enrichment from CIRCL / GreyNoise ---
-        cve_id = row.get("CVE ID", "")
-        if cve_id:
-            cached = _THREAT_INTEL_CACHE.get(cve_id, {})
-            gn     = cached.get("greynoise", {})
-            circl  = cached.get("circl", {})
-            if gn.get("noise"):
-                lines.append("- GreyNoise: ⚠ Active exploitation traffic observed in the wild")
-            elif gn.get("riot"):
-                lines.append("- GreyNoise: Known scanner/researcher activity observed")
-            capecs = circl.get("capec") or []
-            if capecs:
-                capec_str = "; ".join(
-                    f"CAPEC-{c.get('id','')} {c.get('name','')}" for c in capecs[:3]
-                )
-                lines.append(f"- Attack Patterns (CAPEC): {capec_str}")
-        lines.append(f"- NVD: {row.get('NVD URL', '')}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-def _to_list(value):
-    """Return a list of non‑empty items from a comma‑separated string.
-    Values that are '' , None or '0' are ignored."""
-    if not value or str(value).strip() == "0":
-        return []
-    # split on commas (the original data stores several items separated by commas)
-    return [item.strip() for item in str(value).split(",") if item.strip()]
-
-def _format_scenarios(rows: List[Dict[str, Any]], software_name: str, limit) -> str:
-    limit = None if limit == 0 else limit
-    lines: List[str] = []
-    count = 0
-
-    for row in rows:
-        attacks = _split_multi(row.get("ATT&CK Techniques", ""))
-        if not attacks:
-            continue
-
-        first_attack = attacks[0]
-        match = re.match(r"^([A-Z0-9.]+)\s*\((.*?)\)$", first_attack)
-        if match:
-            attack_id, attack_name = match.group(1), match.group(2)
-        else:
-            attack_id, attack_name = first_attack, first_attack
-        
-        count += 1      
-        cve_id = row.get("CVE ID", "")
-                # --- try to get a rich description from the scenario library ------------------------
-        scenario_info = SCENARIOS.get(attack_id)
-        if scenario_info and scenario_info.get("description"):
-            # The library already contains placeholders for {cve_id} and {software_name}
-            narrative = scenario_info["description"].format(
-                cve_id=cve_id,
-                software_name=software_name,
-            )
-        else:
-            # Fallback to the original generic template (the behaviour that existed before)
-            narrative = _scenario_template(
-                attack_id, attack_name, software_name, cve_id
-            )
-        tactics_list = get_tactics(attack_id)
-        impact_text = get_impact(attack_id)
-        d3fend_vals = _to_list(row.get("D3FEND Countermeasures", ""))
-        nist_vals = _to_list(row.get("NIST 800-53 Controls", ""))
-
-        lines.append(f"## Scenario {count}: {attack_name}")
-        lines.append(f"- CVE: {row.get('CVE ID', '')}")
-        lines.append(f"- ATT&CK Technique: {attack_id} ({attack_name})")
-        lines.append(f"- Narrative: {narrative}")
-        if tactics_list:
-            lines.append(f"- Tactics: {', '.join(tactics_list)}")
-        if impact_text:
-            lines.append(f"- Impact: {impact_text}")
-        if len(d3fend_vals) > 0 or len(nist_vals) > 0:
-            lines.append("### Primary Mitigations: ")
-            if len(d3fend_vals) > 0:
-                lines.append("# D3FEND Countermeasures")
-                for mit in d3fend_vals:
-                    lines.append(f"-   {mit}")
-            if len(nist_vals) > 0:
-                lines.append("NIST 800-53 Controls")
-                for control in nist_vals:
-                    lines.append(control)
-        else:
-            lines.append("- Primary Mitigations: No mapped mitigations or controls")
-            
-        lines.append("")
-        lines.append("="*78)
-
-        if limit is not None and count >= limit:
-            break
-
-    return "\n".join(lines).strip() if lines else "No ATT&CK-linked scenarios could be generated."
-
-
-def _format_mitigations(rows: List[Dict[str, Any]], limit) -> str:
-    limit = None if limit == 0 else limit
-    d3f_all: List[str] = []
-    nist_all: List[str] = []
-
-    for row in rows:
-        d3f_all.extend(_split_multi(row.get("D3FEND Countermeasures", "")))
-        nist_all.extend(_split_multi(row.get("NIST 800-53 Controls", "")))
-
-    def unique_keep_order(items: List[str]) -> List[str]:
-        out = []
-        seen = set()
-        for item in items:
-            if item not in seen:
-                seen.add(item)
-                out.append(item)
-        return out
-
-    d3f_unique = unique_keep_order(d3f_all)[:limit]
-    nist_unique = unique_keep_order(nist_all)[:limit]
-
-    lines = ["## Recommended Mitigations", ""]
-
-    lines.append("### D3FEND")
-    if d3f_unique:
-        lines.extend([f"- {x}" for x in d3f_unique])
-    else:
-        lines.append("- No D3FEND mappings available")
-
-    lines.append("")
-    lines.append("### NIST 800-53")
-    if nist_unique:
-        lines.extend([f"- {x}" for x in nist_unique])
-    else:
-        lines.append("- No NIST 800-53 mappings available")
-
-    return "\n".join(lines)
-
 def _top_techniques(
     rows: List[Dict[str, Any]], top_n: int = 5
 ) -> List[Tuple[str, int, Dict[str, Any]]]:
@@ -403,229 +214,58 @@ def _top_techniques(
     most_common = technique_counter.most_common(top_n)
     return [(aid, cnt, technique_meta[aid]) for aid, cnt in most_common]
 
-def _executive_summary(rows: List[Dict[str, Any]]) -> str:
-    """
-    Build a **high‑level narrative** that lists:
-      • total CVEs, severity distribution, KEV and exploit counts,
-      • the top ATT&CK techniques with tactic context,
-      • the defend‑mitigations (D3FEND + NIST) that cover the majority of findings.
-    """
-    # ----- severity totals -------------------------------------------------
-    sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "OTHER": 0}
-    kev_total = 0
-    exploit_total = 0
-    confirmed_total = 0
-    max_risk_score = 0.0
-    software_set: set = set()
-
-    for r in rows:
-        sev = str(r.get("CVSS Severity", "") or r.get("Risk Level", "") or "").upper()
-        if sev in sev_counts:
-            sev_counts[sev] += 1
-        else:
-            sev_counts["OTHER"] += 1
-
-        if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES":
-            kev_total += 1
-        if str(r.get("Public Exploit", "")).upper() == "YES":
-            exploit_total += 1
-        if str(r.get("Version Confirmed", "")).upper() == "YES":
-            confirmed_total += 1
-
-        try:
-            rs = float(r.get("Risk Score", 0))
-            if rs > max_risk_score:
-                max_risk_score = rs
-        except (TypeError, ValueError):
-            pass
-
-        sw = str(r.get("Software Name", "")).strip()
-        if sw:
-            software_set.add(sw)
-
-    total_cves = sum(sev_counts.values())
-
-    # ----- top techniques --------------------------------------------------
-    top = _top_techniques(rows, top_n=5)
-
-    # ----- build markdown ---------------------------------------------------
-    md = ["## Executive Summary", ""]
-    md.append(
-        f"The scan identified **{total_cves}** CVEs across "
-        f"**{len(software_set)}** software {'items' if len(software_set) != 1 else 'item'}. "
-        f"Severity breakdown – Critical: **{sev_counts['CRITICAL']}**, "
-        f"High: **{sev_counts['HIGH']}**, Medium: **{sev_counts['MEDIUM']}**, "
-        f"Low: **{sev_counts['LOW']}**."
-    )
-    md.append("")
-
-    # Key risk indicators
-    risk_items: List[str] = []
-    if kev_total:
-        risk_items.append(f"**{kev_total}** {'CVEs are' if kev_total != 1 else 'CVE is'} listed in the CISA Known Exploited Vulnerabilities catalog")
-    if exploit_total:
-        risk_items.append(f"**{exploit_total}** {'have' if exploit_total != 1 else 'has'} publicly available exploit code")
-    if confirmed_total:
-        risk_items.append(f"**{confirmed_total}** {'are' if confirmed_total != 1 else 'is'} version‑confirmed against the scanned software")
-    if max_risk_score:
-        risk_items.append(f"Highest weighted risk score: **{max_risk_score:.1f}**/100")
-
-    if risk_items:
-        md.append("Key risk indicators:")
-        for item in risk_items:
-            md.append(f"- {item}")
-        md.append("")
-
-    if top:
-        md.append("The most prevalent ATT&CK techniques are:")
-        for aid, cnt, meta in top:
-            tactics_str = ", ".join(meta.get("tactics", [])) or "—"
-            mitig = ", ".join(meta["d3fend"][:3]) or "none"
-            if len(meta["d3fend"]) > 3:
-                mitig += f" (+{len(meta['d3fend']) - 3} more)"
-            nist  = ", ".join(meta["nist"][:3])   or "none"
-            if len(meta["nist"]) > 3:
-                nist += f" (+{len(meta['nist']) - 3} more)"
-            md.append(
-                f"- **{meta['name']}** ({aid}) – observed in **{cnt}** CVEs. "
-                f"Tactics: {tactics_str}. "
-                f"D3FEND mitigations: {mitig}. NIST controls: {nist}."
-            )
-    else:
-        md.append("- No ATT&CK techniques were mapped for the identified CVEs.")
-
-    md.append("")
-    md.append(
-        "Focusing remediation on the mitigations listed above will address "
-        "the majority of the attack surface revealed by this assessment."
-    )
-    md.append("")
-    return "\n".join(md)
-
-def _conclusion_section(rows: List[Dict[str, Any]]) -> str:
-    """
-    Provide a data-driven step-by-step implementation guide for the
-    mitigations surfaced by the scan.
-    """
-    top = _top_techniques(rows, top_n=5)
-
-    # Gather aggregate stats for the conclusion
-    total_cves = len(rows)
-    kev_total = sum(1 for r in rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
-    exploit_total = sum(1 for r in rows if str(r.get("Public Exploit", "")).upper() == "YES")
-    confirmed_total = sum(1 for r in rows if str(r.get("Version Confirmed", "")).upper() == "YES")
-    critical_count = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "CRITICAL")
-    high_count = sum(1 for r in rows if str(r.get("CVSS Severity", "")).upper() == "HIGH")
-
-    # Collect all unique D3FEND and NIST controls across all rows
-    all_d3fend: List[str] = []
-    all_nist: List[str] = []
-    d3_seen: set = set()
-    nist_seen: set = set()
-    for r in rows:
-        for d in _split_multi(r.get("D3FEND Countermeasures", "")):
-            if d not in d3_seen:
-                d3_seen.add(d)
-                all_d3fend.append(d)
-        for n in _split_multi(r.get("NIST 800-53 Controls", "")):
-            if n not in nist_seen:
-                nist_seen.add(n)
-                all_nist.append(n)
-
-    md = ["## Conclusion & Implementation Guidance", ""]
-
-    # Situation overview
-    md.append(
-        f"This assessment identified **{total_cves}** CVEs, of which "
-        f"**{critical_count}** are Critical and **{high_count}** are High severity."
-    )
-    if kev_total or exploit_total:
-        parts = []
-        if kev_total:
-            parts.append(f"**{kev_total}** appear in the CISA KEV catalog")
-        if exploit_total:
-            parts.append(f"**{exploit_total}** have public exploit code available")
-        md.append(f"{'; '.join(parts)}.")
-    if confirmed_total:
-        md.append(
-            f"Of these, **{confirmed_total}** are version-confirmed as affecting "
-            f"the scanned software."
-        )
-    md.append("")
-
-    # Prioritised remediation steps from top techniques
-    if top:
-        md.append(
-            "To address the highest-impact attack vectors, apply the following "
-            "actions in priority order:"
-        )
-        md.append("")
-
-        step = 1
-        for aid, cnt, meta in top:
-            tname = meta.get("name", aid)
-            tactics = ", ".join(meta.get("tactics", [])) or "Unknown"
-            md.append(
-                f"**Priority {step}: {tname} ({aid})** -- "
-                f"affects {cnt} CVE{'s' if cnt != 1 else ''} "
-                f"(Tactics: {tactics})"
-            )
-            if meta["d3fend"]:
-                for d in meta["d3fend"][:3]:
-                    md.append(f"- Deploy D3FEND counter-measure: **{d}**")
-                if len(meta["d3fend"]) > 3:
-                    md.append(f"- ... and {len(meta['d3fend']) - 3} additional D3FEND measures")
-            if meta["nist"]:
-                for n in meta["nist"][:3]:
-                    md.append(f"- Enact NIST 800-53 control: **{n}**")
-                if len(meta["nist"]) > 3:
-                    md.append(f"- ... and {len(meta['nist']) - 3} additional NIST controls")
-            if not meta["d3fend"] and not meta["nist"]:
-                md.append("- No specific D3FEND or NIST mappings available for this technique")
-            md.append("")
-            step += 1
-    else:
-        md.append("No ATT&CK techniques were mapped; remediation should focus on patching the identified CVEs directly.")
-        md.append("")
-
-    # Summary totals
-    md.append(
-        f"Across all findings, **{len(all_d3fend)}** unique D3FEND counter-measures "
-        f"and **{len(all_nist)}** unique NIST 800-53 controls were identified."
-    )
-    md.append("")
-
-    md.append(
-        "Implementation roadmap:\n"
-        "1. **Prioritise** -- Address KEV-listed and publicly-exploitable CVEs first.\n"
-        "2. **Patch** -- Apply vendor patches for all version-confirmed CVEs.\n"
-        "3. **Harden** -- Deploy the D3FEND counter-measures and NIST controls listed above.\n"
-        "4. **Validate** -- Confirm effectiveness with periodic red-team or ATT&CK-mapping tests.\n"
-        "5. **Monitor** -- Continuously scan for new CVEs and update the mitigation set."
-    )
-    md.append("")
-    return "\n".join(md)
-
 # ======================================================================
 #  HTML report helpers
 # ======================================================================
 
 def _load_logo_b64(script_dir: Optional[str] = None) -> str:
     """
-    Return a base64-encoded data URI for draugr_logo.png if it exists
-    next to the script, otherwise return an empty string.
-    The result can be dropped straight into an <img src="..."> attribute.
+    Return a src value for the report logo, in order of preference:
+
+    1. GitHub raw URL — if a repo slug is configured in prefs.json, construct
+       the raw.githubusercontent.com URL for draugr_logo_small.png on the
+       main branch.  The <img> tag will fetch it at report-view time, so the
+       report must be opened with internet access for the logo to appear.
+       This is the preferred path: no embedding required, always up to date.
+
+    2. Local base64 data URI — if draugr_logo_small.png exists next to the
+       script it is embedded directly.  Works offline; larger HTML file.
+
+    3. Empty string — no logo rendered; report still displays correctly.
     """
-    search_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
-    logo_path = os.path.join(search_dir, "draugr_logo_small.png")
-    if not os.path.isfile(logo_path):
-        return ""
+    # ── 1. GitHub raw URL ────────────────────────────────────────────
     try:
-        with open(logo_path, "rb") as fh:
-            encoded = base64.b64encode(fh.read()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
+        from draugr_cache import _default_cache_dir
+        import json as _j
+        p = _default_cache_dir() / "prefs.json"
+        if p.exists():
+            prefs = _j.loads(p.read_text(encoding="utf-8"))
+            repo  = str(prefs.get("github_repo", "") or "").strip()
+            if repo:
+                # Normalise: strip leading https://github.com/ if user pasted full URL
+                repo = re.sub(r"^https?://github\.com/", "", repo).strip("/")
+                return (
+                    f"https://raw.githubusercontent.com/{repo}/main/"
+                    "resources/draugr_logo_small.png"
+                )
     except Exception:
-        return ""
+        pass
+
+    # ── 2. Local file, base64-embedded ───────────────────────────────
+    search_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    for candidate in [
+        os.path.join(search_dir, "resources", "draugr_logo_small.png"),
+        os.path.join(search_dir, "draugr_logo_small.png"),
+    ]:
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate, "rb") as fh:
+                    encoded = base64.b64encode(fh.read()).decode("ascii")
+                return f"data:image/png;base64,{encoded}"
+            except Exception:
+                break
+
+    return ""
 
 
 def _markdown_body_to_html(md: str) -> str:
@@ -912,7 +552,10 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     toc_html: optional pre-built table-of-contents block inserted before body.
     """
     escaped_title = html.escape(title)
-    logo_tag = '<img src="C:\\Users\\comro\\Desktop\\Rob\\cyber\\programs\\draugr\\draugr_logo_small.png" alt="Draugr logo">'
+    logo_tag = (
+        f'<img src="{logo_b64}" alt="Draugr logo">'
+        if logo_b64 else ""
+    )
     sub_tag = (
         f'<span class="subtitle">{html.escape(subtitle)}</span>'
         if subtitle else ""
