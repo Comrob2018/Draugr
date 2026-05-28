@@ -111,6 +111,22 @@ try:
 except ImportError:
     HAS_POAM = False
 
+try:
+    from draugr_fleet import build_fleet_report_from_db
+    HAS_FLEET = True
+except ImportError:
+    HAS_FLEET = False
+    def build_fleet_report_from_db(*a, **kw) -> str: return ""  # type: ignore
+
+try:
+    from draugr_alerts import check_alerts, dispatch_alerts, load_alert_config
+    HAS_ALERTS = True
+except ImportError:
+    HAS_ALERTS = False
+    def load_alert_config() -> dict: return {}                                          # type: ignore
+    def check_alerts(*a, **kw) -> list: return []                                       # type: ignore
+    def dispatch_alerts(*a, **kw) -> dict: return {"email": 0, "webhook": 0}            # type: ignore
+
 
 # ----------------------------------------------------------------------
 # Third‑party imports
@@ -123,12 +139,13 @@ except ImportError:  # pragma: no cover
 try:
     from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
     from PyQt6.QtGui import (
-        QAction, QColor, QFont, QLinearGradient, QPainter,
-        QPainterPath, QPalette, QPixmap, QRadialGradient,
+        QAction, QColor, QDesktopServices, QFont, QLinearGradient,
+        QPainter, QPainterPath, QPalette, QPixmap, QRadialGradient,
     )
     from PyQt6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QComboBox,
         QFrame,
         QHBoxLayout,
         QFileDialog,
@@ -140,6 +157,7 @@ try:
         QPushButton,
         QSplashScreen,
         QSizePolicy,
+        QTextBrowser,
         QTextEdit,
         QVBoxLayout,
         QWidget,
@@ -160,45 +178,85 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
-DRAUGR_VERSION = "2.0.0"
-DRAUGR_UPDATE_URL = "https://api.github.com/repos/your-org/draugr/releases/latest"
+DRAUGR_VERSION = "2.0.2"
+# GitHub repository for update checks — format: "owner/repo"
+# Configurable via Settings → Update Settings. Stored in prefs.json.
+_GITHUB_REPO: str = ""
+
+
+def _load_github_repo() -> str:
+    """Load the configured GitHub repo slug from prefs."""
+    global _GITHUB_REPO
+    try:
+        from draugr_cache import _default_cache_dir
+        import json as _j
+        p = _default_cache_dir() / "prefs.json"
+        if p.exists():
+            prefs = _j.loads(p.read_text(encoding="utf-8"))
+            _GITHUB_REPO = str(prefs.get("github_repo", "") or "")
+    except Exception:
+        pass
+    return _GITHUB_REPO
+
+
+def _save_github_repo(repo: str) -> None:
+    """Persist the GitHub repo slug to prefs."""
+    global _GITHUB_REPO
+    _GITHUB_REPO = repo.strip()
+    try:
+        from draugr_cache import _default_cache_dir
+        import json as _j
+        p = _default_cache_dir() / "prefs.json"
+        prefs: dict = {}
+        if p.exists():
+            try:
+                prefs = _j.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        prefs["github_repo"] = _GITHUB_REPO
+        p.write_text(_j.dumps(prefs, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def check_for_update() -> Optional[Dict[str, str]]:
+    """
+    Check GitHub releases API for a newer version of Draugr.
+    Returns {"version": "x.y.z", "url": "..."} if an update is available, else None.
+    Requires a GitHub repo configured via Settings → Update Settings.
+    """
+    repo = _GITHUB_REPO or _load_github_repo()
+    if not repo or requests is None:
+        return None
+    api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        resp = requests.get(api_url, timeout=5, headers={"User-Agent": USER_AGENT})
+        if resp.status_code == 404:
+            return None   # repo exists but has no releases yet
+        if resp.status_code != 200:
+            return None
+        data   = resp.json()
+        latest = str(data.get("tag_name", "") or "").lstrip("v")
+        html_url = str(data.get("html_url", "") or "")
+        if not latest:
+            return None
+        def _ver(s: str):
+            try:
+                return tuple(int(x) for x in s.split("."))
+            except Exception:
+                return (0,)
+        if _ver(latest) > _ver(DRAUGR_VERSION):
+            return {"version": latest, "url": html_url}
+        return None
+    except Exception:
+        return None
+
 
 # Default path for the CPE mapping override file (same directory as script)
 CPE_MAPPING_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpe_mappings.json")
 
 # Confidence threshold for CPE matching (0.0–1.0). Overridable via Settings.
 _CPE_CONFIDENCE_THRESHOLD = 0.03
-
-
-def check_for_update() -> Optional[Dict[str, str]]:
-    """
-    Check GitHub releases API for a newer version.
-    Returns {"version": "x.y.z", "url": "..."} if update available, else None.
-    Non-blocking — caller should run in a thread.
-    """
-    if requests is None:
-        return None
-    try:
-        resp = requests.get(DRAUGR_UPDATE_URL, timeout=5,
-                            headers={"User-Agent": USER_AGENT})
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        latest = str(data.get("tag_name","") or "").lstrip("v")
-        url    = str(data.get("html_url","") or "")
-        if not latest:
-            return None
-        # Simple version comparison
-        def _ver(s):
-            try:
-                return tuple(int(x) for x in s.split("."))
-            except Exception:
-                return (0,)
-        if _ver(latest) > _ver(DRAUGR_VERSION):
-            return {"version": latest, "url": url}
-    except Exception:
-        pass
-    return None
 
 
 # ======================================================================
@@ -5367,6 +5425,18 @@ def build_defensive_report(
         lines.append(f"- {r_item}")
         lines.append("")
 
+    # ── ICS / OT ATT&CK section (appended if any ICS-relevant findings) ──
+    if HAS_ICS:
+        ics_section = ics_summary_section(all_rows)
+        if ics_section:
+            lines += ["---", "", ics_section]
+
+    # ── Plugin report sections ─────────────────────────────────────────
+    if HAS_PLUGINS:
+        plugin_md = collect_report_sections(all_rows)
+        if plugin_md:
+            lines += ["---", "", plugin_md]
+
     body_md = "\n".join(lines).strip() + "\n"
     return _wrap_html_report(
         title=report_title,
@@ -5996,7 +6066,7 @@ class ScanWorker(QThread):
                  show_medium=True, show_low=True, resources_dir="", executive_report_path="", comp_report_path="",
                  error_log_path="", scan_log_path="", write_logs=True,
                  defensive_report_path="", redteam_report_path="", otx_api_key="",
-                 input_file="", system_id=""):
+                 input_file="", system_id="", software_tags: Optional[Dict[str, str]] = None):
         super().__init__()
         self.software = software
         self.kev_path = kev_path
@@ -6016,8 +6086,10 @@ class ScanWorker(QThread):
         self.otx_api_key = otx_api_key
         self.input_file  = input_file
         self.system_id   = system_id or (extract_system_id(input_file) if input_file else "unknown")
+        self.software_tags: Dict[str, str] = software_tags or {}
         self._scan_log_lines:  List[str] = []
         self._error_log_lines: List[str] = []
+        self._skip_current: bool = False   # set True by GUI to skip the current software item
 
     def _emit_log(self, msg: str, level: str = "info"):
         """Emit to UI and buffer for scan log. Errors also go to the error buffer."""
@@ -6168,6 +6240,11 @@ class ScanWorker(QThread):
             epss_map = query_epss(cve_ids)
 
             # --- Exploit intelligence (Vulners batch lookup) ---
+            if self._skip_current:
+                self._emit_log(f"⏭ Skipped: {label}", "warn")
+                self._skip_current = False
+                self.progress_signal.emit(idx, total)
+                continue
             self.status_signal.emit(f"Scanning: {idx} of {total} — {label} — Enriching: Vulners")
             self._emit_log("Querying Vulners for public exploit data…", "dim")
             vulners_map = query_exploits_vulners(cve_ids)
@@ -6245,6 +6322,10 @@ class ScanWorker(QThread):
                 if db and db.is_false_positive(cid, name):
                     self._emit_log(f"  ↷ {cid} suppressed (false positive list)", "dim")
                     continue
+
+                # ---- skip current software item ----
+                if self._skip_current:
+                    break
 
                 # ---- patch age for risk multiplier ----
                 patch_age_int: Optional[int] = None
@@ -6343,6 +6424,7 @@ class ScanWorker(QThread):
                     "CVSS Version": cve.get("cvss_version", ""),
                     "CVSS Base Score": cve.get("cvss_base_score", ""),
                     "CVSS Severity": cve.get("cvss_severity", ""),
+                    "CVSS Vector": cve.get("cvss_vector", ""),
                     "CVSS Exploitability": cve.get("cvss_exploitability", ""),
                     "CVSS Impact": cve.get("cvss_impact", ""),
                     "Known Exploited Vulnerability": cve.get("kev_known_exploited", "No"),
@@ -6361,10 +6443,21 @@ class ScanWorker(QThread):
                     "CWE": "; ".join(fw["cwe_expanded"]),
                     "CAPEC": capec_str,
                     "ATT&CK Techniques": attack_str,
+                    "ATT&CK Tactics": "; ".join(
+                        t["tactic"] for t in fw["attack_techs"] if t.get("tactic")
+                    ),
                     "D3FEND Countermeasures": d3fend_str,
                     "NIST 800-53 Controls": nist_str,
                     "NVD URL": nvd_url,
                 }
+
+                # ── Apply software tags from the GUI tag manager ───────
+                tag_val = (
+                    self.software_tags.get(name.lower().strip()) or
+                    self.software_tags.get(name.strip()) or ""
+                )
+                if tag_val:
+                    row_dict["Tags"] = tag_val
 
                 # ── ICS/OT ATT&CK enrichment ───────────────────────────
                 if HAS_ICS:
@@ -6518,6 +6611,10 @@ class ScanWorker(QThread):
                 except Exception:
                     pass
 
+            if self._skip_current:
+                self._emit_log(f"⏭ Skipped: {label} (skipped during CVE processing)", "warn")
+                self._skip_current = False
+
             self.progress_signal.emit(idx, total)  # mark this item complete
 
         # Final progress — ensure bar shows 100%
@@ -6555,6 +6652,7 @@ class ScanWorker(QThread):
             "CVSS Version",
             "CVSS Base Score",
             "CVSS Severity",
+            "CVSS Vector",
             "CVSS Exploitability",
             "CVSS Impact",
             "Known Exploited Vulnerability",
@@ -6567,6 +6665,7 @@ class ScanWorker(QThread):
             "CWE",
             "CAPEC",
             "ATT&CK Techniques",
+            "ATT&CK Tactics",
             "D3FEND Countermeasures",
             "NIST 800-53 Controls",
             "ICS ATT&CK Techniques",
@@ -6752,6 +6851,8 @@ class CVEScannerWindow(QMainWindow):
         self.logging     = False
         self._scan_rows: List[Dict[str, Any]] = []   # last scan results for browser
         self._profiles:  Dict[str, Dict[str, Any]] = self._load_profiles()
+        self._tags:      Dict[str, str] = self._load_tags()
+        _load_github_repo()   # pre-load repo slug from prefs
         self._build_ui()
         # Async version check
         if HAS_CACHE:
@@ -6778,6 +6879,26 @@ class CVEScannerWindow(QMainWindow):
             path = _default_cache_dir() / "scan_profiles.json"
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._profiles, f, indent=2)
+        except Exception:
+            pass
+
+    def _load_tags(self) -> Dict[str, str]:
+        try:
+            from draugr_cache import _default_cache_dir
+            path = _default_cache_dir() / "software_tags.json"
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_tags(self) -> None:
+        try:
+            from draugr_cache import _default_cache_dir
+            path = _default_cache_dir() / "software_tags.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._tags, f, indent=2)
         except Exception:
             pass
 
@@ -6915,7 +7036,7 @@ class CVEScannerWindow(QMainWindow):
         # Buttons
         root.addSpacing(14)
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
+        btn_row.setSpacing(0)
 
         ACTION_BTN_STYLE = f"""
         QPushButton {{
@@ -6947,6 +7068,13 @@ class CVEScannerWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.setStyleSheet(ACTION_BTN_STYLE)
 
+        self.skip_btn = QPushButton("⏭   Skip Current")
+        self.skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.skip_btn.setFixedSize(160, 44)
+        self.skip_btn.setEnabled(False)
+        self.skip_btn.setToolTip("Skip the software item currently being scanned and move to the next one")
+        self.skip_btn.setStyleSheet(ACTION_BTN_STYLE.replace(C.RED, C.ORANGE))
+
         self.diff_btn = QPushButton("Δ   Compare Scans")
         self.diff_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.diff_btn.setFixedSize(160, 44)
@@ -6962,12 +7090,15 @@ class CVEScannerWindow(QMainWindow):
         btn_row.addWidget(self.scan_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.stop_btn)
+        btn_row.addSpacing(5)
+        btn_row.addWidget(self.skip_btn)
         btn_row.addSpacing(14)
         btn_row.addWidget(self.diff_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.trend_btn)
         self.scan_btn.clicked.connect(lambda: self._start_scan(generate_executive_report=True))
         self.stop_btn.clicked.connect(self._stop_scan)
+        self.skip_btn.clicked.connect(self._skip_current_software)
         self.diff_btn.clicked.connect(self._run_diff)
         self.trend_btn.clicked.connect(self._view_scan_history)
         btn_row.addStretch()
@@ -7106,6 +7237,26 @@ class CVEScannerWindow(QMainWindow):
         results_left_layout.setContentsMargins(6, 6, 0, 6)
         results_left_layout.setSpacing(4)
 
+        # Source bar — shows what is loaded + Load CSV button
+        source_bar = QHBoxLayout()
+        self._results_source_label = QLabel("No results loaded")
+        self._results_source_label.setStyleSheet(
+            f"color:{C.FG_DIM}; font-size:10px; font-style:italic;"
+        )
+        load_csv_btn = QPushButton("📂  Load CSV")
+        load_csv_btn.setFixedHeight(28)
+        load_csv_btn.setToolTip("Load a previously saved Draugr scan CSV into the Results Browser")
+        load_csv_btn.setStyleSheet(
+            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; "
+            f"padding:2px 10px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
+        )
+        load_csv_btn.clicked.connect(self._load_csv_into_browser)
+        source_bar.addWidget(self._results_source_label, 1)
+        source_bar.addWidget(load_csv_btn)
+        results_left_layout.addLayout(source_bar)
+
         # Filter bar
         filter_bar = QHBoxLayout()
         self._results_filter = QLineEdit()
@@ -7148,7 +7299,11 @@ class CVEScannerWindow(QMainWindow):
             f"border:1px solid {C.BORDER}; padding:5px; font-weight:600; font-size:11px; }}"
             f"QTableWidget::item:selected {{ background:{C.ACCENT}; color:#fff; }}"
         )
-        self._results_table.currentRowChanged.connect(self._on_result_row_selected)
+        self._results_table.currentItemChanged.connect(
+            lambda current, _prev: self._on_result_row_selected(
+                self._results_table.row(current) if current else -1
+            )
+        )
         results_left_layout.addWidget(self._results_table)
         results_splitter.addWidget(results_left)
 
@@ -7165,13 +7320,14 @@ class CVEScannerWindow(QMainWindow):
         )
         detail_layout.addWidget(detail_header)
 
-        self._detail_panel = QTextEdit()
+        self._detail_panel = QTextBrowser()
         self._detail_panel.setReadOnly(True)
         self._detail_panel.setStyleSheet(
-            f"QTextEdit {{ background:{C.BG}; color:{C.FG}; border:1px solid {C.BORDER}; "
+            f"QTextBrowser {{ background:{C.BG}; color:{C.FG}; border:1px solid {C.BORDER}; "
             f"border-radius:6px; padding:10px; font-size:12px; }}"
         )
         self._detail_panel.setPlaceholderText("Select a CVE from the table to see details…")
+        self._detail_panel.setOpenExternalLinks(True)
         detail_layout.addWidget(self._detail_panel)
         results_splitter.addWidget(detail_widget)
         results_splitter.setSizes([520, 380])
@@ -7364,6 +7520,23 @@ class CVEScannerWindow(QMainWindow):
         act_kev_check.triggered.connect(self._check_kev_now)
         settings_menu.addAction(act_kev_check)
 
+        act_tags = QAction("Manage Software Tags…", self)
+        act_tags.setToolTip("Assign tags to software items (e.g. internet-facing, critical) to influence risk scoring")
+        act_tags.triggered.connect(self._manage_tags)
+        settings_menu.addAction(act_tags)
+
+        settings_menu.addSeparator()
+
+        act_update_settings = QAction("Update Settings…", self)
+        act_update_settings.setToolTip("Configure your GitHub repository for update checking")
+        act_update_settings.triggered.connect(self._update_settings)
+        settings_menu.addAction(act_update_settings)
+
+        act_check_update = QAction(f"Check for Updates  (v{DRAUGR_VERSION})", self)
+        act_check_update.setToolTip("Check your GitHub repository for a newer release of Draugr")
+        act_check_update.triggered.connect(self._check_for_update_manual)
+        settings_menu.addAction(act_check_update)
+
     # --------------------------------------------------------------
     # Helper slots
     # --------------------------------------------------------------
@@ -7394,13 +7567,23 @@ class CVEScannerWindow(QMainWindow):
         self.scanning = False
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
         self.scan_btn.setText("▶   Start Scan")
-        self.worker._write_logs()
-        # Populate results browser from the worker's completed rows
-        if hasattr(self.worker, '_completed_rows'):
-            self._scan_rows = self.worker._completed_rows
+        try:
+            self.worker._write_logs()
+        except Exception:
+            pass
+        # Populate results browser — guard against cancelled/errored scans
+        completed_rows = getattr(self.worker, '_completed_rows', None)
+        if completed_rows:
+            self._scan_rows = completed_rows
             self._populate_results_table(self._scan_rows)
-            self.tab_widget.setCurrentIndex(1)   # switch to Results Browser
+            import datetime as _dt
+            self._results_source_label.setText(
+                f"Live scan — {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                f"— {len(self._scan_rows)} finding(s)"
+            )
+            self.tab_widget.setCurrentIndex(1)
         self.worker = None
 
     def _start_scan(self, generate_executive_report: bool = False):
@@ -7455,6 +7638,7 @@ class CVEScannerWindow(QMainWindow):
         self.scanning = True
         self.scan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.skip_btn.setEnabled(True)
         self.scan_btn.setText("Scanning …")
         self.log.clear()
         self.progress_bar.setValue(0)
@@ -7482,6 +7666,7 @@ class CVEScannerWindow(QMainWindow):
             otx_api_key=otx_api_key,
             input_file=sw_path,
             system_id=extract_system_id(sw_path) if HAS_CACHE else "",
+            software_tags=self._tags,
         )
         self.worker.log_signal.connect(self._append_log) 
         self.worker.progress_signal.connect(self._update_progress)
@@ -7594,7 +7779,9 @@ class CVEScannerWindow(QMainWindow):
         h = html.escape
         lines = [
             f'<div style="font-family:Segoe UI,sans-serif;font-size:12px;color:{C.FG};">',
-            f'<h2 style="color:{sev_color};margin:0 0 4px 0;font-size:16px;">{h(cid)}</h2>',
+            f'<h2 style="color:{sev_color};margin:0 0 4px 0;font-size:16px;">'
+            f'<a href="{h(nvd_url)}" style="color:{sev_color};text-decoration:none;">'
+            f'{h(cid)}</a></h2>',
             f'<div style="color:{C.FG_DIM};font-size:10px;margin-bottom:10px;">'
             f'CVSS {score} ({sev}) &nbsp;|&nbsp; Risk Score: {rs} &nbsp;|&nbsp; EPSS: {epss}</div>',
         ]
@@ -7703,10 +7890,78 @@ class CVEScannerWindow(QMainWindow):
                 )
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Load CSV into Results Browser
+    # ------------------------------------------------------------------
+    def _load_csv_into_browser(self) -> None:
+        """Load a previously saved Draugr scan CSV into the Results Browser."""
+        if not HAS_DIFF:
+            # load_scan_csv lives in draugr_diff — fall back to built-in csv if missing
+            import csv as _csv
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Open Draugr Scan CSV", "", "CSV files (*.csv);;All files (*)"
+            )
+            if not path:
+                return
+            try:
+                rows = []
+                with open(path, newline="", encoding="utf-8-sig") as f:
+                    reader = _csv.DictReader(f)
+                    for row in reader:
+                        rows.append(dict(row))
+            except Exception as e:
+                QMessageBox.critical(self, "Load Error", f"Could not read CSV:\n{e}")
+                return
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Open Draugr Scan CSV", "", "CSV files (*.csv);;All files (*)"
+            )
+            if not path:
+                return
+            try:
+                rows = load_scan_csv(path)
+            except Exception as e:
+                QMessageBox.critical(self, "Load Error", f"Could not read CSV:\n{e}")
+                return
+
+        if not rows:
+            QMessageBox.warning(self, "Empty File", "No data found in the selected CSV.")
+            return
+
+        self._scan_rows = rows
+        self._populate_results_table(self._scan_rows)
+
+        # Update source label
+        import datetime as _dt
+        filename = Path(path).name
+        mod_time = _dt.datetime.fromtimestamp(Path(path).stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        self._results_source_label.setText(
+            f"{filename}  —  {mod_time}  —  {len(rows)} finding(s)"
+        )
+        self.tab_widget.setCurrentIndex(1)
+        self._append_log(
+            f"📂 Loaded {len(rows)} findings from {filename}", "ok"
+        )
+
+    # ------------------------------------------------------------------
+    # Stop / Skip scan
+    # ------------------------------------------------------------------
+    def _stop_scan(self) -> None:
         if self.worker:
             self._append_log("Stop requested ...", "info")
             self.worker.requestInterruption()
             self.stop_btn.setEnabled(False)
+            self.skip_btn.setEnabled(False)
+
+    def _skip_current_software(self) -> None:
+        """Signal the worker to abandon the current software item and move to the next."""
+        if self.worker and self.scanning:
+            self.worker._skip_current = True
+            self._append_log(
+                "⏭ Skip requested — current item will be skipped after the active network call completes.",
+                "warn",
+            )
 
     # ------------------------------------------------------------------
     # Diff / Compare Scans
@@ -8555,7 +8810,6 @@ class CVEScannerWindow(QMainWindow):
             return
         try:
             self._append_log("🔄 Fetching live CISA KEV feed…", "info")
-            from draugr_cache import _default_cache_dir
             live_kev = fetch_kev_online()
             if not live_kev:
                 QMessageBox.warning(self, "KEV Check", "Could not fetch the live KEV feed.")
@@ -8584,6 +8838,213 @@ class CVEScannerWindow(QMainWindow):
         except Exception as e:
             self._append_log(f"KEV check error: {e}", "error")
             QMessageBox.critical(self, "KEV Check Error", str(e))
+
+
+    # ------------------------------------------------------------------
+    # Update settings and manual update check
+    # ------------------------------------------------------------------
+    def _update_settings(self) -> None:
+        """Configure the GitHub repository used for update checks."""
+        from PyQt6.QtWidgets import QDialog
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Update Settings")
+        dlg.setFixedSize(460, 200)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            f"Current version: <b>v{DRAUGR_VERSION}</b><br><br>"
+            "Enter your GitHub repository in the format <b>owner/repo</b> "
+            "(e.g. <code>jsmith/draugr</code>).<br>"
+            "Draugr will check this repository's releases for newer versions."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{C.FG_DIM}; font-size:11px;")
+        info.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(info)
+
+        field_row = QHBoxLayout()
+        lbl = QLabel("GitHub Repo:")
+        lbl.setStyleSheet(f"color:{C.FG_DIM}; font-size:12px;")
+        lbl.setFixedWidth(110)
+        inp = QLineEdit(_GITHUB_REPO)
+        inp.setPlaceholderText("owner/repo  e.g. jsmith/draugr")
+        inp.setStyleSheet(
+            f"QLineEdit {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; padding:5px 8px; }}"
+        )
+        field_row.addWidget(lbl)
+        field_row.addWidget(inp, 1)
+        layout.addLayout(field_row)
+
+        btn_s = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                 f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 14px; }}"
+                 f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        def _save():
+            repo = inp.text().strip()
+            # Basic validation — must be "owner/repo" format
+            if repo and "/" not in repo:
+                QMessageBox.warning(dlg, "Invalid Format",
+                    "Please enter the repository in 'owner/repo' format.")
+                return
+            _save_github_repo(repo)
+            self._append_log(
+                f"Update repo set to: {repo or '(cleared)'}", "ok"
+            )
+            dlg.accept()
+
+        save_btn = QPushButton("Save")
+        save_btn.setStyleSheet(btn_s)
+        save_btn.clicked.connect(_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(btn_s)
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        dlg.exec()
+
+    def _check_for_update_manual(self) -> None:
+        """Manually trigger an update check against the configured GitHub repo."""
+        repo = _GITHUB_REPO or _load_github_repo()
+        if not repo:
+            reply = QMessageBox.question(
+                self, "No Repository Configured",
+                "No GitHub repository is configured for update checks.\n\n"
+                "Would you like to configure one now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._update_settings()
+            return
+
+        self._append_log(f"Checking for updates from github.com/{repo}…", "info")
+        try:
+            update = check_for_update()
+            if update:
+                reply = QMessageBox.question(
+                    self,
+                    f"Update Available — v{update['version']}",
+                    f"A newer version of Draugr is available:\n\n"
+                    f"  Current:  v{DRAUGR_VERSION}\n"
+                    f"  Latest:   v{update['version']}\n\n"
+                    f"Would you like to open the release page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    QDesktopServices.openUrl(
+                        __import__("PyQt6.QtCore", fromlist=["QUrl"]).QUrl(update["url"])
+                    )
+                self._append_log(
+                    f"Update available: v{update['version']} — {update['url']}", "warn"
+                )
+            else:
+                QMessageBox.information(
+                    self, "Up to Date",
+                    f"Draugr v{DRAUGR_VERSION} is the latest version."
+                )
+                self._append_log(f"✓ Draugr v{DRAUGR_VERSION} is up to date.", "ok")
+        except Exception as e:
+            QMessageBox.warning(self, "Update Check Failed",
+                f"Could not reach GitHub:\n{e}")
+            self._append_log(f"Update check failed: {e}", "warn")
+    def _manage_tags(self) -> None:
+        """
+        Assign persistent tags to software names.
+        Tags flow into the Tags column of the CSV and can be read
+        by plugins (score_modifier, enrich_row) and reports.
+        Built-in recognised tags: internet-facing, critical, contractor,
+        legacy, ot-connected, test-only, accepted-risk.
+        Custom tags are also supported.
+        """
+        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Software Tag Manager")
+        dlg.setMinimumSize(600, 420)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "Assign tags to software items. Tags are matched by name (case-insensitive) "
+            "and written to the Tags column of every scan CSV.\n"
+            "Recognised tags: internet-facing · critical · contractor · legacy · "
+            "ot-connected · test-only · accepted-risk  (custom tags also allowed)"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{C.FG_DIM}; font-size:11px;")
+        layout.addWidget(info)
+
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Software Name", "Tags (comma-separated)"])
+        table.setStyleSheet(
+            f"QTableWidget {{ background:{C.BG_CARD}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; gridline-color:{C.BORDER}; }}"
+            f"QHeaderView::section {{ background:{C.BG_INPUT}; color:{C.FG_DIM}; "
+            f"border:1px solid {C.BORDER}; padding:4px; }}"
+        )
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+
+        # Populate from current tags
+        for sw_name, tags in sorted(self._tags.items()):
+            ri = table.rowCount()
+            table.insertRow(ri)
+            table.setItem(ri, 0, QTableWidgetItem(sw_name))
+            table.setItem(ri, 1, QTableWidgetItem(tags))
+        layout.addWidget(table)
+
+        btn_s = (f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+                 f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 12px; }}"
+                 f"QPushButton:hover {{ background:{C.BG_HOVER}; }}")
+        btn_layout = QHBoxLayout()
+
+        def _add_row():
+            ri = table.rowCount()
+            table.insertRow(ri)
+            table.setItem(ri, 0, QTableWidgetItem(""))
+            table.setItem(ri, 1, QTableWidgetItem(""))
+            table.editItem(table.item(ri, 0))
+
+        def _delete_row():
+            rows = sorted({i.row() for i in table.selectedItems()}, reverse=True)
+            for ri in rows:
+                table.removeRow(ri)
+
+        def _save():
+            self._tags = {}
+            for ri in range(table.rowCount()):
+                name_item = table.item(ri, 0)
+                tags_item = table.item(ri, 1)
+                sw_name = (name_item.text() if name_item else "").strip().lower()
+                tags    = (tags_item.text() if tags_item else "").strip()
+                if sw_name and tags:
+                    self._tags[sw_name] = tags
+            self._save_tags()
+            self._append_log(f"Software tags saved: {len(self._tags)} entries", "ok")
+            dlg.accept()
+
+        for label, slot in [("Add Row", _add_row), ("Delete Selected", _delete_row)]:
+            btn = QPushButton(label)
+            btn.setStyleSheet(btn_s)
+            btn.clicked.connect(slot)
+            btn_layout.addWidget(btn)
+
+        btn_layout.addStretch()
+        save_btn = QPushButton("Save")
+        save_btn.setStyleSheet(btn_s)
+        save_btn.clicked.connect(_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(btn_s)
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        dlg.exec()
 
 
 # ----------------------------------------------------------------------
