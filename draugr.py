@@ -216,10 +216,10 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
-DRAUGR_VERSION = "2.0.2"
+DRAUGR_VERSION = "2.1.0"
 # GitHub repository for update checks — format: "owner/repo"
 # Configurable via Settings → Update Settings. Stored in prefs.json.
-_GITHUB_REPO: str = ""
+_GITHUB_REPO: str = "https://github.com/Comrob2018/Draugr/tree/main"
 
 
 def _load_github_repo() -> str:
@@ -5179,16 +5179,51 @@ class DraugrSplash(QSplashScreen):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
 
     def _build_pixmap(self) -> QPixmap:
-        img_path = Path(__file__).with_name("draugr_splash.png")
-        if img_path.exists():
-            pm = QPixmap(str(img_path))
-            if not pm.isNull():
-                scaled = pm.scaled(
-                    900, 520,
-                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                return self._overlay_text(scaled)
+        # ── 1. Try GitHub raw URL ────────────────────────────────────
+        try:
+            from draugr_cache import _default_cache_dir
+            import json as _j
+            p = _default_cache_dir() / "prefs.json"
+            if p.exists() and requests is not None:
+                prefs = _j.loads(p.read_text(encoding="utf-8"))
+                repo  = str(prefs.get("github_repo", "") or "").strip()
+                if repo:
+                    import re as _re
+                    repo = _re.sub(r"^https?://github\.com/", "", repo).strip("/")
+                    url  = (
+                        f"https://raw.githubusercontent.com/{repo}/main/"
+                        "resources/draugr_splash.png"
+                    )
+                    resp = requests.get(url, timeout=5)
+                    if resp.status_code == 200:
+                        pm = QPixmap()
+                        pm.loadFromData(resp.content)
+                        if not pm.isNull():
+                            scaled = pm.scaled(
+                                900, 520,
+                                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                Qt.TransformationMode.SmoothTransformation,
+                            )
+                            return self._overlay_text(scaled)
+        except Exception:
+            pass
+
+        # ── 2. Local file ────────────────────────────────────────────
+        for candidate in [
+            Path(__file__).parent / "resources" / "draugr_splash.png",
+            Path(__file__).with_name("draugr_splash.png"),
+        ]:
+            if candidate.exists():
+                pm = QPixmap(str(candidate))
+                if not pm.isNull():
+                    scaled = pm.scaled(
+                        900, 520,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    return self._overlay_text(scaled)
+
+        # ── 3. Procedural fallback ───────────────────────────────────
         return self._paint_procedural()
 
     def _paint_procedural(self) -> QPixmap:
