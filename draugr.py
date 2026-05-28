@@ -127,6 +127,44 @@ except ImportError:
     def check_alerts(*a, **kw) -> list: return []                                       # type: ignore
     def dispatch_alerts(*a, **kw) -> dict: return {"email": 0, "webhook": 0}            # type: ignore
 
+try:
+    from draugr_remediation import (
+        enrich_rows_with_remediation,
+        remediation_summary,
+        remediation_report_section,
+        upsert_item as _rem_upsert,
+        suggest_due_date as _rem_suggest_due,
+        STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_MITIGATED,
+        STATUS_ACCEPTED_RISK, STATUS_RESOLVED, ALL_STATUSES,
+    )
+    HAS_REMEDIATION = True
+except ImportError:
+    HAS_REMEDIATION = False
+    def enrich_rows_with_remediation(db, rows): return rows                             # type: ignore
+    def remediation_summary(db): return {}                                              # type: ignore
+    def remediation_report_section(db): return ""                                       # type: ignore
+
+# draugr_reports is imported here so _THREAT_INTEL_CACHE is bound before any
+# function that writes to it (query_otx_for_cves) is defined below.
+# The cache dict is declared in draugr_reports to avoid a circular import.
+try:
+    from draugr_reports import (
+        build_executive_report_markdown,
+        build_defensive_report,
+        build_redteam_report,
+        _THREAT_INTEL_CACHE,
+    )
+    HAS_REPORTS = True
+except ImportError:
+    HAS_REPORTS = False
+    _THREAT_INTEL_CACHE: Dict[str, Dict[str, Any]] = {}                                # type: ignore
+    def build_executive_report_markdown(rows, report_title="", otx_results=None) -> str:  # type: ignore
+        return "# Report generation unavailable\n\ndraugr_reports.py could not be imported.\n"
+    def build_defensive_report(rows, report_title="") -> str:                             # type: ignore
+        return "<html><body><p>draugr_reports.py could not be imported.</p></body></html>"
+    def build_redteam_report(rows, report_title="", otx_results=None) -> str:             # type: ignore
+        return "<html><body><p>draugr_reports.py could not be imported.</p></body></html>"
+
 
 # ----------------------------------------------------------------------
 # Third‑party imports
@@ -1609,16 +1647,6 @@ def query_otx_for_cves(
     return scores
 
 
-# ----------------------------------------------------------------------
-# Enrichment cache — declared in draugr_reports.py so both modules share
-# the same dict object. Populated here during scan; read by report builders.
-# ----------------------------------------------------------------------
-try:
-    from draugr_reports import _THREAT_INTEL_CACHE
-except ImportError:
-    _THREAT_INTEL_CACHE: Dict[str, Dict[str, Any]] = {}  # type: ignore
-
-
 def _get_cached_intel(cve_id: str) -> Dict[str, Any]:
     """Return combined CIRCL + GreyNoise data for a CVE, using cache."""
     if cve_id not in _THREAT_INTEL_CACHE:
@@ -2115,30 +2143,6 @@ def _plural(count: int, singular: str, plural: str = "") -> str:
 
 
 # ----------------------------------------------------------------------
-# Executive Report helpers
-# ----------------------------------------------------------------------
-
-# ----------------------------------------------------------------------
-# Report generation (draugr_reports.py)
-# ----------------------------------------------------------------------
-try:
-    from draugr_reports import (
-        build_executive_report_markdown,
-        build_defensive_report,
-        build_redteam_report,
-    )
-    HAS_REPORTS = True
-except ImportError:
-    HAS_REPORTS = False
-    def build_executive_report_markdown(rows, report_title="", otx_results=None) -> str:  # type: ignore
-        return "# Report generation unavailable\n\ndraugr_reports.py could not be imported.\n"
-    def build_defensive_report(rows, report_title="") -> str:                             # type: ignore
-        return "<html><body><p>draugr_reports.py could not be imported.</p></body></html>"
-    def build_redteam_report(rows, report_title="", otx_results=None) -> str:             # type: ignore
-        return "<html><body><p>draugr_reports.py could not be imported.</p></body></html>"
-
-
-# ----------------------------------------------------------------------
 # Worker thread – performs the heavy lifting
 # ----------------------------------------------------------------------
 class ScanWorker(QThread):
@@ -2446,6 +2450,13 @@ class ScanWorker(QThread):
                 else:
                     other_count += 1
 
+                # ---- Threat intel cache — ensure this CVE has an entry ----
+                # query_otx_for_cves pre-populates the cache for the first 20 CVEs
+                # per software item. _get_cached_intel fills in any that were missed
+                # (e.g. CVEs beyond the first 20, or software with no OTX results).
+                if cid not in _THREAT_INTEL_CACHE:
+                    _get_cached_intel(cid)
+
                 # ---- Framework enrichment (unified pipeline) ----
                 cwe_ids = cve.get("cwe_ids", [])
                 self.status_signal.emit(
@@ -2713,6 +2724,16 @@ class ScanWorker(QThread):
             except Exception as e:
                 self._emit_log(f"⚠ Plugin on_scan_complete failed: {e}", "warn")
 
+        # ── Remediation enrichment ─────────────────────────────────────
+        # Annotate each row with its current remediation status, owner, and
+        # due date from the DB. Rows default to 'open' if no record exists.
+        if HAS_REMEDIATION and HAS_CACHE:
+            try:
+                db = _get_db()
+                all_rows = enrich_rows_with_remediation(db, all_rows)
+            except Exception as e:
+                self._emit_log(f"⚠ Remediation enrichment failed: {e}", "warn")
+
         # Make rows accessible to the GUI results browser
         self._completed_rows = all_rows
 
@@ -2757,6 +2778,11 @@ class ScanWorker(QThread):
             "ICS ATT&CK Techniques",
             "Tags",
             "NVD URL",
+            "Remediation Status",
+            "Remediation Owner",
+            "Remediation Due Date",
+            "Remediation Notes",
+            "Acceptance Expired",
         ]
         self.status_signal.emit("Writing CSV…")
         try:
