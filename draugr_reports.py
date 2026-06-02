@@ -596,7 +596,8 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     list-style: decimal;
 }}
 .toc ul > li {{
-    list-style: none;
+    list-style: disc;
+    margin-left: 4px;
 }}
 .toc li::before {{
     content: none;
@@ -1712,7 +1713,11 @@ def _format_cve_engineering(r: Dict[str, Any], sw_name: str) -> List[str]:
     block.append(f"| Draugr Risk Score | {rs} / 100 ({rl}) |")
     block.append(f"| EPSS (30-day exploitation probability) | {epss} |")
     block.append(f"| CISA KEV Listed | {'Yes — active exploitation confirmed' if kev_f else 'No'} |")
-    block.append(f"| Public Exploit Available | {'Yes — ' + (expl_src or 'see NVD') if expl_f else 'No'} |")
+    if expl_f:
+        src_lines = "<br>".join(expl_src.split("; ")) if expl_src else "see NVD"
+        block.append(f"| Public Exploit Available | Yes —<br>{src_lines} |")
+    else:
+        block.append("| Public Exploit Available | No |")
     block.append(f"| Version Confirmed | {conf if conf else 'Unverified — based on CPE product match'} |")
     block.append(f"| Published | {pub_date} |")
     sw_pub   = str(r.get("Publisher", "") or "")
@@ -1768,7 +1773,9 @@ def _format_cve_engineering(r: Dict[str, Any], sw_name: str) -> List[str]:
         if   "AC:L" in v: expl_conditions.append("**Attack Complexity: Low** — exploitation is straightforward and repeatable")
         elif "AC:H" in v: expl_conditions.append("**Attack Complexity: High** — exploitation requires specific conditions")
         if   "S:C"  in v: expl_conditions.append("**Scope: Changed** — can affect components beyond the vulnerable boundary")
-    if expl_f:   expl_conditions.append(f"**Public Exploit Code Exists** — {expl_src or 'check NVD and Vulners'}. Exploitation barrier is low.")
+    if expl_f:
+        src_lines = "\n  - ".join(expl_src.split("; ")) if expl_src else "check NVD and Vulners"
+        expl_conditions.append(f"**Public Exploit Code Exists** — exploitation barrier is low.\n  - {src_lines}")
     if kev_f:    expl_conditions.append("**CISA KEV Confirmed** — actively exploited by threat actors in real-world campaigns.")
     if gn_active:expl_conditions.append("**GreyNoise Active Signal** — exploitation or scanning attempts observed in the wild.")
     try:
@@ -2088,7 +2095,7 @@ def build_defensive_report(
         '<li><a href="#3-severity-distribution-and-risk-scoring">3. Severity Distribution and Risk Scoring</a></li>'
         '<li><a href="#4-vulnerability-chaining-and-attack-path-analysis">4. Vulnerability Chaining and Attack Path Analysis</a></li>'
         '<li><a href="#5-detailed-cve-analysis">5. Detailed CVE Analysis</a>'
-        f'<ol>{sw_toc_items}</ol></li>'
+        f'<ul style="margin-top:4px;padding-left:18px;">{sw_toc_items}</ul></li>'
         '<li><a href="#6-cwe-weakness-distribution">6. CWE Weakness Distribution</a></li>'
         '<li><a href="#7-mitre-attck-technique-coverage">7. MITRE ATT&amp;CK Technique Coverage</a></li>'
         '<li><a href="#8-kev-and-epss-priority-analysis">8. KEV / EPSS Priority Analysis</a></li>'
@@ -2832,7 +2839,8 @@ def _redteam_attack_chains(all_rows: List[Dict[str, Any]], otx_results: Optional
 
             lines.append(f"#### {cid}  [{flag_str}]")
             lines.append(f"- CVSS: {score} ({sev})  |  Risk Score: {rs}  |  EPSS: {epss:.3f}")
-            lines.append(f"- Exploit Sources: {src}")
+            for es in (src.split("; ") if src != "None identified" else ["None identified"]):
+                lines.append(f"- Exploit Source: {es.strip()}")
             lines.append(f"- Brief: {desc}")
             lines.append(f"- NVD: {r.get('NVD URL','')}")
             lines.append("")
@@ -3079,7 +3087,8 @@ def _redteam_exploit_inventory(all_rows: List[Dict[str, Any]]) -> str:
         src   = r.get("Exploit Sources","") or "NVD refs"
         rs    = r.get("Risk Score","")
         conf  = r.get("Version Confirmed","")
-        lines.append(f"| {cid} | {name} | {ver} | {cvss} | {epss} | {kev} | {src} | {rs} | {conf} |")
+        src_cell = "<br>".join(s.strip() for s in src.split(";") if s.strip())
+        lines.append(f"| {cid} | {name} | {ver} | {cvss} | {epss} | {kev} | {src_cell} | {rs} | {conf} |")
     return "\n".join(lines)
 
 
