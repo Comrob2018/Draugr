@@ -2153,7 +2153,7 @@ class ScanWorker(QThread):
     error_signal = pyqtSignal(str) 
 
     def __init__(self, software, kev_path, api_key, output_path, cpe_mapping_path="",
-                 show_medium=True, show_low=True, resources_dir="", executive_report_path="", comp_report_path="",
+                 show_medium=True, show_low=True, show_unverified=True, resources_dir="", executive_report_path="", comp_report_path="",
                  error_log_path="", scan_log_path="", write_logs=True,
                  defensive_report_path="", redteam_report_path="", otx_api_key="",
                  input_file="", system_id="", software_tags: Optional[Dict[str, str]] = None):
@@ -2165,6 +2165,7 @@ class ScanWorker(QThread):
         self.cpe_mapping_path = cpe_mapping_path
         self.show_medium = show_medium
         self.show_low = show_low
+        self.show_unverified = show_unverified
         self.resources_dir = resources_dir
         self.executive_report_path = executive_report_path
         self.comp_report_path = comp_report_path
@@ -2653,7 +2654,13 @@ class ScanWorker(QThread):
                     level,
                 )
                 _log_cve_list(confirmed_list, level)
-                _log_cve_list(unverified_list, level, tag="[unverified]")
+                if self.show_unverified:
+                    _log_cve_list(unverified_list, level, tag="[unverified]")
+                elif unverified_list:
+                    self._emit_log(
+                        f"    ({len(unverified_list)} unverified hidden — enable in log filters)",
+                        "dim",
+                    )
 
             # 4) Medium / Low / Unranked (gated by user preference)
             if medium_count and self.show_medium:
@@ -2670,7 +2677,13 @@ class ScanWorker(QThread):
                 detail_m = f" ({', '.join(parts_m)})" if parts_m else ""
                 self._emit_log(f" [!] {_plural(medium_count, 'MEDIUM CVE')}{detail_m}", "info")
                 _log_cve_list(m_cves_confirmed, "info")
-                _log_cve_list(m_cves_unverified, "info", tag="[unverified]")
+                if self.show_unverified:
+                    _log_cve_list(m_cves_unverified, "info", tag="[unverified]")
+                elif m_cves_unverified:
+                    self._emit_log(
+                        f"    ({len(m_cves_unverified)} unverified hidden — enable in log filters)",
+                        "dim",
+                    )
             elif medium_count:
                 self._emit_log(f" [!] {_plural(medium_count, 'MEDIUM CVE')} (hidden — enable in log filters)", "dim")
 
@@ -2688,7 +2701,13 @@ class ScanWorker(QThread):
                 detail_l = f" ({', '.join(parts_l)})" if parts_l else ""
                 self._emit_log(f" [i] {_plural(low_count, 'LOW CVE')}{detail_l}", "info")
                 _log_cve_list(l_cves_confirmed, "info")
-                _log_cve_list(l_cves_unverified, "info", tag="[unverified]")
+                if self.show_unverified:
+                    _log_cve_list(l_cves_unverified, "info", tag="[unverified]")
+                elif l_cves_unverified:
+                    self._emit_log(
+                        f"    ({len(l_cves_unverified)} unverified hidden — enable in log filters)",
+                        "dim",
+                    )
             elif low_count:
                 self._emit_log(f" [i] {_plural(low_count, 'LOW CVE')} (hidden — enable in log filters)", "dim")
 
@@ -3287,11 +3306,18 @@ class CVEScannerWindow(QMainWindow):
         self.chk_low.setStyleSheet(CHECKBOX_STYLE)
         filter_row.addWidget(self.chk_low)
 
+        self.chk_unverified = QCheckBox("Show Unverified")
+        self.chk_unverified.setChecked(True)
+        self.chk_unverified.setToolTip("Show CVEs where the version match could not be confirmed")
+        self.chk_unverified.setStyleSheet(CHECKBOX_STYLE)
+        filter_row.addWidget(self.chk_unverified)
+
         root.addLayout(filter_row)
         root.addSpacing(4)
 
         self.chk_medium.stateChanged.connect(self._update_show_medium)
         self.chk_low.stateChanged.connect(self._update_show_low)
+        self.chk_unverified.stateChanged.connect(self._update_show_unverified)
 
         # ── Tab widget: Scan Log | Results Browser ─────────────────────
         from PyQt6.QtWidgets import QTabWidget, QSplitter, QTableWidget, QTableWidgetItem
@@ -3481,6 +3507,11 @@ class CVEScannerWindow(QMainWindow):
         self.show_low = self.chk_low.isChecked()
         if self.worker is not None:
             self.worker.show_low = self.show_low
+    
+    def _update_show_unverified(self):
+        self.show_unverified = self.chk_unverified.isChecked()
+        if self.worker is not None:
+            self.worker.show_unverified = self.show_unverified
 
     # --------------------------------------------------------------
     # Menu bar
@@ -3768,6 +3799,7 @@ class CVEScannerWindow(QMainWindow):
             software, kev_path, api_key, csv_path, cpe_path,
             show_medium=self.chk_medium.isChecked(),
             show_low=self.chk_low.isChecked(),
+            show_unverified=self.chk_unverified.isChecked(),
             resources_dir=resources_dir,
             executive_report_path=executive_report_path,
             comp_report_path=comp_report_path,
@@ -4717,6 +4749,7 @@ class CVEScannerWindow(QMainWindow):
                 "api_key":       "",    # never save API keys in profiles
                 "show_medium":   self.chk_medium.isChecked(),
                 "show_low":      self.chk_low.isChecked(),
+                "show_unverified": self.chk_unverified.isChecked(),
             }
             self._save_profiles()
             lw.clear()
@@ -4742,6 +4775,7 @@ class CVEScannerWindow(QMainWindow):
                 self.resources_row.setText(p["resources_dir"])
             self.chk_medium.setChecked(p.get("show_medium", True))
             self.chk_low.setChecked(p.get("show_low", False))
+            self.chk_unverified.setChecked(p.get("show_unverified", True))
             self._append_log(f"Profile loaded: {name}", "ok")
             dlg.accept()
 
