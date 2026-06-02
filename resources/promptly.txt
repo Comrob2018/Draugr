@@ -1,45 +1,63 @@
-Let me trace the full path where duplicates can enter.
+Let me find every place exploit sources are rendered in the reports.
 
-Now I can see exactly where duplicates come from. There are two overlap scenarios:
+Good — I have all four locations. Now I’ll write the changes.
 
-	1.	NVD URLs vs Vulners URLs — NVD references often link to exploit-db.com, packetstormsecurity.com etc. Vulners returns those same sites as href values. The same URL ends up in both nvd_urls and vulners_exploits, so it gets added twice.
-	2.	Vulners source names vs Vulners URLs — the current code adds the source field (e.g. "exploitdb") from Vulners but not the url. If a future change adds URLs from Vulners too, the domain of the URL and the source name would both appear.
+The markdown table on line 3082 is a special case — pipe characters inside a table cell break the table layout, so URLs there need to be separated with <br> tags which markdown-to-HTML renderers handle correctly inside table cells.
 
-The fix is one line — deduplicate exploit_sources while preserving order before writing it to the row. Using dict.fromkeys() is the idiomatic way to do this in Python (preserves insertion order, O(n)):
+Change 1 — Per-CVE detail table (build_cve_detail_block, line ~1715)
 
 Before:
 
-                exploit_sources: List[str] = []
-                if has_nvd_exploit:
-                    nvd_urls = cve.get("exploit_urls", [])
-                    if nvd_urls:
-                        exploit_sources.extend(nvd_urls)
-                    else:
-                        exploit_sources.append("NVD refs")
-                if vulners_exploits:
-                    sources = set(e.get("source", "") for e in vulners_exploits)
-                    exploit_sources.extend(s for s in sources if s)
+    block.append(f"| Public Exploit Available | {'Yes — ' + (expl_src or 'see NVD') if expl_f else 'No'} |")
 
 
 After:
 
-                exploit_sources: List[str] = []
-                if has_nvd_exploit:
-                    nvd_urls = cve.get("exploit_urls", [])
-                    if nvd_urls:
-                        exploit_sources.extend(nvd_urls)
-                    else:
-                        exploit_sources.append("NVD refs")
-                if vulners_exploits:
-                    for e in vulners_exploits:
-                        url = e.get("url", "").strip()
-                        src = e.get("source", "").strip()
-                        # Prefer the direct URL; fall back to source name
-                        exploit_sources.append(url if url else src)
-                # Deduplicate preserving insertion order
-                exploit_sources = list(dict.fromkeys(s for s in exploit_sources if s))
+    if expl_f:
+        src_lines = "<br>".join(expl_src.split("; ")) if expl_src else "see NVD"
+        block.append(f"| Public Exploit Available | Yes —<br>{src_lines} |")
+    else:
+        block.append("| Public Exploit Available | No |")
 
 
-This also improves the Vulners side at the same time — instead of just storing the source type name ("exploitdb"), it now stores the actual URL from Vulners (href/vhref) when one exists, falling back to the source name only if there’s no URL. That means you get real clickable links from Vulners too, not just from NVD.
+Change 2 — Exploit conditions narrative (build_cve_detail_block, line ~1771)
 
-Want me to apply it?
+Before:
+
+    if expl_f:   expl_conditions.append(f"**Public Exploit Code Exists** — {expl_src or 'check NVD and Vulners'}. Exploitation barrier is low.")
+
+
+After:
+
+    if expl_f:
+        src_lines = "\n  - ".join(expl_src.split("; ")) if expl_src else "check NVD and Vulners"
+        expl_conditions.append(f"**Public Exploit Code Exists** — exploitation barrier is low.\n  - {src_lines}")
+
+
+Change 3 — Red team per-CVE block (build_redteam_report, line ~2835)
+
+Before:
+
+            lines.append(f"- Exploit Sources: {src}")
+
+
+After:
+
+            for es in (src.split("; ") if src != "None identified" else ["None identified"]):
+                lines.append(f"- Exploit Source: {es.strip()}")
+
+
+Change 4 — Exploit sources table (_build_exploit_sources_section, line ~3082)
+
+Before:
+
+        lines.append(f"| {cid} | {name} | {ver} | {cvss} | {epss} | {kev} | {src} | {rs} | {conf} |")
+
+
+After:
+
+        src_cell = "<br>".join(s.strip() for s in src.split(";") if s.strip())
+        lines.append(f"| {cid} | {name} | {ver} | {cvss} | {epss} | {kev} | {src_cell} | {rs} | {conf} |")
+
+
+Want me to apply all four?
