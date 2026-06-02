@@ -1,12 +1,99 @@
-  File "c:\Users\P09816\OneDrive - NGC\Desktop\Coding\draugr\draugr.py", line 5850, in <module>
-    main()
-    ~~~~^^
-  File "c:\Users\P09816\OneDrive - NGC\Desktop\Coding\draugr\draugr.py", line 5839, in main
-    window = CVEScannerWindow()
-  File "c:\Users\P09816\OneDrive - NGC\Desktop\Coding\draugr\draugr.py", line 3048, in __init__
-    self._build_ui()
-    ~~~~~~~~~~~~~~^^
-  File "c:\Users\P09816\OneDrive - NGC\Desktop\Coding\draugr\draugr.py", line 3379, in _build_ui
-    log_clear_btn.clicked.connect(self.log.clear)
-                                  ^^^^^^^^
-AttributeError: 'CVEScannerWindow' object has no attribute 'log'
+Let me look at the relevant report-building code.
+
+Found both issues. defensive_report_path is the same file as comp_report_path, so it shows up twice in both the log and the status bar. Now the TOC issue:
+
+I have both issues clearly. Now I’ll fix them.
+
+Issue 1 — defensive_report_path is the same file as comp_report_path (assigned on line 3949), so it shows up twice in the written list and in report_names. The fix is to skip it in both places since it’s not a separate output.
+
+Issue 2 — The <ol> of software items under section 5 is placed directly after the </a> with no extra indentation in the CSS. The <ol> needs margin-top: 4px; padding-left: 20px; and the sw_toc_items need to be <ul> (disc bullets, visually subordinate) rather than <ol> (which continues the parent numbering).
+
+Fix 1 — Status bar and log showing duplicate Technical Report
+
+File: draugr.py
+
+Before:
+
+                written = [
+                    f"✅ Executive Report → {self.executive_report_path}",
+                    f"✅ Technical Report → {self.comp_report_path}",
+                ]
+                if self.defensive_report_path:
+                    written.append(f"✅ Defensive Report → {self.defensive_report_path}")
+                if self.redteam_report_path:
+                    written.append(f"✅ Red Team Report  → {self.redteam_report_path}")
+                self._emit_log("\n".join(written), "ok")
+
+            if self.executive_report_path:
+                report_names = " + ".join(filter(None, [
+                    os.path.basename(self.output_path),
+                    os.path.basename(self.executive_report_path),
+                    os.path.basename(self.comp_report_path),
+                    os.path.basename(self.defensive_report_path) if self.defensive_report_path else "",
+                    os.path.basename(self.redteam_report_path) if self.redteam_report_path else "",
+                ]))
+
+
+After:
+
+                written = [
+                    f"✅ Executive Report → {self.executive_report_path}",
+                    f"✅ Technical Report → {self.comp_report_path}",
+                ]
+                if self.redteam_report_path:
+                    written.append(f"✅ Red Team Report  → {self.redteam_report_path}")
+                self._emit_log("\n".join(written), "ok")
+
+            if self.executive_report_path:
+                report_names = " + ".join(filter(None, [
+                    os.path.basename(self.output_path),
+                    os.path.basename(self.executive_report_path),
+                    os.path.basename(self.comp_report_path),
+                    os.path.basename(self.redteam_report_path) if self.redteam_report_path else "",
+                ]))
+
+
+The defensive_report_path check is removed from both the log list and report_names since it’s always the same file as comp_report_path.
+
+Fix 2 — Section 5 software listing not indented in TOC
+
+File: draugr_reports.py
+
+Two changes needed — the HTML structure and the CSS.
+
+Step 2a — Change the <ol> to a <ul> in the TOC HTML (line ~2091):
+
+Before:
+
+        '<li><a href="#5-detailed-cve-analysis">5. Detailed CVE Analysis</a>'
+        f'<ol>{sw_toc_items}</ol></li>'
+
+
+After:
+
+        '<li><a href="#5-detailed-cve-analysis">5. Detailed CVE Analysis</a>'
+        f'<ul style="margin-top:4px;padding-left:18px;">{sw_toc_items}</ul></li>'
+
+
+Using <ul> makes these sub-items visually subordinate to the numbered list, and the inline style ensures the indent is applied regardless of any CSS specificity issues.
+
+Step 2b — Fix the CSS so nested ul inside .toc li gets proper indent (line ~598):
+
+Before:
+
+.toc ul > li {{
+    list-style: none;
+}}
+
+
+After:
+
+.toc ul > li {{
+    list-style: disc;
+    margin-left: 4px;
+}}
+
+
+Giving the sub-items list-style: disc (bullet) distinguishes them visually from the numbered top-level entries, and margin-left adds the extra indent push.
+
+Want me to apply both fixes to the files and produce the updated versions?
