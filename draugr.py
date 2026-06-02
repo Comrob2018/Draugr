@@ -13,7 +13,7 @@ Usage:
    https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
 3. Optionally create a cpe_mappings.json file (see CPE MAPPING section below).
 4. Run:
-   python cve_scanner.py
+   python draugr.py
 
 CPE MAPPING FILE (optional — cpe_mappings.json):
     A JSON object that pins product names to exact CPE vendor:product pairs.
