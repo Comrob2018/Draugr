@@ -1,33 +1,210 @@
-Just the one block in _render_cve_detail. Here’s the exact before and after:
+Let me read everything I need before writing a single line.
 
-Before:
+I have everything I need. Here are all the changes:
 
-        if expl:
-            lines.append(f'<div style="background:#2a1000;color:{C.ORANGE};padding:4px 8px;'
-                         f'border-radius:4px;margin-bottom:6px;font-size:11px;font-weight:700;">'
-                         f'🔴 PUBLIC EXPLOIT — {h(expl_src or "See NVD")}</div>')
+The full before and after
+
+Before — the entire two-label header block:
+
+        header = QLabel("DRAUGR")
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header.setStyleSheet(
+            f"color: {C.ACCENT}; font-size: 64px; font-weight: 700; letter-spacing: 4px;"
+        )
+        root.addWidget(header)
+
+        subtitle = QLabel("THREAT    INTELLIGENCE    SYSTEM") #  ·  
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 12px; letter-spacing: 3px; padding-bottom: 16px;"
+        )
+        root.addWidget(subtitle)
+
+
+After — replace the entire block above with this:
+
+        # ── Header banner ─────────────────────────────────────────────
+        header_frame = QFrame()
+        header_frame.setStyleSheet(
+            f"QFrame {{ background: {C.BG_CARD}; border: none; "
+            f"border-bottom: 1px solid {C.BORDER}; border-radius: 0px; }}"
+        )
+        header_outer = QHBoxLayout(header_frame)
+        header_outer.setContentsMargins(0, 0, 0, 0)
+        header_outer.setSpacing(0)
+
+        # Left accent bar (suggestion 2)
+        accent_bar = QFrame()
+        accent_bar.setFixedWidth(4)
+        accent_bar.setStyleSheet(f"background: {C.ACCENT}; border: none;")
+        header_outer.addWidget(accent_bar)
+
+        # Inner layout: logo left, meta right
+        header_inner = QHBoxLayout()
+        header_inner.setContentsMargins(16, 10, 16, 10)
+        header_inner.setSpacing(0)
+
+        # Logo + subtitle stacked (suggestions 1 & 3)
+        logo_col = QVBoxLayout()
+        logo_col.setSpacing(1)
+        logo_label = QLabel("DRAUGR")
+        logo_label.setStyleSheet(
+            f"color: {C.ACCENT}; font-size: 38px; font-weight: 700; "
+            f"letter-spacing: 4px; background: transparent; border: none;"
+        )
+        sub_label = QLabel("THREAT  INTELLIGENCE  SYSTEM")
+        sub_label.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 11px; letter-spacing: 3px; "
+            f"background: transparent; border: none;"
+        )
+        logo_col.addWidget(logo_label)
+        logo_col.addWidget(sub_label)
+        header_inner.addLayout(logo_col)
+        header_inner.addStretch()
+
+        # Right meta column: version, last scan, CVE count (suggestions 1 & 4)
+        meta_col = QVBoxLayout()
+        meta_col.setSpacing(2)
+        meta_col.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        ver_label = QLabel(f"v{DRAUGR_VERSION}")
+        ver_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        ver_label.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 11px; font-weight: 600; "
+            f"background: transparent; border: none;"
+        )
+
+        self._header_scan_label = QLabel("No scan yet")
+        self._header_scan_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._header_scan_label.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+
+        # Status dot (suggestion 6)
+        self._status_dot = QLabel("●  IDLE")
+        self._status_dot.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._status_dot.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+        self._dot_blink_state = False
+        self._dot_timer = QTimer(self)
+        self._dot_timer.setInterval(600)
+        self._dot_timer.timeout.connect(self._blink_status_dot)
+
+        meta_col.addWidget(ver_label)
+        meta_col.addWidget(self._header_scan_label)
+        meta_col.addWidget(self._status_dot)
+        header_inner.addLayout(meta_col)
+
+        header_outer.addLayout(header_inner)
+        root.addWidget(header_frame)
+        root.addSpacing(12)
+
+
+Change 2 — Add _blink_status_dot slot
+
+Add this alongside the other small slots (near _update_show_medium):
+
+    def _blink_status_dot(self):
+        self._dot_blink_state = not self._dot_blink_state
+        color = C.RED if self._dot_blink_state else C.FG_DIM
+        self._status_dot.setStyleSheet(
+            f"color: {color}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+
+
+Change 3 — Start the dot timer and update header in _start_scan
+
+Find this block in _start_scan:
+
+        self.scanning = True
+        self.scan_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.skip_btn.setEnabled(True)
+        self.scan_btn.setText("Scanning …")
+        self.log.clear()
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("")
+        self._scan_progress_text = ""
+        self._scan_current_item  = ""
+        self._update_progress_bar_color("normal")
 
 
 After:
 
-        if expl:
-            if expl_src:
-                src_parts = [s.strip() for s in str(expl_src).split(";") if s.strip()]
-                src_html = "<br>".join(
-                    f'<a href="{h(s)}" style="color:{C.ORANGE};font-weight:400;">{h(s)}</a>'
-                    if s.startswith("http") else h(s)
-                    for s in src_parts
-                ) if src_parts else h("See NVD")
-            else:
-                src_html = "See NVD"
-            lines.append(f'<div style="background:#2a1000;color:{C.ORANGE};padding:6px 8px;'
-                         f'border-radius:4px;margin-bottom:6px;font-size:11px;font-weight:700;">'
-                         f'🔴 PUBLIC EXPLOIT<br>'
-                         f'<span style="font-weight:400;line-height:1.8;">{src_html}</span></div>')
+        self.scanning = True
+        self.scan_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.skip_btn.setEnabled(True)
+        self.scan_btn.setText("Scanning …")
+        self.log.clear()
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("")
+        self._scan_progress_text = ""
+        self._scan_current_item  = ""
+        self._update_progress_bar_color("normal")
+        self._status_dot.setText("●  SCANNING")
+        self._dot_timer.start()
 
 
-The three things that changed:
+Change 4 — Stop the dot timer and update header in _scan_finished
 
-	1.	expl_src is split on ";" into individual entries and each one is put on its own line via <br>
-	2.	Any entry starting with http is wrapped in an <a> tag so it becomes a clickable link
-	3.	The label changed from 🔴 PUBLIC EXPLOIT — <sources on one line> to 🔴 PUBLIC EXPLOIT on its own line with the sources beneath it in normal weight text
+Find this at the top of _scan_finished:
+
+        self._append_log("Scan Finished.", "info")
+        self.scanning = False
+        self.scan_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
+
+
+After:
+
+        self._append_log("Scan Finished.", "info")
+        self.scanning = False
+        self.scan_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.skip_btn.setEnabled(False)
+        self._dot_timer.stop()
+        self._status_dot.setText("●  IDLE")
+        self._status_dot.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+
+
+Change 5 — Update the header scan label when a scan finishes
+
+In _scan_finished, find the existing block that sets _results_source_label:
+
+        if completed_rows:
+            self._scan_rows = completed_rows
+            self._populate_results_table(self._scan_rows)
+            import datetime as _dt
+            self._results_source_label.setText(
+                f"Live scan — {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                f"— {len(self._scan_rows)} finding(s)"
+            )
+            self.tab_widget.setCurrentIndex(1)
+
+
+After:
+
+        if completed_rows:
+            self._scan_rows = completed_rows
+            self._populate_results_table(self._scan_rows)
+            import datetime as _dt
+            _now = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+            self._results_source_label.setText(
+                f"Live scan — {_now} — {len(self._scan_rows)} finding(s)"
+            )
+            self._header_scan_label.setText(
+                f"Last scan: {_now}  ·  {len(self._scan_rows)} CVEs"
+            )
+            self.tab_widget.setCurrentIndex(1)
+
+
+That’s all 5 changes. Want me to apply them to the file now?
