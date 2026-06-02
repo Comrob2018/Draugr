@@ -1,43 +1,33 @@
-Let me look at exactly how the NVD exploit data is pulled and what’s available in the response.
-
-Now I have the complete picture. Here’s the answer:
-
-“NVD refs” is not a vague label — the actual URLs are already being captured. _extract_reference_tags() returns a list called exploit_urls containing the real reference URLs (e.g. https://www.exploit-db.com/exploits/12345). These are stored on the CVE dict as exploit_urls.
-
-The problem is what happens next. When building exploit_sources for the output row, the code does:
-
-if has_nvd_exploit:
-    exploit_sources.append("NVD refs")   # ← discards the actual URLs
-
-
-It throws away cve.get("exploit_urls") entirely and replaces the real links with the generic string "NVD refs". The Vulners path does better — it passes through actual source names like exploit-db or packetstorm.
-
-The fix is straightforward — use the actual URLs instead:
+Just the one block in _render_cve_detail. Here’s the exact before and after:
 
 Before:
 
-exploit_sources: List[str] = []
-if has_nvd_exploit:
-    exploit_sources.append("NVD refs")
-if vulners_exploits:
-    sources = set(e.get("source", "") for e in vulners_exploits)
-    exploit_sources.extend(s for s in sources if s)
+        if expl:
+            lines.append(f'<div style="background:#2a1000;color:{C.ORANGE};padding:4px 8px;'
+                         f'border-radius:4px;margin-bottom:6px;font-size:11px;font-weight:700;">'
+                         f'🔴 PUBLIC EXPLOIT — {h(expl_src or "See NVD")}</div>')
 
 
 After:
 
-exploit_sources: List[str] = []
-if has_nvd_exploit:
-    nvd_urls = cve.get("exploit_urls", [])
-    if nvd_urls:
-        exploit_sources.extend(nvd_urls)
-    else:
-        exploit_sources.append("NVD refs")
-if vulners_exploits:
-    sources = set(e.get("source", "") for e in vulners_exploits)
-    exploit_sources.extend(s for s in sources if s)
+        if expl:
+            if expl_src:
+                src_parts = [s.strip() for s in str(expl_src).split(";") if s.strip()]
+                src_html = "<br>".join(
+                    f'<a href="{h(s)}" style="color:{C.ORANGE};font-weight:400;">{h(s)}</a>'
+                    if s.startswith("http") else h(s)
+                    for s in src_parts
+                ) if src_parts else h("See NVD")
+            else:
+                src_html = "See NVD"
+            lines.append(f'<div style="background:#2a1000;color:{C.ORANGE};padding:6px 8px;'
+                         f'border-radius:4px;margin-bottom:6px;font-size:11px;font-weight:700;">'
+                         f'🔴 PUBLIC EXPLOIT<br>'
+                         f'<span style="font-weight:400;line-height:1.8;">{src_html}</span></div>')
 
 
-This means the Exploit Sources column and the log output will show the real URLs — e.g. https://www.exploit-db.com/exploits/44813; https://packetstormsecurity.com/files/152014 — instead of the generic NVD refs label. The fallback to "NVD refs" is kept for the rare case where NVD flagged a reference as an exploit but the URL somehow wasn’t captured.
+The three things that changed:
 
-Want me to apply that change?
+	1.	expl_src is split on ";" into individual entries and each one is put on its own line via <br>
+	2.	Any entry starting with http is wrapped in an <a> tag so it becomes a clickable link
+	3.	The label changed from 🔴 PUBLIC EXPLOIT — <sources on one line> to 🔴 PUBLIC EXPLOIT on its own line with the sources beneath it in normal weight text
