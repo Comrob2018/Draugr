@@ -1,1 +1,12 @@
-updated now.
+  File "c:\Users\P09816\OneDrive - NGC\Desktop\Coding\draugr\draugr.py", line 5850, in <module>
+    main()
+    ~~~~^^
+  File "c:\Users\P09816\OneDrive - NGC\Desktop\Coding\draugr\draugr.py", line 5839, in main
+    window = CVEScannerWindow()
+  File "c:\Users\P09816\OneDrive - NGC\Desktop\Coding\draugr\draugr.py", line 3048, in __init__
+    self._build_ui()
+    ~~~~~~~~~~~~~~^^
+  File "c:\Users\P09816\OneDrive - NGC\Desktop\Coding\draugr\draugr.py", line 3379, in _build_ui
+    log_clear_btn.clicked.connect(self.log.clear)
+                                  ^^^^^^^^
+AttributeError: 'CVEScannerWindow' object has no attribute 'log'
