@@ -13,7 +13,7 @@ Usage:
    https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
 3. Optionally create a cpe_mappings.json file (see CPE MAPPING section below).
 4. Run:
-   python draugr.py
+   python cve_scanner.py
 
 CPE MAPPING FILE (optional — cpe_mappings.json):
     A JSON object that pins product names to exact CPE vendor:product pairs.
@@ -2149,6 +2149,7 @@ class ScanWorker(QThread):
     log_signal = pyqtSignal(str, str)        # message, level
     progress_signal = pyqtSignal(int, int)   # current, total
     status_signal = pyqtSignal(str)          # status bar text
+    risk_signal = pyqtSignal(str)            # "normal" | "kev" | "critical"
     finished_signal = pyqtSignal()
     error_signal = pyqtSignal(str) 
 
@@ -2404,10 +2405,19 @@ class ScanWorker(QThread):
 
                 exploit_sources: List[str] = []
                 if has_nvd_exploit:
-                    exploit_sources.append("NVD refs")
+                    nvd_urls = cve.get("exploit_urls", [])
+                    if nvd_urls:
+                        exploit_sources.extend(nvd_urls)
+                    else:
+                        exploit_sources.append("NVD refs")
                 if vulners_exploits:
-                    sources = set(e.get("source", "") for e in vulners_exploits)
-                    exploit_sources.extend(s for s in sources if s)
+                    for e in vulners_exploits:
+                        url = e.get("url", "").strip()
+                        src = e.get("source", "").strip()
+                        # Prefer the direct URL; fall back to source name
+                        exploit_sources.append(url if url else src)
+                # Deduplicate preserving insertion order
+                exploit_sources = list(dict.fromkeys(s for s in exploit_sources if s))
 
                 # ---- false positive suppression ----
                 if db and db.is_false_positive(cid, name):
@@ -2595,6 +2605,14 @@ class ScanWorker(QThread):
                         l_cves_confirmed.append(cid)
                     elif affected is None:
                         l_cves_unverified.append(cid)
+
+            if critical_count > 0:
+                self.risk_signal.emit("critical")
+            elif any(
+                str(r.get("Known Exploited Vulnerability", "")).upper() == "YES"
+                for r in all_rows
+            ):
+                self.risk_signal.emit("kev")
 
             # ----- Summary log lines -----
             def _log_cve_list(cve_list: List[str], level: str, tag: str = ""):
@@ -2940,8 +2958,6 @@ class ScanWorker(QThread):
                     f"✅ Executive Report → {self.executive_report_path}",
                     f"✅ Technical Report → {self.comp_report_path}",
                 ]
-                if self.defensive_report_path:
-                    written.append(f"✅ Defensive Report → {self.defensive_report_path}")
                 if self.redteam_report_path:
                     written.append(f"✅ Red Team Report  → {self.redteam_report_path}")
                 self._emit_log("\n".join(written), "ok")
@@ -2951,7 +2967,6 @@ class ScanWorker(QThread):
                     os.path.basename(self.output_path),
                     os.path.basename(self.executive_report_path),
                     os.path.basename(self.comp_report_path),
-                    os.path.basename(self.defensive_report_path) if self.defensive_report_path else "",
                     os.path.basename(self.redteam_report_path) if self.redteam_report_path else "",
                 ]))
                 self.status_signal.emit(
@@ -2968,6 +2983,57 @@ class ScanWorker(QThread):
             self._write_logs()
             self.finished_signal.emit()
 
+class Toast(QFrame):
+    """
+    Slide-in / fade-out toast notification displayed in the bottom-right
+    of the parent window.  Call Toast.show_toast(parent, message, level).
+    """
+    _LEVELS = {
+        "ok":     ("#0a1f0a", C.GREEN,  "✓"),
+        "warn":   ("#2a1400", C.ORANGE, "⚠"),
+        "error":  ("#3a0a0a", C.RED,    "✕"),
+        "info":   ("#0a0f1f", C.BLUE,   "ℹ"),
+    }
+
+    def __init__(self, parent, message: str, level: str = "info", duration_ms: int = 4000):
+        super().__init__(parent)
+        bg, fg, icon = self._LEVELS.get(level, self._LEVELS["info"])
+        self.setStyleSheet(
+            f"QFrame {{ background: {bg}; border: 1px solid {fg}; border-radius: 8px; }}"
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(10)
+
+        icon_lbl = QLabel(icon)
+        icon_lbl.setStyleSheet(f"color: {fg}; font-size: 16px; border: none; background: transparent;")
+        layout.addWidget(icon_lbl)
+
+        msg_lbl = QLabel(message)
+        msg_lbl.setStyleSheet(f"color: {fg}; font-size: 12px; border: none; background: transparent;")
+        msg_lbl.setWordWrap(True)
+        layout.addWidget(msg_lbl, 1)
+
+        self.setFixedWidth(360)
+        self.adjustSize()
+        self._position_self()
+        self.show()
+        self.raise_()
+
+        QTimer.singleShot(duration_ms, self.deleteLater)
+
+    def _position_self(self):
+        p = self.parent()
+        if p:
+            x = p.width()  - self.width()  - 16
+            y = p.height() - self.height() - 16
+            self.move(x, y)
+
+    @staticmethod
+    def show_toast(parent, message: str, level: str = "info", duration_ms: int = 4000):
+        t = Toast(parent, message, level, duration_ms)
+        return t
+    
 
 # ----------------------------------------------------------------------
 # Main window
@@ -3034,6 +3100,10 @@ class CVEScannerWindow(QMainWindow):
         except Exception:
             pass
 
+    def _copy_log(self):
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self.log.toPlainText())
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -3043,19 +3113,84 @@ class CVEScannerWindow(QMainWindow):
         root.setContentsMargins(28, 20, 28, 20)
         root.setSpacing(0)
 
-        header = QLabel("DRAUGR")
-        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.setStyleSheet(
-            f"color: {C.ACCENT}; font-size: 64px; font-weight: 700; letter-spacing: 4px;"
+        # ── Header banner ─────────────────────────────────────────────
+        header_frame = QFrame()
+        header_frame.setStyleSheet(
+            f"QFrame {{ background: {C.BG_CARD}; border: none; "
+            f"border-bottom: 1px solid {C.BORDER}; border-radius: 0px; }}"
         )
-        root.addWidget(header)
+        header_outer = QHBoxLayout(header_frame)
+        header_outer.setContentsMargins(0, 0, 0, 0)
+        header_outer.setSpacing(0)
 
-        subtitle = QLabel("THREAT    INTELLIGENCE    SYSTEM") #  ·  
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet(
-            f"color: {C.FG_DIM}; font-size: 12px; letter-spacing: 3px; padding-bottom: 16px;"
+        # Left accent bar (suggestion 2)
+        accent_bar = QFrame()
+        accent_bar.setFixedWidth(4)
+        accent_bar.setStyleSheet(f"background: {C.ACCENT}; border: none;")
+        header_outer.addWidget(accent_bar)
+
+        # Inner layout: logo left, meta right
+        header_inner = QHBoxLayout()
+        header_inner.setContentsMargins(16, 10, 16, 10)
+        header_inner.setSpacing(0)
+
+        # Logo + subtitle stacked (suggestions 1 & 3)
+        logo_col = QVBoxLayout()
+        logo_col.setSpacing(1)
+        logo_label = QLabel("DRAUGR")
+        logo_label.setStyleSheet(
+            f"color: {C.ACCENT}; font-size: 38px; font-weight: 700; "
+            f"letter-spacing: 4px; background: transparent; border: none;"
         )
-        root.addWidget(subtitle)
+        sub_label = QLabel("THREAT  INTELLIGENCE  SYSTEM")
+        sub_label.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 11px; letter-spacing: 3px; "
+            f"background: transparent; border: none;"
+        )
+        logo_col.addWidget(logo_label)
+        logo_col.addWidget(sub_label)
+        header_inner.addLayout(logo_col)
+        header_inner.addStretch()
+
+        # Right meta column: version, last scan, CVE count (suggestions 1 & 4)
+        meta_col = QVBoxLayout()
+        meta_col.setSpacing(2)
+        meta_col.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        ver_label = QLabel(f"v{DRAUGR_VERSION}")
+        ver_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        ver_label.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 11px; font-weight: 600; "
+            f"background: transparent; border: none;"
+        )
+
+        self._header_scan_label = QLabel("No scan yet")
+        self._header_scan_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._header_scan_label.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+
+        # Status dot (suggestion 6)
+        self._status_dot = QLabel("●  IDLE")
+        self._status_dot.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._status_dot.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+        self._dot_blink_state = False
+        self._dot_timer = QTimer(self)
+        self._dot_timer.setInterval(600)
+        self._dot_timer.timeout.connect(self._blink_status_dot)
+
+        meta_col.addWidget(ver_label)
+        meta_col.addWidget(self._header_scan_label)
+        meta_col.addWidget(self._status_dot)
+        header_inner.addLayout(meta_col)
+
+        header_outer.addLayout(header_inner)
+        root.addWidget(header_frame)
+        root.addSpacing(12)
 
         # Configuration card
         card = QFrame()
@@ -3193,6 +3328,7 @@ class CVEScannerWindow(QMainWindow):
         self.scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_btn.setFixedSize(200, 44)
         self.scan_btn.setStyleSheet(ACTION_BTN_STYLE)
+        self._scan_btn_default_style = ACTION_BTN_STYLE
 
         self.stop_btn = QPushButton("■   Stop Scan")
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3294,10 +3430,29 @@ class CVEScannerWindow(QMainWindow):
             f"color: {C.FG_DIM}; font-size: 10px; font-weight: 600; letter-spacing: 2px;"
         )
         filter_row.addWidget(log_label)
+        _log_btn_style = (
+            f"QPushButton {{ background: {C.BG_INPUT}; color: {C.FG_DIM}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 4px; "
+            f"padding: 1px 8px; font-size: 11px; }}"
+            f"QPushButton:hover {{ background: {C.BG_HOVER}; color: {C.FG}; }}"
+        )
+        log_copy_btn = QPushButton("⎘ Copy")
+        log_copy_btn.setFixedHeight(22)
+        log_copy_btn.setToolTip("Copy the full log to clipboard")
+        log_copy_btn.setStyleSheet(_log_btn_style)
+        log_copy_btn.clicked.connect(self._copy_log)
+        filter_row.addWidget(log_copy_btn)
+
+        log_clear_btn = QPushButton("✕ Clear")
+        log_clear_btn.setFixedHeight(22)
+        log_clear_btn.setToolTip("Clear the scan log")
+        log_clear_btn.setStyleSheet(_log_btn_style)
+        log_clear_btn.clicked.connect(lambda: self.log.clear())
+        filter_row.addWidget(log_clear_btn)
         filter_row.addStretch()
 
         self.chk_medium = QCheckBox("Show MEDIUM")
-        self.chk_medium.setChecked(True)
+        self.chk_medium.setChecked(False)
         self.chk_medium.setStyleSheet(CHECKBOX_STYLE)
         filter_row.addWidget(self.chk_medium)
 
@@ -3307,7 +3462,7 @@ class CVEScannerWindow(QMainWindow):
         filter_row.addWidget(self.chk_low)
 
         self.chk_unverified = QCheckBox("Show Unverified")
-        self.chk_unverified.setChecked(True)
+        self.chk_unverified.setChecked(False)
         self.chk_unverified.setToolTip("Show CVEs where the version match could not be confirmed")
         self.chk_unverified.setStyleSheet(CHECKBOX_STYLE)
         filter_row.addWidget(self.chk_unverified)
@@ -3494,7 +3649,16 @@ class CVEScannerWindow(QMainWindow):
         )
         root.addSpacing(4)
         root.addWidget(self.status_label)
-    
+
+    def _blink_status_dot(self):
+        self._dot_blink_state = not self._dot_blink_state
+        color = C.RED if self._dot_blink_state else C.FG_DIM
+        self._status_dot.setStyleSheet(
+            f"color: {color}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+
+
     # Slot that runs whenever the Medium checkbox changes
     def _update_show_medium(self):
         self.show_medium = self.chk_medium.isChecked()
@@ -3610,7 +3774,7 @@ class CVEScannerWindow(QMainWindow):
 
         self._act_write_logs = QAction("Write Logs to File", self)
         self._act_write_logs.setCheckable(True)
-        self._act_write_logs.setChecked(True)
+        self._act_write_logs.setChecked(False)
         settings_menu.addAction(self._act_write_logs)
 
         settings_menu.addSeparator()
@@ -3697,14 +3861,45 @@ class CVEScannerWindow(QMainWindow):
         safe_msg = html.escape(msg).replace("\n", "<br>")
         self.log.append(f'<span style="color:{color}">{safe_msg}</span>')
 
+    def _update_progress_bar_color(self, level: str):
+        if level == "critical":
+            color = C.RED
+        elif level == "kev":
+            color = C.ORANGE
+        else:
+            color = C.GREEN
+        self.progress_bar.setStyleSheet(
+            f"QProgressBar {{ background: {C.BG_CARD}; border: none; border-radius: 3px; }}"
+            f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
+        )
+
     def _update_progress(self, current: int, total: int):
         self.progress_bar.setMaximum(max(total, 1))
         self.progress_bar.setValue(current)
         pct = int((current / total) * 100) if total else 0
-        self.progress_label.setText(f"{current} / {total}   ({pct}%) Complete")
+        self._scan_progress_text = f"{current} / {total}  ({pct}%)"
+        self._refresh_progress_label()
+
+    def _refresh_progress_label(self):
+        item = getattr(self, "_scan_current_item", "")
+        base = getattr(self, "_scan_progress_text", "")
+        if item:
+            self.progress_label.setText(f"{base}  —  {item}")
+        else:
+            self.progress_label.setText(base)
 
     def _update_status(self, text: str):
         self.status_label.setText(text)
+        # Extract the item name from "Scanning: N of M — <name>" for the progress label
+        if text.startswith("Scanning:") and " — " in text:
+            # Take everything after the first " — ", strip any " — Enriching: …" suffix
+            after_dash = text.split(" — ", 1)[1]
+            item_name = after_dash.split(" — ")[0].strip()
+            self._scan_current_item = item_name
+            self._refresh_progress_label()
+        elif not text.startswith("Scanning:"):
+            self._scan_current_item = ""
+            self._refresh_progress_label()
 
     def _scan_finished(self):
         self._append_log("Scan Finished.", "info")
@@ -3712,7 +3907,33 @@ class CVEScannerWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.skip_btn.setEnabled(False)
-        self.scan_btn.setText("▶   Start Scan")
+        self._dot_timer.stop()
+        self._status_dot.setText("●  IDLE")
+        self._status_dot.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+
+        # Show result-aware button label for 3 seconds then revert
+        completed_rows = getattr(self.worker, '_completed_rows', None)
+        has_critical = any(
+            str(r.get("CVSS Severity","")).upper() == "CRITICAL"
+            for r in (completed_rows or [])
+        )
+        has_kev = any(
+            str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+            for r in (completed_rows or [])
+        )
+        if has_critical or has_kev:
+            self.scan_btn.setText("⚠  Issues Found")
+            self.scan_btn.setStyleSheet(self.scan_btn.styleSheet().replace(C.RED, C.ORANGE))
+        elif completed_rows:
+            self.scan_btn.setText("✓  Scan Complete")
+            self.scan_btn.setStyleSheet(self.scan_btn.styleSheet().replace(C.RED, C.GREEN))
+        else:
+            self.scan_btn.setText("▶   Start Scan")
+
+        QTimer.singleShot(3000, self._reset_scan_button)
         try:
             self.worker._write_logs()
         except Exception:
@@ -3720,15 +3941,38 @@ class CVEScannerWindow(QMainWindow):
         # Populate results browser — guard against cancelled/errored scans
         completed_rows = getattr(self.worker, '_completed_rows', None)
         if completed_rows:
+            kev_count  = sum(1 for r in completed_rows
+                            if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+            crit_count = sum(1 for r in completed_rows
+                            if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
+            total      = len(completed_rows)
+            parts = [f"{total} CVE{'s' if total != 1 else ''} found"]
+            if crit_count:
+                parts.append(f"{crit_count} CRITICAL")
+            if kev_count:
+                parts.append(f"{kev_count} KEV")
+            level = "error" if (crit_count or kev_count) else "ok"
+            Toast.show_toast(self, "Scan complete — " + ", ".join(parts), level)
+        else:
+            Toast.show_toast(self, "Scan stopped — no results", "warn")
+
+        if completed_rows:
             self._scan_rows = completed_rows
             self._populate_results_table(self._scan_rows)
             import datetime as _dt
+            _now = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
             self._results_source_label.setText(
-                f"Live scan — {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')} "
-                f"— {len(self._scan_rows)} finding(s)"
+                f"Live scan — {_now} — {len(self._scan_rows)} finding(s)"
+            )
+            self._header_scan_label.setText(
+                f"Last scan: {_now}  ·  {len(self._scan_rows)} CVEs"
             )
             self.tab_widget.setCurrentIndex(1)
         self.worker = None
+
+    def _reset_scan_button(self):
+        self.scan_btn.setText("▶   Start Scan")
+        self.scan_btn.setStyleSheet(self._scan_btn_default_style)
 
     def _start_scan(self, generate_executive_report: bool = False):
         if self.scanning:
@@ -3787,6 +4031,11 @@ class CVEScannerWindow(QMainWindow):
         self.log.clear()
         self.progress_bar.setValue(0)
         self.progress_label.setText("")
+        self._scan_progress_text = ""
+        self._scan_current_item = ""
+        self._update_progress_bar_color("normal")
+        self._status_dot.setText("●  SCANNING")
+        self._dot_timer.start()
         kev_path = self.kev_row.text()
         cpe_path = self.cpe_row.text()
         api_key = self.api_input.text().strip()
@@ -3816,6 +4065,7 @@ class CVEScannerWindow(QMainWindow):
         self.worker.log_signal.connect(self._append_log) 
         self.worker.progress_signal.connect(self._update_progress)
         self.worker.status_signal.connect(self._update_status)
+        self.worker.risk_signal.connect(self._update_progress_bar_color)
         self.worker.finished_signal.connect(self._scan_finished)
         self.worker.start()
 
@@ -3935,9 +4185,19 @@ class CVEScannerWindow(QMainWindow):
                          f'border-radius:4px;margin-bottom:6px;font-size:11px;font-weight:700;">'
                          f'⚠ CISA KEV-LISTED — Active exploitation confirmed</div>')
         if expl:
-            lines.append(f'<div style="background:#2a1000;color:{C.ORANGE};padding:4px 8px;'
+            if expl_src:
+                src_parts = [s.strip() for s in str(expl_src).split(";") if s.strip()]
+                src_html = "<br>".join(
+                    f'<a href="{h(s)}" style="color:{C.ORANGE};font-weight:400;">{h(s)}</a>'
+                    if s.startswith("http") else h(s)
+                    for s in src_parts
+                ) if src_parts else h("See NVD")
+            else:
+                src_html = "See NVD"
+            lines.append(f'<div style="background:#2a1000;color:{C.ORANGE};padding:6px 8px;'
                          f'border-radius:4px;margin-bottom:6px;font-size:11px;font-weight:700;">'
-                         f'🔴 PUBLIC EXPLOIT — {h(expl_src or "See NVD")}</div>')
+                         f'🔴 PUBLIC EXPLOIT<br>'
+                         f'<span style="font-weight:400;line-height:1.8;">{src_html}</span></div>')
         lines.append(f'<p style="margin:8px 0;line-height:1.5;">{h(desc)}</p>')
 
         def _section(title: str, content: str) -> str:
