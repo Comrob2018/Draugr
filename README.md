@@ -42,7 +42,7 @@ json
 Run the scanner:  
 
 bash  
-python main.py  
+python draugr.py  
 
 📂 Output  
 CSV report — Contains CVE details, risk scores, exploit indicators, and KEV flags.  
