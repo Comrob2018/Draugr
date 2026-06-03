@@ -36,15 +36,17 @@ https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.j
 Optionally create a cpe_mappings.json file to override heuristic matching:  
 
 json  
+```
 {  
   "apache tomcat": "apache:tomcat",  
   "openssl": "openssl:openssl",  
   "microsoft edge": "microsoft:edge_chromium"  
-}  
+}
+```  
 Run the scanner:  
-
-bash  
+```
 python draugr.py  
+```
 
 📂 Output  
 CSV report — Contains CVE details, risk scores, exploit indicators, and KEV flags.  
