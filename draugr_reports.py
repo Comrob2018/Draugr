@@ -340,7 +340,6 @@ def _markdown_body_to_html(md: str) -> str:
             out.append("<hr>")
             continue
 
-        # --- Table row ---
         if line.startswith("|"):
             close_list()
             cells = [c.strip() for c in line.strip("|").split("|")]
@@ -356,7 +355,13 @@ def _markdown_body_to_html(md: str) -> str:
             if not in_table:
                 out.append('<table>')
                 in_table = True
-            row_html = "".join(f"<td>{inline(escape(c))}</td>" for c in cells)
+            # If a cell already contains HTML tags (e.g. <br>, <a>), pass it
+            # through inline() without escaping — it was pre-built as safe HTML.
+            def _cell(c: str) -> str:
+                if re.search(r"<[a-zA-Z/]", c):
+                    return f"<td>{inline(c)}</td>"
+                return f"<td>{inline(escape(c))}</td>"
+            row_html = "".join(_cell(c) for c in cells)
             out.append(f"<tr>{row_html}</tr>")
             continue
 
@@ -1886,7 +1891,7 @@ def build_executive_report_markdown(
         lines.append(
             "- **Immediate response capacity** — Security and IT personnel will need to be "
             f"allocated for emergency patching of the {kev_total} actively exploited "
-            "{'system' if kev_total == 1 else 'systems'}, potentially requiring after-hours effort."
+            f"{'system' if kev_total == 1 else 'systems'}, potentially requiring after-hours effort."
         )
     if sev_counts["CRITICAL"] + sev_counts["HIGH"] > 0:
         lines.append(
