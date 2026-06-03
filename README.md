@@ -57,15 +57,12 @@ GUI view — Displays progress, results, and export options.
 
 🧠 Optional Enrichment Databases  
 Place these JSON files in the resources/ directory for deeper analysis:  
-
+```
 cwe_db.json  
-
 capec_db.json  
-
 defend_db.json  
-
 nist_db.json  
-
+```
 These enable lineage expansion and mapping to MITRE ATT&CK and D3FEND frameworks.  
 
 🛡️ License  
