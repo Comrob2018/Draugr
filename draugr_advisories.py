@@ -4,8 +4,7 @@ draugr_advisories.py — Vendor security advisory URL resolution.
 Given a publisher name and/or software name, returns the direct vendor
 advisory/patch URL when available, supplementing the NVD reference links.
 """
-import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 
 # ------------------------------------------------------------------
