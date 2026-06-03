@@ -7,7 +7,6 @@ column structure, pre-populated from Draugr scan results.
 Column mapping follows DISA STIG/RMF POA&M template conventions.
 """
 import datetime
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
