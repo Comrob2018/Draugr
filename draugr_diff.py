@@ -8,10 +8,7 @@ Compares two Draugr output CSVs and produces:
 """
 import csv
 import html
-import json
-import re
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 # ------------------------------------------------------------------
