@@ -1,9 +1,9 @@
-## Draugr  
+# Draugr  
 Draugr is a PyQt6 desktop vulnerability intelligence tool that analyzes software against multiple threat data sources — including the NVD,  
 CISA Known Exploited Vulnerabilities (KEV) catalog, EPSS scores, and public exploit references — to compute a weighted risk score per CVE.  
 It’s designed for analysts and developers who need fast, local vulnerability intelligence without relying on asset inventories or complex CMDBs.  
 
-🚀 Features  
+##🚀 Features  
 NVD integration — Queries CVE and CPE APIs directly using your API key.  
 CISA KEV overlay — Flags known exploited vulnerabilities and adds metadata.  
 EPSS scoring — Pulls exploit prediction scores for prioritization.  
@@ -13,7 +13,7 @@ Offline enrichment pipeline — Optional local databases for CWE, CAPEC, ATT&CK,
 CSV export — Generates analyst‑ready reports.  
 PyQt6 GUI — Clean, modular interface with progress tracking and theme support.  
 
-🧩 Requirements  
+##🧩 Requirements  
 Install dependencies:  
 ```
 pip install -r requirements.txt  
@@ -26,8 +26,8 @@ requests
 packaging  
 jsonschema  # optional for enrichment validation
 ```
-⚙️ Usage  
-*  **Prepare a software list file** (see sample_list.txt, or sample_list.csv in resources folder).  
+##⚙️ Usage  
+*  **Prepare a software list file** (see sample_list.txt, or sample_list.csv in resources folder).
 Optionally download the CISA KEV JSON feed:  
 ```  
 https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json  
@@ -46,14 +46,15 @@ json
 python draugr.py  
 ```
 
-📂 Output  
+##📂 Output  
 CSV report — Contains CVE details, risk scores, exploit indicators, and KEV flags.  
 HTML Reports  
-Executive Report- All information needed for an excutive style report. Limit amounts of data to highest risk cves  
-Comprehensive Report - No limit to the amount of information included.  
-GUI view — Displays progress, results, and export options.  
+Executive Report - Focused C-Suite sytle report  
+Technical Report - Technical implementation for mitigations and remediations
+Red Team Report - Report that proposes attack paths and 
 
-🧠 Optional Enrichment Databases  
+
+##🧠 Optional Enrichment Databases  
 Place these JSON files in the resources/ directory for deeper analysis:  
 ```
 cwe_db.json  
