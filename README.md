@@ -57,7 +57,9 @@ python draugr.py
 * POA&M - Plan of action and milestones for cves
 ### SBOM
 * JSON software bill of materials in the CycloneDX 1.5 format
-
+### Logs
+* Scan Log - The log from the scan log window
+* Error Log - The errors from the scan log window
 
 ## 🧠 Optional Enrichment Databases  
 ### Place these JSON files in the resources/ directory for deeper analysis:  
