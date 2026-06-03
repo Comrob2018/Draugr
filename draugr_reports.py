@@ -21,7 +21,6 @@ All functions take pre-computed scan row dicts; no NVD/network calls are made he
 # ----------------------------------------------------------------------
 import base64
 import datetime
-import hashlib
 import html
 import os
 import re
@@ -379,6 +378,13 @@ def _markdown_body_to_html(md: str) -> str:
             close_list()
             close_table()
             out.append("")
+            continue
+
+        # --- Raw HTML passthrough (SVG, div wrappers, etc.) ---
+        if line.startswith("<"):
+            close_list()
+            close_table()
+            out.append(line)
             continue
 
         # --- Plain paragraph text ---
@@ -770,6 +776,531 @@ _TECHNIQUE_REMEDIATION: Dict[str, str] = {
 }
 
 
+# ── SVG graphic helpers ────────────────────────────────────────────────────
+
+def _svg_donut(sev_counts: Dict[str, int], total: int) -> str:
+    """
+    Inline SVG donut chart — severity breakdown.
+    Segments: CRITICAL (red) / HIGH (orange) / MEDIUM (amber) / LOW (green).
+    Total CVE count displayed in the centre.
+    """
+    colours = {
+        "CRITICAL": "#c0392b",
+        "HIGH":     "#d35400",
+        "MEDIUM":   "#d4ac0d",
+        "LOW":      "#27ae60",
+    }
+    labels  = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    counts  = [sev_counts.get(l, 0) for l in labels]
+    total_s = sum(counts)
+    if total_s == 0:
+        return ""
+
+    cx, cy, r_out, r_in = 110, 110, 90, 54
+    import math
+
+    def arc_path(start_deg: float, end_deg: float) -> str:
+        s = math.radians(start_deg - 90)
+        e = math.radians(end_deg   - 90)
+        large = 1 if (end_deg - start_deg) > 180 else 0
+        x1o = cx + r_out * math.cos(s);  y1o = cy + r_out * math.sin(s)
+        x2o = cx + r_out * math.cos(e);  y2o = cy + r_out * math.sin(e)
+        x1i = cx + r_in  * math.cos(e);  y1i = cy + r_in  * math.sin(e)
+        x2i = cx + r_in  * math.cos(s);  y2i = cy + r_in  * math.sin(s)
+        return (f"M {x1o:.2f} {y1o:.2f} "
+                f"A {r_out} {r_out} 0 {large} 1 {x2o:.2f} {y2o:.2f} "
+                f"L {x1i:.2f} {y1i:.2f} "
+                f"A {r_in} {r_in} 0 {large} 0 {x2i:.2f} {y2i:.2f} Z")
+
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="320" height="220" '
+             'style="font-family:Segoe UI,sans-serif;display:block;margin:16px auto;">']
+
+    # Draw segments
+    angle = 0.0
+    for label, count in zip(labels, counts):
+        if count == 0:
+            continue
+        sweep = (count / total_s) * 360
+        # Avoid full-circle degenerate arc
+        end = angle + sweep - 0.01 if sweep >= 360 else angle + sweep
+        parts.append(f'<path d="{arc_path(angle, end)}" fill="{colours[label]}" '
+                     f'stroke="#fff" stroke-width="2"/>')
+        angle += sweep
+
+    # Centre text
+    parts += [
+        f'<text x="{cx}" y="{cy - 8}" text-anchor="middle" '
+        f'font-size="26" font-weight="700" fill="#1a1a2e">{total_s}</text>',
+        f'<text x="{cx}" y="{cy + 12}" text-anchor="middle" '
+        f'font-size="11" fill="#555">Total CVEs</text>',
+    ]
+
+    # Legend (right side)
+    lx, ly = 218, 60
+    for i, (label, count) in enumerate(zip(labels, counts)):
+        y = ly + i * 26
+        pct = f"{count/total_s*100:.0f}%" if total_s else "0%"
+        parts += [
+            f'<rect x="{lx}" y="{y}" width="13" height="13" '
+            f'fill="{colours[label]}" rx="2"/>',
+            f'<text x="{lx+18}" y="{y+11}" font-size="11" fill="#333">'
+            f'{label}  <tspan font-weight="700">{count}</tspan>'
+            f'  <tspan fill="#888">({pct})</tspan></text>',
+        ]
+
+    parts.append('</svg>')
+    return "\n".join(parts)
+
+
+def _svg_risk_matrix(
+    grouped: Dict[Any, List[Dict[str, Any]]],
+) -> str:
+    """
+    Inline SVG 5×5 likelihood vs consequence risk matrix.
+    Each software item is plotted as a labelled dot.
+    Legend sits below the chart to avoid overlapping dots.
+    """
+    import math
+
+    W, H    = 480, 420   # extra height for below-chart legend
+    PAD_L   = 60
+    PAD_B   = 50
+    PAD_T   = 30
+    PAD_R   = 20
+    LEGEND_H = 90        # reserved at bottom for legend
+    GRID    = 5
+    CW      = (W - PAD_L - PAD_R) / GRID
+    CH      = (H - PAD_T - PAD_B - LEGEND_H) / GRID
+    PLOT_H  = H - PAD_T - PAD_B - LEGEND_H
+
+    zone_colours = [
+        "#27ae6022", "#27ae6033", "#f39c1233", "#e74c3c33", "#c0392b44",
+        "#27ae6033", "#f39c1233", "#f39c1233", "#e74c3c44", "#c0392b55",
+        "#f39c1233", "#f39c1233", "#e74c3c33", "#e74c3c44", "#c0392b55",
+        "#e74c3c33", "#e74c3c44", "#e74c3c44", "#c0392b55", "#c0392b66",
+        "#e74c3c44", "#c0392b44", "#c0392b55", "#c0392b66", "#c0392b77",
+    ]
+
+    def _likelihood(rows: List[Dict[str, Any]]) -> float:
+        kev  = any(str(r.get("Known Exploited Vulnerability","")).upper()=="YES" for r in rows)
+        expl = any(str(r.get("Public Exploit","")).upper()=="YES" for r in rows)
+        epss = max((_epss_float(r.get("EPSS Score",0)) for r in rows), default=0.0)
+        score = 0.0
+        if kev:  score += 4.0
+        elif expl: score += 2.5
+        score += min(epss * 3.0, 1.5)
+        return min(score, 5.0)
+
+    def _consequence(rows: List[Dict[str, Any]]) -> float:
+        crit = any(str(r.get("CVSS Severity","")).upper()=="CRITICAL" for r in rows)
+        high = any(str(r.get("CVSS Severity","")).upper()=="HIGH"     for r in rows)
+        max_rs = max((_to_float(r.get("Risk Score",0)) for r in rows), default=0.0)
+        base = 5.0 if crit else 3.5 if high else 2.0
+        return min(base + max_rs / 50.0, 5.0)
+
+    def _px(likelihood: float, consequence: float):
+        x = PAD_L + (likelihood / 5.0) * (W - PAD_L - PAD_R)
+        y = PAD_T + PLOT_H - (consequence / 5.0) * PLOT_H
+        return x, y
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'style="font-family:Segoe UI,sans-serif;display:block;margin:16px auto;'
+        f'border:1px solid #ddd;border-radius:6px;background:#fafafa;">',
+    ]
+
+    # Colour zones
+    for row in range(GRID):
+        for col in range(GRID):
+            idx = (GRID - 1 - row) * GRID + col
+            x   = PAD_L + col * CW
+            y   = PAD_T + row * CH
+            parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{CW:.1f}" height="{CH:.1f}" '
+                         f'fill="{zone_colours[idx]}" stroke="#ccc" stroke-width="0.5"/>')
+
+    # Axis labels
+    axis_style = 'font-size="10" fill="#555" text-anchor="middle"'
+    x_labels = ["Very Low", "Low", "Moderate", "High", "Very High"]
+    y_labels = ["Very Low", "Low", "Moderate", "High", "Critical"]
+    for i, lbl in enumerate(x_labels):
+        x = PAD_L + (i + 0.5) * CW
+        parts.append(f'<text x="{x:.1f}" y="{PAD_T + PLOT_H + 16}" {axis_style}>{lbl}</text>')
+    for i, lbl in enumerate(y_labels):
+        y = PAD_T + PLOT_H - (i + 0.5) * CH
+        parts.append(f'<text x="{PAD_L - 8}" y="{y:.1f}" font-size="10" fill="#555" '
+                     f'text-anchor="end" dominant-baseline="middle">{lbl}</text>')
+
+    # Axis titles
+    parts += [
+        f'<text x="{PAD_L + (W-PAD_L-PAD_R)/2:.1f}" y="{PAD_T + PLOT_H + 34}" '
+        f'font-size="11" fill="#333" text-anchor="middle" font-weight="600">LIKELIHOOD</text>',
+        f'<text x="10" y="{PAD_T + PLOT_H/2:.1f}" '
+        f'font-size="11" fill="#333" text-anchor="middle" font-weight="600" '
+        f'transform="rotate(-90,10,{PAD_T+PLOT_H/2:.1f})">CONSEQUENCE</text>',
+    ]
+
+    # Plot software dots
+    dot_colours = ["#c0392b","#8e44ad","#2980b9","#16a085","#d35400",
+                   "#27ae60","#f39c12","#1abc9c","#2c3e50","#7f8c8d"]
+    plotted: List[tuple] = []
+    for idx, ((sw_name, sw_ver), sw_rows) in enumerate(
+        sorted(grouped.items(), key=lambda kv: (
+            -max((_to_float(r.get("Risk Score",0)) for r in kv[1]), default=0)
+        ))
+    ):
+        lik  = _likelihood(sw_rows)
+        con  = _consequence(sw_rows)
+        px, py = _px(lik, con)
+        colour  = dot_colours[idx % len(dot_colours)]
+        label   = sw_name[:22] + ("…" if len(sw_name) > 22 else "")
+        num     = idx + 1
+        plotted.append((colour, label, num))
+        parts.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="10" '
+                     f'fill="{colour}" fill-opacity="0.85" stroke="#fff" stroke-width="1.5"/>')
+        parts.append(f'<text x="{px:.1f}" y="{py+4:.1f}" text-anchor="middle" '
+                     f'font-size="9" font-weight="700" fill="#fff">{num}</text>')
+
+    # Legend below the plot area — two columns
+    if plotted:
+        legend_y = PAD_T + PLOT_H + 48
+        col_w    = (W - PAD_L) // 2
+        for i, (colour, label, num) in enumerate(plotted):
+            col  = i % 2
+            row  = i // 2
+            lx   = PAD_L + col * col_w
+            ly   = legend_y + row * 16
+            parts += [
+                f'<circle cx="{lx+6}" cy="{ly:.1f}" r="5" fill="{colour}"/>',
+                f'<text x="{lx+15}" y="{ly+4:.1f}" font-size="9" fill="#333">'
+                f'<tspan font-weight="700">{num}.</tspan> {html.escape(label)}</text>',
+            ]
+
+    parts.append('</svg>')
+    return "\n".join(parts)
+
+
+def _svg_controls_heatmap(
+    all_rows: List[Dict[str, Any]],
+    grouped: Dict[Any, List[Dict[str, Any]]],
+    top_n: int = 10,
+) -> str:
+    """
+    Controls gap heatmap for the executive report.
+    Rows = top NIST 800-53 controls by frequency.
+    Columns = software items.
+    Cell colour = number of CVEs on that software missing that control.
+    """
+    from collections import Counter as _Counter
+
+    # Count control frequency per software item
+    sw_names = sorted({n for (n, _) in grouped.keys() if n},
+                      key=lambda s: -max(
+                          (_to_float(r.get("Risk Score", 0))
+                           for r in grouped.get((s, next(
+                               (v for (n, v) in grouped if n == s), "")), [])),
+                          default=0
+                      ))[:12]
+
+    # Global top controls by total frequency
+    global_counter: Counter = Counter()
+    for r in all_rows:
+        for ctrl in _split_multi(r.get("NIST 800-53 Controls", "")):
+            cid = ctrl.split()[0] if ctrl.split() else ctrl
+            if cid:
+                global_counter[cid] += 1
+    top_controls = [c for c, _ in global_counter.most_common(top_n)]
+
+    if not top_controls or not sw_names:
+        return ""
+
+    # Per-software per-control counts
+    sw_ctrl_counts: Dict[str, Dict[str, int]] = {s: {} for s in sw_names}
+    for (sw_name, _), rows in grouped.items():
+        if sw_name not in sw_ctrl_counts:
+            continue
+        for r in rows:
+            for ctrl in _split_multi(r.get("NIST 800-53 Controls", "")):
+                cid = ctrl.split()[0] if ctrl.split() else ctrl
+                if cid in top_controls:
+                    sw_ctrl_counts[sw_name][cid] = sw_ctrl_counts[sw_name].get(cid, 0) + 1
+
+    max_count = max(
+        (v for d in sw_ctrl_counts.values() for v in d.values()),
+        default=1
+    ) or 1
+
+    CELL_W  = max(52, min(80, int(520 / len(sw_names))))
+    CELL_H  = 26
+    PAD_L   = 72
+    PAD_T   = 80
+    W       = PAD_L + CELL_W * len(sw_names) + 20
+    H       = PAD_T + CELL_H * len(top_controls) + 50
+
+    def _heat_colour(count: int) -> str:
+        if count == 0:
+            return "#f0f0f0"
+        intensity = min(count / max_count, 1.0)
+        # White → deep red
+        r = 255
+        g = int(255 * (1 - intensity * 0.85))
+        b = int(255 * (1 - intensity * 0.85))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _text_colour(count: int) -> str:
+        if count == 0:
+            return "#aaa"
+        intensity = min(count / max_count, 1.0)
+        return "#fff" if intensity > 0.5 else "#333"
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'style="font-family:Segoe UI,sans-serif;display:block;margin:16px auto;overflow:visible;">',
+    ]
+
+    # Column headers — rotated software names
+    for ci, sw in enumerate(sw_names):
+        x = PAD_L + ci * CELL_W + CELL_W // 2
+        y = PAD_T - 8
+        label = sw[:14] + ("…" if len(sw) > 14 else "")
+        parts.append(
+            f'<text x="{x}" y="{y}" font-size="9" fill="#333" text-anchor="start" '
+            f'transform="rotate(-40,{x},{y})">{html.escape(label)}</text>'
+        )
+
+    # Rows
+    for ri, ctrl in enumerate(top_controls):
+        y = PAD_T + ri * CELL_H
+        short = _NIST_IMPL.get(ctrl, "").split("—")[0].strip()[:28]
+        label = f"{ctrl}" + (f" – {short}" if short else "")
+
+        # Row label
+        parts.append(
+            f'<text x="{PAD_L - 4}" y="{y + CELL_H - 7}" text-anchor="end" '
+            f'font-size="9" fill="#333" font-weight="600">{html.escape(ctrl)}</text>'
+        )
+
+        # Cells
+        for ci, sw in enumerate(sw_names):
+            x     = PAD_L + ci * CELL_W
+            count = sw_ctrl_counts.get(sw, {}).get(ctrl, 0)
+            fill  = _heat_colour(count)
+            tcol  = _text_colour(count)
+            parts.append(
+                f'<rect x="{x}" y="{y}" width="{CELL_W-1}" height="{CELL_H-1}" '
+                f'fill="{fill}" rx="2" stroke="#e0e0e0" stroke-width="0.5"/>'
+            )
+            if count > 0:
+                parts.append(
+                    f'<text x="{x+CELL_W//2}" y="{y+CELL_H-8}" text-anchor="middle" '
+                    f'font-size="9" font-weight="700" fill="{tcol}">{count}</text>'
+                )
+
+    # Colour scale legend
+    ly = H - 30
+    parts.append(f'<text x="{PAD_L}" y="{ly - 4}" font-size="9" fill="#555">Gap severity:</text>')
+    scale_steps = 5
+    sw = 20
+    for i in range(scale_steps):
+        intensity = i / (scale_steps - 1)
+        count_approx = int(intensity * max_count)
+        fill = _heat_colour(count_approx)
+        lx = PAD_L + 80 + i * (sw + 4)
+        parts += [
+            f'<rect x="{lx}" y="{ly - 12}" width="{sw}" height="14" fill="{fill}" rx="2" '
+            f'stroke="#ccc" stroke-width="0.5"/>',
+        ]
+    parts += [
+        f'<text x="{PAD_L + 80}" y="{ly + 6}" font-size="8" fill="#888" text-anchor="middle">Low</text>',
+        f'<text x="{PAD_L + 80 + (scale_steps-1)*(sw+4)}" y="{ly + 6}" font-size="8" '
+        f'fill="#888" text-anchor="middle">High</text>',
+        f'<text x="{PAD_L + 80 + (scale_steps+1)*(sw+4)}" y="{ly - 2}" font-size="8" '
+        f'fill="#aaa">Numbers = CVE count missing this control</text>',
+    ]
+
+    parts.append('</svg>')
+    return "\n".join(parts)
+
+
+def _svg_bar_chart(
+    grouped: Dict[Any, List[Dict[str, Any]]],
+    top_n: int = 10,
+) -> str:
+    """
+    Horizontal bar chart — top N software items ranked by max risk score.
+    Bars are colour-coded by highest severity found in that software.
+    """
+    sev_colour = {
+        "CRITICAL": "#c0392b",
+        "HIGH":     "#d35400",
+        "MEDIUM":   "#d4ac0d",
+        "LOW":      "#27ae60",
+    }
+
+    # Build ranked list
+    ranked = []
+    for (sw_name, sw_ver), rows in grouped.items():
+        max_rs = max((_to_float(r.get("Risk Score", 0)) for r in rows), default=0.0)
+        sevs   = [str(r.get("CVSS Severity","")).upper() for r in rows]
+        top_sev = ("CRITICAL" if "CRITICAL" in sevs else
+                   "HIGH"     if "HIGH"     in sevs else
+                   "MEDIUM"   if "MEDIUM"   in sevs else "LOW")
+        kev    = any(str(r.get("Known Exploited Vulnerability","")).upper()=="YES" for r in rows)
+        ranked.append((sw_name, sw_ver, max_rs, top_sev, kev))
+    ranked.sort(key=lambda x: x[2], reverse=True)
+    ranked = ranked[:top_n]
+    if not ranked:
+        return ""
+
+    BAR_H   = 28
+    PAD_L   = 190
+    PAD_R   = 60
+    PAD_T   = 30
+    PAD_B   = 20
+    W       = 600
+    H       = PAD_T + len(ranked) * (BAR_H + 6) + PAD_B
+    MAX_BAR = W - PAD_L - PAD_R
+    max_score = max(r[2] for r in ranked) or 1.0
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'style="font-family:Segoe UI,sans-serif;display:block;margin:16px auto;">',
+        f'<text x="{W//2}" y="18" text-anchor="middle" font-size="12" '
+        f'font-weight="600" fill="#1a1a2e">Top {len(ranked)} Systems by Risk Score</text>',
+    ]
+
+    for i, (sw_name, sw_ver, score, sev, kev) in enumerate(ranked):
+        y      = PAD_T + i * (BAR_H + 6)
+        bar_w  = max(4.0, (score / max_score) * MAX_BAR)
+        colour = sev_colour.get(sev, "#888")
+        label  = f"{sw_name[:26]}{'…' if len(sw_name)>26 else ''}"
+        kev_tag = " ⚠KEV" if kev else ""
+
+        # Background row
+        parts.append(f'<rect x="{PAD_L}" y="{y}" width="{MAX_BAR}" height="{BAR_H}" '
+                     f'fill="#f0f0f0" rx="4"/>')
+        # Filled bar
+        parts.append(f'<rect x="{PAD_L}" y="{y}" width="{bar_w:.1f}" height="{BAR_H}" '
+                     f'fill="{colour}" rx="4" fill-opacity="0.85"/>')
+        # Software name (left)
+        parts.append(f'<text x="{PAD_L-6}" y="{y + BAR_H//2 + 4}" text-anchor="end" '
+                     f'font-size="11" fill="#222">{html.escape(label)}</text>')
+        # Score label (right of bar)
+        parts.append(f'<text x="{PAD_L + bar_w + 5:.1f}" y="{y + BAR_H//2 + 4}" '
+                     f'font-size="10" fill="{colour}" font-weight="700">'
+                     f'{score:.1f}{html.escape(kev_tag)}</text>')
+
+    parts.append('</svg>')
+    return "\n".join(parts)
+
+
+def _svg_cve_heatmap(
+    grouped: Dict[Any, List[Dict[str, Any]]],
+    max_sw: int = 15,
+    max_cves: int = 20,
+) -> str:
+    """
+    CVE × Software severity heatmap for the technical report.
+    Rows = top CVEs (by risk score), Columns = software items.
+    Cell colour = severity of that CVE on that software (grey = not applicable).
+    """
+    sev_fill = {
+        "CRITICAL": "#c0392b",
+        "HIGH":     "#d35400",
+        "MEDIUM":   "#d4ac0d",
+        "LOW":      "#27ae60",
+        "":         "#ececec",
+    }
+
+    # Build CVE → software → severity lookup
+    cve_sw_map: Dict[str, Dict[str, str]] = {}
+    for (sw_name, _sw_ver), rows in grouped.items():
+        for r in rows:
+            cve = str(r.get("CVE ID","")).strip()
+            sev = str(r.get("CVSS Severity","")).upper()
+            if cve:
+                if cve not in cve_sw_map:
+                    cve_sw_map[cve] = {}
+                cve_sw_map[cve][sw_name] = sev
+
+    # Top CVEs by max risk score across all software
+    cve_scores: Dict[str, float] = {}
+    for r in (r for rows in grouped.values() for r in rows):
+        cve = str(r.get("CVE ID","")).strip()
+        rs  = _to_float(r.get("Risk Score",0))
+        if cve and rs > cve_scores.get(cve, 0):
+            cve_scores[cve] = rs
+    top_cves = [c for c, _ in sorted(cve_scores.items(), key=lambda x:-x[1])][:max_cves]
+
+    # Top software by max risk score
+    sw_scores = {
+        sw_name: max((_to_float(r.get("Risk Score",0)) for r in rows), default=0)
+        for (sw_name, _), rows in grouped.items()
+    }
+    top_sw = [s for s, _ in sorted(sw_scores.items(), key=lambda x:-x[1])][:max_sw]
+
+    if not top_cves or not top_sw:
+        return ""
+
+    CELL_W  = max(60, min(90, int(560 / len(top_sw))))
+    CELL_H  = 22
+    PAD_L   = 130
+    PAD_T   = 90
+    W       = PAD_L + CELL_W * len(top_sw) + 20
+    H       = PAD_T + CELL_H * len(top_cves) + 40
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'style="font-family:Segoe UI,sans-serif;display:block;margin:16px auto;'
+        f'overflow:visible;">',
+    ]
+
+    # Column headers (software names — rotated)
+    for ci, sw in enumerate(top_sw):
+        x = PAD_L + ci * CELL_W + CELL_W // 2
+        y = PAD_T - 8
+        label = sw[:16] + ("…" if len(sw) > 16 else "")
+        parts.append(
+            f'<text x="{x}" y="{y}" font-size="9" fill="#333" text-anchor="start" '
+            f'transform="rotate(-45,{x},{y})">{html.escape(label)}</text>'
+        )
+
+    # Rows
+    for ri, cve in enumerate(top_cves):
+        y = PAD_T + ri * CELL_H
+        # Row label
+        parts.append(
+            f'<text x="{PAD_L - 6}" y="{y + CELL_H - 6}" text-anchor="end" '
+            f'font-size="9" fill="#333">{html.escape(cve)}</text>'
+        )
+        # Cells
+        for ci, sw in enumerate(top_sw):
+            x   = PAD_L + ci * CELL_W
+            sev = cve_sw_map.get(cve, {}).get(sw, "")
+            fill = sev_fill.get(sev, sev_fill[""])
+            parts.append(
+                f'<rect x="{x}" y="{y}" width="{CELL_W-1}" height="{CELL_H-1}" '
+                f'fill="{fill}" rx="2"/>'
+            )
+            if sev:
+                abbr = sev[0]  # C / H / M / L
+                parts.append(
+                    f'<text x="{x+CELL_W//2}" y="{y+CELL_H-6}" text-anchor="middle" '
+                    f'font-size="8" font-weight="700" fill="white">{abbr}</text>'
+                )
+
+    # Legend
+    lx = PAD_L
+    ly = H - 28
+    for sev, colour in [("CRITICAL","#c0392b"),("HIGH","#d35400"),
+                         ("MEDIUM","#d4ac0d"),("LOW","#27ae60"),("N/A","#ececec")]:
+        parts.append(f'<rect x="{lx}" y="{ly}" width="12" height="12" fill="{colour}" rx="2"/>')
+        parts.append(f'<text x="{lx+15}" y="{ly+10}" font-size="9" fill="#555">{sev}</text>')
+        lx += 75
+
+    parts.append('</svg>')
+    return "\n".join(parts)
+
+
 def build_executive_report_markdown(
     all_rows: List[Dict[str, Any]],
     report_title: str = "Executive Cyber Risk Brief",
@@ -878,6 +1409,12 @@ def build_executive_report_markdown(
         )
     lines += [urgency_lead, ""]
 
+    # Severity donut chart
+    _donut_svg = _svg_donut(sev_counts, total_cves)
+    if _donut_svg:
+        lines += ["<div style='text-align:center;margin:20px 0;'>",
+                  _donut_svg, "</div>", ""]
+
     # Decision summary box
     lines += [
         "**Leadership decisions required:**",
@@ -945,9 +1482,36 @@ def build_executive_report_markdown(
         f"| Threat actor interest | {'⚠ Elevated' if gn_active_total > 0 else 'Standard'} | {'Active scanning and exploitation attempts observed' if gn_active_total > 0 else 'No anomalous threat activity detected'} |",
         f"| Regulatory/compliance exposure | {'⚠ YES' if kev_total > 0 else 'Potential'} | {'KEV-listed vulnerabilities carry federal remediation mandates' if kev_total > 0 else 'Unpatched critical findings may create compliance gaps'} |",
         "",
-        "---",
-        "",
     ]
+
+    # Likelihood vs Consequence risk matrix
+    _matrix_svg = _svg_risk_matrix(grouped)
+    if _matrix_svg:
+        lines += [
+            "<div style='text-align:center;margin:20px 0;'>",
+            "<p style='font-size:12px;color:#555;margin-bottom:4px;'>"
+            "<em>Figure: Likelihood vs Consequence — each numbered dot represents a software component. "
+            "Upper-right quadrant (red) = highest priority.</em></p>",
+            _matrix_svg,
+            "</div>",
+            "",
+        ]
+
+    # Controls gap heatmap
+    _controls_svg = _svg_controls_heatmap(all_rows, grouped)
+    if _controls_svg:
+        lines += [
+            "<div style='overflow-x:auto;margin:20px 0;'>",
+            "<p style='font-size:12px;color:#555;margin-bottom:4px;'>"
+            "<em>Figure: Security control gap heatmap — darker cells indicate more CVEs "
+            "mapping to a missing control on that system. Prioritize controls in the "
+            "darkest cells.</em></p>",
+            _controls_svg,
+            "</div>",
+            "",
+        ]
+
+    lines += ["---", ""]
 
     # ── SECTION 3 — MOST CRITICAL RISKS ─────────────────────────────────
     lines += [
@@ -957,6 +1521,18 @@ def build_executive_report_markdown(
         "Each entry describes the nature of the risk in operational terms.",
         "",
     ]
+
+    # Top software bar chart
+    _bar_svg = _svg_bar_chart(grouped)
+    if _bar_svg:
+        lines += [
+            "<div style='text-align:center;margin:20px 0;'>",
+            "<p style='font-size:12px;color:#555;margin-bottom:4px;'>"
+            "<em>Figure: Systems ranked by maximum risk score. ⚠KEV = actively exploited.</em></p>",
+            _bar_svg,
+            "</div>",
+            "",
+        ]
 
     # Rank software by criticality
     sw_ranked = sorted(
@@ -2188,8 +2764,22 @@ def build_defensive_report(
         max_epss = max(epss_values)
         lines.append(f"- EPSS range: {min(epss_values)*100:.2f}% – {max_epss*100:.2f}%  |  Mean: {avg_epss*100:.2f}%")
 
+    # CVE × Software severity heatmap
+    _heatmap_svg = _svg_cve_heatmap(grouped)
+    if _heatmap_svg:
+        lines += [
+            "",
+            "<div style='overflow-x:auto;margin:20px 0;'>",
+            "<p style='font-size:12px;color:#555;margin-bottom:4px;'>"
+            "<em>Figure: CVE severity heatmap — rows are top CVEs by risk score, "
+            "columns are software components. C=Critical, H=High, M=Medium, L=Low, "
+            "grey=not applicable to that component.</em></p>",
+            _heatmap_svg,
+            "</div>",
+            "",
+        ]
+
     # Patch age analysis
-    import datetime as _dt
     age_entries: List[int] = []
     overdue_kev: List[Dict[str, Any]] = []
     overdue_crit: List[Dict[str, Any]] = []
