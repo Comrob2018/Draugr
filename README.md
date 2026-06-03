@@ -20,17 +20,19 @@ bash
 pip install -r requirements.txt  
 requirements.txt  
 
-Code  
+```  
 PyQt6  
 requests  
 packaging  
-jsonschema  # optional for enrichment validation  
+jsonschema  # optional for enrichment validation
+```
 ⚙️ Usage  
 Prepare a software list file (see sample_software_list.txt format).  
 Optionally download the CISA KEV JSON feed:  
 
-Code  
+```  
 https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json  
+```
 Optionally create a cpe_mappings.json file to override heuristic matching:  
 
 json  
