@@ -70,6 +70,3 @@ defend_db.json
 nist_db.json  
 ```
 These enable lineage expansion and mapping to MITRE ATT&CK and D3FEND frameworks.  
-
-## 🛡️ License  
-**MIT License** — free for modification and commercial use with attribution.  
