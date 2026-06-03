@@ -1,63 +1,27 @@
-Let me find exactly how the controls are rendered in the technical report.
+No, it wouldn’t. If there’s only one software item, several of the graphics become meaningless or misleading:
 
-There are three locations. Let me check each in context to see exactly what’s being rendered.
+	•	Risk matrix — a single dot on a grid with no other points to compare against tells you nothing. The matrix only has value when you can see relative positioning between multiple items.
+	•	Bar chart — a single bar is just a number with decoration. The severity badges in the executive summary already convey the same information.
+	•	Controls heatmap — a single column heatmap loses its “which systems are missing which controls” comparative value entirely.
 
-Good. Now I can see all three clearly. The issues are:
+The donut chart is the only one that still makes sense with a single software item — it shows the severity breakdown of CVEs which is meaningful regardless of how many systems are scanned.
 
-	•	Location 1 (L2477): [SI-2](url) is the linked ID, but {ctrl} in the second column is the full string e.g. SI-2 Flaw Remediation — the ID is duplicated visibly.
-	•	Location 2 (L2599): The URL is in a raw Reference column as plain text — the inline() handler auto-links it, making the full URL visible.
-	•	Location 3 (L3114): Same as location 1 — [SI-2](url) linked ID, fine.
+The fix is simple — add a minimum item count guard before each SVG is generated:
 
-The fix for all three is the same pattern: make the control ID a hyperlink and remove the raw URL from view.
+In _svg_risk_matrix, return "" if fewer than 2 items:
 
-Change 1 — Per-CVE NIST controls table (L2477)
-
-Before:
-
-            block.append(f"| [{ctrl_id}]({ctrl_url}) | {ctrl} | {note} |")
+    if len(grouped) < 2:
+        return ""
 
 
-After:
+In _svg_bar_chart, already handles single items fine visually but loses comparative value — guard at 2:
 
-            block.append(f"| <a href='{ctrl_url}'>{ctrl_id}</a> | {ctrl} | {note} |")
-
-
-Change 2 — Per-technique NIST controls table (L2599)
-
-The Reference column currently holds the raw URL. Remove the column entirely and make the control ID the link instead.
-
-Before:
-
-            lines.append("| Control | Description | Implementation Note | Reference |")
-            lines.append("|---|---|---|---|")
-            for ctrl in nist:
-                ctrl_id  = ctrl.split()[0] if ctrl.split() else ctrl
-                note     = _NIST_IMPL.get(ctrl_id, "Refer to NIST SP 800-53 Rev 5.")
-                nist_url = f"https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl_id}"
-                lines.append(f"| {ctrl_id} | {ctrl} | {note} | {nist_url} |")
+    if len(ranked) < 2:
+        return ""
 
 
-After:
+In _svg_controls_heatmap, guard at 2 software items:
 
-            lines.append("| Control | Description | Implementation Note |")
-            lines.append("|---|---|---|")
-            for ctrl in nist:
-                ctrl_id  = ctrl.split()[0] if ctrl.split() else ctrl
-                note     = _NIST_IMPL.get(ctrl_id, "Refer to NIST SP 800-53 Rev 5.")
-                nist_url = f"https://csrc.nist.gov/projects/cprt/catalog#/cprt/framework/version/SP_800_53_5_1_0/home?element={ctrl_id}"
-                lines.append(f"| <a href='{nist_url}'>{ctrl_id}</a> | {ctrl} | {note} |")
+    if len(sw_names) < 2 or not top_controls:
+        return ""
 
-
-Change 3 — Section 13 control gaps table (L3114)
-
-Before:
-
-        lines.append(f"| [{ctrl_id}]({ctrl_url}) | {freq} CVEs | {gap_note} | {note} |")
-
-
-After:
-
-        lines.append(f"| <a href='{ctrl_url}'>{ctrl_id}</a> | {freq} CVEs | {gap_note} | {note} |")
-
-
-The markdown [text](url) link syntax relies on the inline() function which isn’t handling it — switching to raw <a> tags means the HTML passthrough handles them correctly via the fix already applied to _markdown_body_to_html. Want me to apply all three?
