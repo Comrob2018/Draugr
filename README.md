@@ -3,7 +3,7 @@ Draugr is a PyQt6 desktop vulnerability intelligence tool that analyzes software
 CISA Known Exploited Vulnerabilities (KEV) catalog, EPSS scores, and public exploit references — to compute a weighted risk score per CVE.  
 It’s designed for analysts and developers who need fast, local vulnerability intelligence without relying on asset inventories or complex CMDBs.  
 
-##🚀 Features  
+## 🚀 Features  
 NVD integration — Queries CVE and CPE APIs directly using your API key.  
 CISA KEV overlay — Flags known exploited vulnerabilities and adds metadata.  
 EPSS scoring — Pulls exploit prediction scores for prioritization.  
@@ -13,26 +13,26 @@ Offline enrichment pipeline — Optional local databases for CWE, CAPEC, ATT&CK,
 CSV export — Generates analyst‑ready reports.  
 PyQt6 GUI — Clean, modular interface with progress tracking and theme support.  
 
-##🧩 Requirements  
-Install dependencies:  
+## 🧩 Requirements  
+### Install dependencies:  
 ```
 pip install -r requirements.txt  
 ```
 
-Contents of requirements.txt:
+#### Contents of requirements.txt:
 ```  
 PyQt6  
 requests  
 packaging  
 jsonschema  # optional for enrichment validation
 ```
-##⚙️ Usage  
+## ⚙️ Usage  
 *  **Prepare a software list file** (see sample_list.txt, or sample_list.csv in resources folder).
-Optionally download the CISA KEV JSON feed:  
+#### Optionally download the CISA KEV JSON feed:  
 ```  
 https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json  
 ```
-Optionally create a cpe_mappings.json file to override heuristic matching:  
+#### Optionally create a cpe_mappings.json file to override heuristic matching:  
 json  
 ```
 {  
@@ -46,16 +46,21 @@ json
 python draugr.py  
 ```
 
-##📂 Output  
-CSV report — Contains CVE details, risk scores, exploit indicators, and KEV flags.  
-HTML Reports  
-Executive Report - Focused C-Suite sytle report  
-Technical Report - Technical implementation for mitigations and remediations
-Red Team Report - Report that proposes attack paths and 
+## 📂 Output  
+### CSV report — Contains CVE details, risk scores, exploit indicators, and KEV flags.  
+### HTML Reports  
+* Executive Report - Focused C-Suite sytle report  
+* Technical Report - Technical implementation for mitigations and remediations
+* Red Team Report - Report that proposes attack paths full target profile
+* Fleet Report - report showing any cve details that affect multiple systems over multiple systems
+### Excel reports
+* POA&M - Plan of action and milestones for cves
+### SBOM
+* JSON software bill of materials in the CycloneDX 1.5 format
 
 
-##🧠 Optional Enrichment Databases  
-Place these JSON files in the resources/ directory for deeper analysis:  
+## 🧠 Optional Enrichment Databases  
+### Place these JSON files in the resources/ directory for deeper analysis:  
 ```
 cwe_db.json  
 capec_db.json  
