@@ -27,7 +27,7 @@ packaging
 jsonschema  # optional for enrichment validation
 ```
 ⚙️ Usage  
-Prepare a software list file (see sample_software_list.txt, or .csv format).  
+Prepare a software list file (see sample_list.txt, or sample_list.csv in resources folder).  
 Optionally download the CISA KEV JSON feed:  
 
 ```  
