@@ -35,28 +35,23 @@ CPE MAPPING FILE (optional — cpe_mappings.json):
 # ----------------------------------------------------------------------
 # Standard library imports
 # ----------------------------------------------------------------------
-import base64
 import csv
 import datetime
-import hashlib
 import html
 import json
 import os
 import re
 import sys
 import time
-import sqlite3
 import argparse
-from collections import defaultdict, Counter
 from pathlib import Path
 from packaging.version import Version, InvalidVersion
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus
-from resources.mitre_attack_scenarios import TECHNIQUE_SCENARIOS as SCENARIOS, get_tactics, get_impact
 
 # Draugr companion modules (imported with fallback so headless CLI still works)
 try:
-    from draugr_themes import get_theme, set_theme, load_saved_theme, qt_stylesheet, t as _t, THEMES, report_css_overrides
+    from draugr_themes import set_theme, load_saved_theme, qt_stylesheet, t as _t, THEMES
     HAS_THEMES = True
     load_saved_theme()
 except ImportError:
@@ -80,13 +75,13 @@ except ImportError:
     def collect_report_sections(rows): return ""   # type: ignore
 
 try:
-    from draugr_ics import enrich_row_with_ics, ics_summary_section, is_ics_relevant
+    from draugr_ics import enrich_row_with_ics
     HAS_ICS = True
 except ImportError:
     HAS_ICS = False
 
 try:
-    from draugr_cache import DraugrDB, get_db as _get_db, extract_system_id
+    from draugr_cache import get_db as _get_db, extract_system_id
     HAS_CACHE = True
 except ImportError:
     HAS_CACHE = False
@@ -100,7 +95,7 @@ except ImportError:
     HAS_DIFF = False
 
 try:
-    from draugr_advisories import resolve_advisory, enrich_rows_with_advisories
+    from draugr_advisories import resolve_advisory
     HAS_ADVISORIES = True
 except ImportError:
     HAS_ADVISORIES = False
@@ -132,10 +127,6 @@ try:
         enrich_rows_with_remediation,
         remediation_summary,
         remediation_report_section,
-        upsert_item as _rem_upsert,
-        suggest_due_date as _rem_suggest_due,
-        STATUS_OPEN, STATUS_IN_PROGRESS, STATUS_MITIGATED,
-        STATUS_ACCEPTED_RISK, STATUS_RESOLVED, ALL_STATUSES,
     )
     HAS_REMEDIATION = True
 except ImportError:
@@ -175,10 +166,10 @@ except ImportError:  # pragma: no cover
     requests = None
 
 try:
-    from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+    from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
     from PyQt6.QtGui import (
-        QAction, QColor, QDesktopServices, QFont, QLinearGradient,
-        QPainter, QPainterPath, QPalette, QPixmap, QRadialGradient,
+        QAction, QColor, QDesktopServices, QFont, QKeySequence, QLinearGradient,
+        QPainter, QPainterPath, QPalette, QPixmap, QRadialGradient, QShortcut,
     )
     from PyQt6.QtWidgets import (
         QApplication,
@@ -190,11 +181,12 @@ try:
         QLabel,
         QLineEdit,
         QMainWindow,
+        QMenu,
         QMessageBox,
         QProgressBar,
         QPushButton,
         QSplashScreen,
-        QSizePolicy,
+        QStackedWidget,
         QTextBrowser,
         QTextEdit,
         QVBoxLayout,
@@ -216,7 +208,7 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
-DRAUGR_VERSION = "2.2.0"
+DRAUGR_VERSION = "2.2.1"
 # GitHub repository for update checks — format: "owner/repo"
 # Configurable via Settings → Update Settings. Stored in prefs.json.
 _GITHUB_REPO: str = "https://github.com/Comrob2018/Draugr/tree/main"
@@ -2082,7 +2074,7 @@ class FileRow(QWidget):
         }}
     """
 
-    def __init__(self, label_text, placeholder="", is_file=False, file_filter="",pick_folder=False, parent=None):
+    def __init__(self, label_text, placeholder="", is_file=False, file_filter="", pick_folder=False, recent_menu=None, parent=None):
         super().__init__(parent)
         self.is_save = is_file
         self.file_filter = file_filter
@@ -2101,6 +2093,9 @@ class FileRow(QWidget):
         self.input = QLineEdit()
         self.input.setPlaceholderText(placeholder)
         self.input.setStyleSheet(self.INPUT_STYLE)
+        self.input.setAcceptDrops(True)
+        self.input.dragEnterEvent = self._drag_enter
+        self.input.dropEvent      = self._drop
         layout.addWidget(self.input, 1)
         if self.pick_folder or self.is_save:
             btn = QPushButton("Browse")
@@ -2109,6 +2104,33 @@ class FileRow(QWidget):
             btn.setStyleSheet(self.BTN_STYLE)
             btn.clicked.connect(self._browse)
             layout.addWidget(btn)
+
+        if recent_menu is not None:
+            self._recent_btn = QPushButton("🕐")
+            self._recent_btn.setFixedSize(28, 28)
+            self._recent_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._recent_btn.setToolTip("Recent files")
+            self._recent_btn.setStyleSheet(self.BTN_STYLE)
+            self._recent_btn.clicked.connect(
+                lambda: recent_menu.exec(
+                    self._recent_btn.mapToGlobal(
+                        self._recent_btn.rect().bottomLeft()
+                    )
+                )
+            )
+            layout.addWidget(self._recent_btn)
+
+    def _drag_enter(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _drop(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            self.input.setText(urls[0].toLocalFile())
+            event.acceptProposedAction()
 
     def _browse(self):
         if self.pick_folder:
@@ -2151,7 +2173,7 @@ class ScanWorker(QThread):
     status_signal = pyqtSignal(str)          # status bar text
     risk_signal = pyqtSignal(str)            # "normal" | "kev" | "critical"
     finished_signal = pyqtSignal()
-    error_signal = pyqtSignal(str) 
+    error_signal = pyqtSignal(str)
 
     def __init__(self, software, kev_path, api_key, output_path, cpe_mapping_path="",
                  show_medium=True, show_low=True, show_unverified=True, resources_dir="", executive_report_path="", comp_report_path="",
@@ -2606,6 +2628,7 @@ class ScanWorker(QThread):
                     elif affected is None:
                         l_cves_unverified.append(cid)
 
+            # ----- Risk signal for progress bar colour -----
             if critical_count > 0:
                 self.risk_signal.emit("critical")
             elif any(
@@ -2983,16 +3006,21 @@ class ScanWorker(QThread):
             self._write_logs()
             self.finished_signal.emit()
 
+
+# ----------------------------------------------------------------------
+# Toast notification widget
+# ----------------------------------------------------------------------
 class Toast(QFrame):
     """
-    Slide-in / fade-out toast notification displayed in the bottom-right
-    of the parent window.  Call Toast.show_toast(parent, message, level).
+    Slide-in toast notification displayed in the bottom-right corner of
+    the parent window.  Call Toast.show_toast(parent, message, level).
+    Disappears automatically after duration_ms milliseconds.
     """
     _LEVELS = {
-        "ok":     ("#0a1f0a", C.GREEN,  "✓"),
-        "warn":   ("#2a1400", C.ORANGE, "⚠"),
-        "error":  ("#3a0a0a", C.RED,    "✕"),
-        "info":   ("#0a0f1f", C.BLUE,   "ℹ"),
+        "ok":    ("#0a1f0a", C.GREEN,  "✓"),
+        "warn":  ("#2a1400", C.ORANGE, "⚠"),
+        "error": ("#3a0a0a", C.RED,    "✕"),
+        "info":  ("#0a0f1f", C.BLUE,   "ℹ"),
     }
 
     def __init__(self, parent, message: str, level: str = "info", duration_ms: int = 4000):
@@ -3006,34 +3034,38 @@ class Toast(QFrame):
         layout.setSpacing(10)
 
         icon_lbl = QLabel(icon)
-        icon_lbl.setStyleSheet(f"color: {fg}; font-size: 16px; border: none; background: transparent;")
+        icon_lbl.setStyleSheet(
+            f"color: {fg}; font-size: 16px; border: none; background: transparent;"
+        )
         layout.addWidget(icon_lbl)
 
         msg_lbl = QLabel(message)
-        msg_lbl.setStyleSheet(f"color: {fg}; font-size: 12px; border: none; background: transparent;")
+        msg_lbl.setStyleSheet(
+            f"color: {fg}; font-size: 12px; border: none; background: transparent;"
+        )
         msg_lbl.setWordWrap(True)
         layout.addWidget(msg_lbl, 1)
 
         self.setFixedWidth(360)
         self.adjustSize()
-        self._position_self()
+        self._reposition()
         self.show()
         self.raise_()
-
         QTimer.singleShot(duration_ms, self.deleteLater)
 
-    def _position_self(self):
+    def _reposition(self):
         p = self.parent()
         if p:
-            x = p.width()  - self.width()  - 16
-            y = p.height() - self.height() - 16
-            self.move(x, y)
+            self.move(p.width() - self.width() - 16, p.height() - self.height() - 16)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition()
 
     @staticmethod
     def show_toast(parent, message: str, level: str = "info", duration_ms: int = 4000):
-        t = Toast(parent, message, level, duration_ms)
-        return t
-    
+        return Toast(parent, message, level, duration_ms)
+
 
 # ----------------------------------------------------------------------
 # Main window
@@ -3047,11 +3079,15 @@ class CVEScannerWindow(QMainWindow):
         self.scanning    = False
         self.worker      = None
         self.logging     = False
+        self.show_medium    = False
+        self.show_low       = False
+        self.show_unverified = False
         self._scan_rows: List[Dict[str, Any]] = []   # last scan results for browser
         self._profiles:  Dict[str, Dict[str, Any]] = self._load_profiles()
         self._tags:      Dict[str, str] = self._load_tags()
         _load_github_repo()   # pre-load repo slug from prefs
         self._build_ui()
+        self._setup_shortcuts()
         # Async version check
         if HAS_CACHE:
             try:
@@ -3100,9 +3136,79 @@ class CVEScannerWindow(QMainWindow):
         except Exception:
             pass
 
-    def _copy_log(self):
-        from PyQt6.QtWidgets import QApplication
-        QApplication.clipboard().setText(self.log.toPlainText())
+    def _load_ui_prefs(self) -> Dict[str, Any]:
+        try:
+            from draugr_cache import _default_cache_dir
+            path = _default_cache_dir() / "ui_prefs.json"
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_ui_prefs(self, prefs: Dict[str, Any]) -> None:
+        try:
+            from draugr_cache import _default_cache_dir
+            path = _default_cache_dir() / "ui_prefs.json"
+            existing: Dict[str, Any] = {}
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            existing.update(prefs)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+        except Exception:
+            pass
+
+    def _save_recent_file(self, path: str) -> None:
+        if not path:
+            return
+        prefs = self._load_ui_prefs()
+        recent: List[str] = prefs.get("recent_sw_files", [])
+        if path in recent:
+            recent.remove(path)
+        recent.insert(0, path)
+        recent = recent[:5]   # keep last 5
+        self._save_ui_prefs({"recent_sw_files": recent})
+        self._refresh_recent_menu()
+
+    def _refresh_recent_menu(self) -> None:
+        if not hasattr(self, "_recent_menu"):
+            return
+        self._recent_menu.clear()
+        recent = self._load_ui_prefs().get("recent_sw_files", [])
+        if not recent:
+            act = self._recent_menu.addAction("No recent files")
+            act.setEnabled(False)
+            return
+        for p in recent:
+            act = self._recent_menu.addAction(p)
+            act.triggered.connect(lambda _checked, fp=p: self.sw_row.setText(fp))
+
+    def _save_col_widths(self, _index: int = 0, _old: int = 0, _new: int = 0) -> None:
+        widths = [
+            self._results_table.columnWidth(i)
+            for i in range(self._results_table.columnCount())
+        ]
+        self._save_ui_prefs({"results_col_widths": widths})
+
+    def _restore_col_widths(self) -> None:
+        widths = self._load_ui_prefs().get("results_col_widths", [])
+        if not widths:
+            return
+        try:
+            self._results_table.horizontalHeader().sectionResized.disconnect(
+                self._save_col_widths
+            )
+        except (TypeError, RuntimeError):
+            pass   # not connected — safe to ignore
+        for i, w in enumerate(widths):
+            if i < self._results_table.columnCount() and w > 0:
+                self._results_table.setColumnWidth(i, w)
+        self._results_table.horizontalHeader().sectionResized.connect(
+            self._save_col_widths
+        )
 
     def _build_ui(self):
         central = QWidget()
@@ -3123,7 +3229,7 @@ class CVEScannerWindow(QMainWindow):
         header_outer.setContentsMargins(0, 0, 0, 0)
         header_outer.setSpacing(0)
 
-        # Left accent bar (suggestion 2)
+        # Left accent bar
         accent_bar = QFrame()
         accent_bar.setFixedWidth(4)
         accent_bar.setStyleSheet(f"background: {C.ACCENT}; border: none;")
@@ -3134,7 +3240,7 @@ class CVEScannerWindow(QMainWindow):
         header_inner.setContentsMargins(16, 10, 16, 10)
         header_inner.setSpacing(0)
 
-        # Logo + subtitle stacked (suggestions 1 & 3)
+        # Logo + subtitle stacked
         logo_col = QVBoxLayout()
         logo_col.setSpacing(1)
         logo_label = QLabel("DRAUGR")
@@ -3152,7 +3258,7 @@ class CVEScannerWindow(QMainWindow):
         header_inner.addLayout(logo_col)
         header_inner.addStretch()
 
-        # Right meta column: version, last scan, CVE count (suggestions 1 & 4)
+        # Right meta column: version, last scan, status dot
         meta_col = QVBoxLayout()
         meta_col.setSpacing(2)
         meta_col.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -3171,7 +3277,6 @@ class CVEScannerWindow(QMainWindow):
             f"background: transparent; border: none;"
         )
 
-        # Status dot (suggestion 6)
         self._status_dot = QLabel("●  IDLE")
         self._status_dot.setAlignment(Qt.AlignmentFlag.AlignRight)
         self._status_dot.setStyleSheet(
@@ -3207,23 +3312,54 @@ class CVEScannerWindow(QMainWindow):
         card_layout.setContentsMargins(24, 20, 24, 20)
         card_layout.setSpacing(10)
 
+        # Collapsible header row
+        card_header_row = QHBoxLayout()
+        card_header_row.setContentsMargins(0, 0, 0, 0)
         section = QLabel("CONFIGURATION")
         section.setStyleSheet(
             f"color: {C.ACCENT}; font-size: 11px; font-weight: 600; letter-spacing: 2px; border: none;"
         )
-        card_layout.addWidget(section)
+        self._card_toggle_btn = QPushButton("▲")
+        self._card_toggle_btn.setFixedSize(22, 22)
+        self._card_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._card_toggle_btn.setToolTip("Collapse / expand configuration")
+        self._card_toggle_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.FG_DIM}; border: none; "
+            f"font-size: 10px; font-weight: 700; }}"
+            f"QPushButton:hover {{ color: {C.FG}; }}"
+        )
+        self._card_collapsed = False
+        card_header_row.addWidget(section)
+        card_header_row.addStretch()
+        card_header_row.addWidget(self._card_toggle_btn)
+        card_layout.addLayout(card_header_row)
 
+        # Body widget — all fields go inside this so it can be hidden as one unit
+        self._card_body = QWidget()
+        card_body_layout = QVBoxLayout(self._card_body)
+        card_body_layout.setContentsMargins(0, 0, 0, 0)
+        card_body_layout.setSpacing(10)
+
+        self._recent_menu = QMenu(self)
+        self._recent_menu.setStyleSheet(
+            f"QMenu {{ background:{C.BG_CARD}; color:{C.FG}; border:1px solid {C.BORDER}; "
+            f"border-radius:6px; padding:4px 0; font-size:11px; }}"
+            f"QMenu::item {{ padding:5px 16px; }}"
+            f"QMenu::item:selected {{ background:{C.BG_HOVER}; }}"
+        )
         self.sw_row = FileRow(
             "Software List ", "Path to file …",
-            is_file=True,file_filter="CSV and Text files (*.csv *.txt);;All files (*)",
+            is_file=True, file_filter="CSV and Text files (*.csv *.txt);;All files (*)",
+            recent_menu=self._recent_menu,
         )
-        card_layout.addWidget(self.sw_row)
+        card_body_layout.addWidget(self.sw_row)
+        self._refresh_recent_menu()
 
         self.out_row = FileRow(
             "Output Directory ", "Enter folder name …",
             file_filter="",
         )
-        card_layout.addWidget(self.out_row)
+        card_body_layout.addWidget(self.out_row)
 
         # --- Optional fields (hidden by default, toggled via Settings menu) ---
         self.kev_row = FileRow(
@@ -3231,7 +3367,7 @@ class CVEScannerWindow(QMainWindow):
             is_file=True,file_filter="JSON files (*.json);;All files (*)",
         )
         self.kev_row.setVisible(False)
-        card_layout.addWidget(self.kev_row)
+        card_body_layout.addWidget(self.kev_row)
 
         self.cpe_row = FileRow(
             "CPE Mappings ", "Optional — cpe_mappings.json",
@@ -3240,7 +3376,7 @@ class CVEScannerWindow(QMainWindow):
         if os.path.isfile(CPE_MAPPING_DEFAULT):
             self.cpe_row.setText(CPE_MAPPING_DEFAULT)
         self.cpe_row.setVisible(False)
-        card_layout.addWidget(self.cpe_row)
+        card_body_layout.addWidget(self.cpe_row)
 
         self.resources_row = FileRow(
             "Resources Dir ", "Optional — folder with cwe_db.json, capec_db.json, etc.",
@@ -3249,7 +3385,7 @@ class CVEScannerWindow(QMainWindow):
         if os.path.isdir(_RESOURCES_DIR):
             self.resources_row.setText(_RESOURCES_DIR)
         self.resources_row.setVisible(False)
-        card_layout.addWidget(self.resources_row)
+        card_body_layout.addWidget(self.resources_row)
 
         # API key entry (hidden by default)
         self.api_widget = QWidget()
@@ -3270,7 +3406,7 @@ class CVEScannerWindow(QMainWindow):
         api_layout.addWidget(self.api_input, 1)
 
         self.api_widget.setVisible(False)
-        card_layout.addWidget(self.api_widget)
+        card_body_layout.addWidget(self.api_widget)
 
         # OTX API key entry (hidden by default)
         self.otx_widget = QWidget()
@@ -3293,7 +3429,10 @@ class CVEScannerWindow(QMainWindow):
         otx_layout.addWidget(self.otx_input, 1)
 
         self.otx_widget.setVisible(False)
-        card_layout.addWidget(self.otx_widget)
+        card_body_layout.addWidget(self.otx_widget)
+
+        card_layout.addWidget(self._card_body)
+        self._card_toggle_btn.clicked.connect(self._toggle_config_card)
 
         root.addWidget(card)
 
@@ -3328,13 +3467,15 @@ class CVEScannerWindow(QMainWindow):
         self.scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_btn.setFixedSize(200, 44)
         self.scan_btn.setStyleSheet(ACTION_BTN_STYLE)
-        self._scan_btn_default_style = ACTION_BTN_STYLE
+        self.scan_btn.setToolTip("Start a new scan  (Ctrl+R)")
+        self._scan_btn_default_style = ACTION_BTN_STYLE   # saved for reset after feedback
 
         self.stop_btn = QPushButton("■   Stop Scan")
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_btn.setFixedSize(200, 44)
         self.stop_btn.setEnabled(False)
         self.stop_btn.setStyleSheet(ACTION_BTN_STYLE)
+        self.stop_btn.setToolTip("Stop the running scan  (Ctrl+.)")
 
         self.skip_btn = QPushButton("⏭   Skip Current")
         self.skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3430,6 +3571,7 @@ class CVEScannerWindow(QMainWindow):
             f"color: {C.FG_DIM}; font-size: 10px; font-weight: 600; letter-spacing: 2px;"
         )
         filter_row.addWidget(log_label)
+
         _log_btn_style = (
             f"QPushButton {{ background: {C.BG_INPUT}; color: {C.FG_DIM}; "
             f"border: 1px solid {C.BORDER}; border-radius: 4px; "
@@ -3449,6 +3591,7 @@ class CVEScannerWindow(QMainWindow):
         log_clear_btn.setStyleSheet(_log_btn_style)
         log_clear_btn.clicked.connect(lambda: self.log.clear())
         filter_row.addWidget(log_clear_btn)
+
         filter_row.addStretch()
 
         self.chk_medium = QCheckBox("Show MEDIUM")
@@ -3573,9 +3716,18 @@ class CVEScannerWindow(QMainWindow):
         self._kev_filter.setStyleSheet(CHECKBOX_STYLE)
         self._kev_filter.stateChanged.connect(self._apply_results_filter)
 
+        self._unverified_filter = QCheckBox("Unverified only")
+        self._unverified_filter.setToolTip(
+            "Show only findings where the version match could not be confirmed\n"
+            "(Version Confirmed = Unverified)"
+        )
+        self._unverified_filter.setStyleSheet(CHECKBOX_STYLE)
+        self._unverified_filter.stateChanged.connect(self._apply_results_filter)
+
         filter_bar.addWidget(self._results_filter, 1)
         filter_bar.addWidget(self._sev_filter)
         filter_bar.addWidget(self._kev_filter)
+        filter_bar.addWidget(self._unverified_filter)
         results_left_layout.addLayout(filter_bar)
 
         RESULTS_TABLE_COLS = ["CVE ID", "Software", "Severity", "Risk", "CVSS", "KEV", "Exploit", "EPSS"]
@@ -3598,7 +3750,34 @@ class CVEScannerWindow(QMainWindow):
                 self._results_table.row(current) if current else -1
             )
         )
-        results_left_layout.addWidget(self._results_table)
+        self._results_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._results_table.customContextMenuRequested.connect(self._results_context_menu)
+        self._results_table.horizontalHeader().sectionResized.connect(
+            self._save_col_widths
+        )
+
+        # Empty state placeholder shown when no results are loaded
+        _empty_widget = QWidget()
+        _empty_layout = QVBoxLayout(_empty_widget)
+        _empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _empty_icon = QLabel("🔍")
+        _empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _empty_icon.setStyleSheet("font-size: 48px; background: transparent; border: none;")
+        _empty_text = QLabel("No results loaded\nRun a scan or load a CSV to get started")
+        _empty_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _empty_text.setStyleSheet(
+            f"color: {C.FG_DIM}; font-size: 13px; background: transparent; "
+            f"border: none; line-height: 1.6;"
+        )
+        _empty_layout.addWidget(_empty_icon)
+        _empty_layout.addSpacing(8)
+        _empty_layout.addWidget(_empty_text)
+
+        self._results_stack = QStackedWidget()
+        self._results_stack.addWidget(_empty_widget)      # index 0 — empty state
+        self._results_stack.addWidget(self._results_table) # index 1 — table
+        self._results_stack.setCurrentIndex(0)
+        results_left_layout.addWidget(self._results_stack)
         results_splitter.addWidget(results_left)
 
         # Right: CVE detail panel
@@ -3649,16 +3828,7 @@ class CVEScannerWindow(QMainWindow):
         )
         root.addSpacing(4)
         root.addWidget(self.status_label)
-
-    def _blink_status_dot(self):
-        self._dot_blink_state = not self._dot_blink_state
-        color = C.RED if self._dot_blink_state else C.FG_DIM
-        self._status_dot.setStyleSheet(
-            f"color: {color}; font-size: 10px; "
-            f"background: transparent; border: none;"
-        )
-
-
+    
     # Slot that runs whenever the Medium checkbox changes
     def _update_show_medium(self):
         self.show_medium = self.chk_medium.isChecked()
@@ -3671,11 +3841,25 @@ class CVEScannerWindow(QMainWindow):
         self.show_low = self.chk_low.isChecked()
         if self.worker is not None:
             self.worker.show_low = self.show_low
-    
+
+    # Slot that runs whenever the Show Unverified checkbox changes
     def _update_show_unverified(self):
         self.show_unverified = self.chk_unverified.isChecked()
         if self.worker is not None:
             self.worker.show_unverified = self.show_unverified
+
+    def _blink_status_dot(self):
+        self._dot_blink_state = not self._dot_blink_state
+        color = C.RED if self._dot_blink_state else C.FG_DIM
+        self._status_dot.setStyleSheet(
+            f"color: {color}; font-size: 10px; "
+            f"background: transparent; border: none;"
+        )
+
+    def _toggle_config_card(self):
+        self._card_collapsed = not self._card_collapsed
+        self._card_body.setVisible(not self._card_collapsed)
+        self._card_toggle_btn.setText("▼" if self._card_collapsed else "▲")
 
     # --------------------------------------------------------------
     # Menu bar
@@ -3774,7 +3958,7 @@ class CVEScannerWindow(QMainWindow):
 
         self._act_write_logs = QAction("Write Logs to File", self)
         self._act_write_logs.setCheckable(True)
-        self._act_write_logs.setChecked(False)
+        self._act_write_logs.setChecked(True)
         settings_menu.addAction(self._act_write_logs)
 
         settings_menu.addSeparator()
@@ -3861,17 +4045,42 @@ class CVEScannerWindow(QMainWindow):
         safe_msg = html.escape(msg).replace("\n", "<br>")
         self.log.append(f'<span style="color:{color}">{safe_msg}</span>')
 
-    def _update_progress_bar_color(self, level: str):
-        if level == "critical":
-            color = C.RED
-        elif level == "kev":
-            color = C.ORANGE
-        else:
-            color = C.GREEN
-        self.progress_bar.setStyleSheet(
-            f"QProgressBar {{ background: {C.BG_CARD}; border: none; border-radius: 3px; }}"
-            f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
-        )
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._start_scan)
+        QShortcut(QKeySequence("Ctrl+."), self, activated=self._stop_scan)
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=lambda: self.log.clear())
+        QShortcut(QKeySequence("Ctrl+W"), self, activated=self.close)
+
+    def closeEvent(self, event):
+        if self.scanning:
+            reply = QMessageBox(self)
+            reply.setWindowTitle("Scan in Progress")
+            reply.setText("A scan is currently running.\nAre you sure you want to quit?")
+            reply.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            reply.setDefaultButton(QMessageBox.StandardButton.No)
+            reply.setStyleSheet(self.styleSheet())
+            if reply.exec() != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            if self.worker:
+                self.worker.requestInterruption()
+        event.accept()
+
+    def _styled_msgbox(self, level: str, title: str, text: str) -> None:
+        """Drop-in replacement for QMessageBox.critical/warning/information styled to the theme."""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setStyleSheet(self.styleSheet())
+        icon_map = {
+            "critical":    QMessageBox.Icon.Critical,
+            "warning":     QMessageBox.Icon.Warning,
+            "information": QMessageBox.Icon.Information,
+        }
+        box.setIcon(icon_map.get(level, QMessageBox.Icon.Information))
+        box.exec()
 
     def _update_progress(self, current: int, total: int):
         self.progress_bar.setMaximum(max(total, 1))
@@ -3890,16 +4099,33 @@ class CVEScannerWindow(QMainWindow):
 
     def _update_status(self, text: str):
         self.status_label.setText(text)
-        # Extract the item name from "Scanning: N of M — <name>" for the progress label
+        # Extract item name from "Scanning: N of M — <name>" for the progress label
         if text.startswith("Scanning:") and " — " in text:
-            # Take everything after the first " — ", strip any " — Enriching: …" suffix
             after_dash = text.split(" — ", 1)[1]
-            item_name = after_dash.split(" — ")[0].strip()
-            self._scan_current_item = item_name
+            self._scan_current_item = after_dash.split(" — ")[0].strip()
             self._refresh_progress_label()
         elif not text.startswith("Scanning:"):
             self._scan_current_item = ""
             self._refresh_progress_label()
+
+    def _update_progress_bar_color(self, level: str):
+        if level == "critical":
+            color = C.RED
+        elif level == "kev":
+            color = C.ORANGE
+        else:
+            color = C.GREEN
+        self.progress_bar.setStyleSheet(
+            f"QProgressBar {{ background: {C.BG_CARD}; border: none; border-radius: 3px; }}"
+            f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
+        )
+
+    def _reset_scan_button(self):
+        self.scan_btn.setText("▶   Start Scan")
+        self.scan_btn.setStyleSheet(self._scan_btn_default_style)
+
+    def _copy_log(self):
+        QApplication.clipboard().setText(self.log.toPlainText())
 
     def _scan_finished(self):
         self._append_log("Scan Finished.", "info")
@@ -3914,47 +4140,53 @@ class CVEScannerWindow(QMainWindow):
             f"background: transparent; border: none;"
         )
 
-        # Show result-aware button label for 3 seconds then revert
+        # Populate results browser — guard against cancelled/errored scans
         completed_rows = getattr(self.worker, '_completed_rows', None)
+
+        # Result-aware button feedback for 3 seconds then revert
         has_critical = any(
-            str(r.get("CVSS Severity","")).upper() == "CRITICAL"
+            str(r.get("CVSS Severity", "")).upper() == "CRITICAL"
             for r in (completed_rows or [])
         )
         has_kev = any(
-            str(r.get("Known Exploited Vulnerability","")).upper() == "YES"
+            str(r.get("Known Exploited Vulnerability", "")).upper() == "YES"
             for r in (completed_rows or [])
         )
         if has_critical or has_kev:
             self.scan_btn.setText("⚠  Issues Found")
-            self.scan_btn.setStyleSheet(self.scan_btn.styleSheet().replace(C.RED, C.ORANGE))
+            self.scan_btn.setStyleSheet(
+                self._scan_btn_default_style.replace(C.RED, C.ORANGE)
+            )
         elif completed_rows:
             self.scan_btn.setText("✓  Scan Complete")
-            self.scan_btn.setStyleSheet(self.scan_btn.styleSheet().replace(C.RED, C.GREEN))
+            self.scan_btn.setStyleSheet(
+                self._scan_btn_default_style.replace(C.RED, C.GREEN)
+            )
         else:
             self.scan_btn.setText("▶   Start Scan")
-
         QTimer.singleShot(3000, self._reset_scan_button)
-        try:
-            self.worker._write_logs()
-        except Exception:
-            pass
-        # Populate results browser — guard against cancelled/errored scans
-        completed_rows = getattr(self.worker, '_completed_rows', None)
+
+        # Toast notification
         if completed_rows:
             kev_count  = sum(1 for r in completed_rows
-                            if str(r.get("Known Exploited Vulnerability","")).upper() == "YES")
+                             if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
             crit_count = sum(1 for r in completed_rows
-                            if str(r.get("CVSS Severity","")).upper() == "CRITICAL")
-            total      = len(completed_rows)
-            parts = [f"{total} CVE{'s' if total != 1 else ''} found"]
+                             if str(r.get("CVSS Severity", "")).upper() == "CRITICAL")
+            total_found = len(completed_rows)
+            parts = [f"{total_found} CVE{'s' if total_found != 1 else ''} found"]
             if crit_count:
                 parts.append(f"{crit_count} CRITICAL")
             if kev_count:
                 parts.append(f"{kev_count} KEV")
-            level = "error" if (crit_count or kev_count) else "ok"
-            Toast.show_toast(self, "Scan complete — " + ", ".join(parts), level)
+            toast_level = "error" if (crit_count or kev_count) else "ok"
+            Toast.show_toast(self, "Scan complete — " + ", ".join(parts), toast_level)
         else:
             Toast.show_toast(self, "Scan stopped — no results", "warn")
+
+        try:
+            self.worker._write_logs()
+        except Exception:
+            pass
 
         if completed_rows:
             self._scan_rows = completed_rows
@@ -3967,12 +4199,9 @@ class CVEScannerWindow(QMainWindow):
             self._header_scan_label.setText(
                 f"Last scan: {_now}  ·  {len(self._scan_rows)} CVEs"
             )
+            self.tab_widget.setTabText(1, f"🔍  Results ({len(self._scan_rows)})")
             self.tab_widget.setCurrentIndex(1)
         self.worker = None
-
-    def _reset_scan_button(self):
-        self.scan_btn.setText("▶   Start Scan")
-        self.scan_btn.setStyleSheet(self._scan_btn_default_style)
 
     def _start_scan(self, generate_executive_report: bool = False):
         if self.scanning:
@@ -3980,11 +4209,11 @@ class CVEScannerWindow(QMainWindow):
 
         sw_path = self.sw_row.text()
         if not sw_path or not os.path.isfile(sw_path):
-            QMessageBox.critical(self, "Error", "Please select a valid software list file.")
+            self._styled_msgbox("critical", "Error", "Please select a valid software list file.")
             return
         out_path = self.out_row.text()
         if not out_path:
-            QMessageBox.critical(self, "Error", "Please specify an output path.")
+            self._styled_msgbox("critical", "Error", "Please specify an output path.")
             return
         base_dir = Path("results")
         user_dir = Path(self.out_row.text())
@@ -4017,10 +4246,10 @@ class CVEScannerWindow(QMainWindow):
         try:
             software = parse_software_input(sw_path)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to parse software list:\n{exc}")
+            self._styled_msgbox("critical", "Error", f"Failed to parse software list:\n{exc}")
             return
         if not software:
-            QMessageBox.warning(self, "Warning", "Software list is empty.")
+            self._styled_msgbox("warning", "Warning", "Software list is empty.")
             return
 
         self.scanning = True
@@ -4028,11 +4257,12 @@ class CVEScannerWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.skip_btn.setEnabled(True)
         self.scan_btn.setText("Scanning …")
+        self.tab_widget.setTabText(1, "🔍  Results Browser")
         self.log.clear()
         self.progress_bar.setValue(0)
         self.progress_label.setText("")
         self._scan_progress_text = ""
-        self._scan_current_item = ""
+        self._scan_current_item  = ""
         self._update_progress_bar_color("normal")
         self._status_dot.setText("●  SCANNING")
         self._dot_timer.start()
@@ -4044,6 +4274,7 @@ class CVEScannerWindow(QMainWindow):
  
         self._append_log(f"Starting scan of {len(software)} entries …", "info")
         self._update_status(f"Starting scan of {len(software)} entries …")
+        self._save_recent_file(sw_path)
         self.worker = ScanWorker(
             software, kev_path, api_key, csv_path, cpe_path,
             show_medium=self.chk_medium.isChecked(),
@@ -4105,6 +4336,8 @@ class CVEScannerWindow(QMainWindow):
                 self._results_table.setItem(ri, ci, item)
         self._results_table.setSortingEnabled(True)
         self._results_table.resizeColumnsToContents()
+        self._restore_col_widths()
+        self._results_stack.setCurrentIndex(1 if rows else 0)
 
     def _apply_results_filter(self) -> None:
         text    = self._results_filter.text().lower().strip()
@@ -4141,6 +4374,90 @@ class CVEScannerWindow(QMainWindow):
         row = next((r for r in self._scan_rows if r.get("CVE ID","") == cve_id), None)
         if row:
             self._detail_panel.setHtml(self._render_cve_detail(row))
+
+    def _results_context_menu(self, pos) -> None:
+        row_index = self._results_table.rowAt(pos.y())
+        if row_index < 0:
+            return
+        cve_item = self._results_table.item(row_index, 0)
+        sw_item  = self._results_table.item(row_index, 1)
+        if not cve_item:
+            return
+        cve_id = cve_item.text()
+        sw     = sw_item.text() if sw_item else ""
+
+        # Look up the full row for NVD URL
+        full_row = next((r for r in self._scan_rows if r.get("CVE ID","") == cve_id), {})
+        nvd_url  = full_row.get("NVD URL","") or f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+
+        _menu_style = (
+            f"QMenu {{ background:{C.BG_CARD}; color:{C.FG}; border:1px solid {C.BORDER}; "
+            f"border-radius:6px; padding:4px 0; font-size:12px; }}"
+            f"QMenu::item {{ padding:6px 20px; }}"
+            f"QMenu::item:selected {{ background:{C.BG_HOVER}; }}"
+            f"QMenu::separator {{ height:1px; background:{C.BORDER}; margin:4px 8px; }}"
+        )
+        menu = QMenu(self)
+        menu.setStyleSheet(_menu_style)
+
+        act_copy_cve = menu.addAction(f"📋  Copy CVE ID  ({cve_id})")
+        act_copy_row = menu.addAction("📋  Copy Row as CSV")
+        menu.addSeparator()
+        act_nvd      = menu.addAction("🌐  Open NVD Page")
+        act_edb      = menu.addAction("🔍  Search Exploit-DB")
+        act_mitre    = menu.addAction("🔗  Search MITRE ATT&CK")
+        menu.addSeparator()
+        act_fp       = menu.addAction("🚫  Mark as False Positive")
+
+        action = menu.exec(self._results_table.viewport().mapToGlobal(pos))
+        if not action:
+            return
+
+        if action == act_copy_cve:
+            QApplication.clipboard().setText(cve_id)
+
+        elif action == act_copy_row:
+            row_vals = [
+                self._results_table.item(row_index, ci).text()
+                for ci in range(self._results_table.columnCount())
+                if self._results_table.item(row_index, ci)
+            ]
+            QApplication.clipboard().setText(",".join(row_vals))
+
+        elif action == act_nvd:
+            QDesktopServices.openUrl(QUrl(nvd_url))
+
+        elif action == act_edb:
+            QDesktopServices.openUrl(
+                QUrl(f"https://www.exploit-db.com/search?cve={cve_id.replace('CVE-','')}")
+            )
+
+        elif action == act_mitre:
+            QDesktopServices.openUrl(
+                QUrl(f"https://attack.mitre.org/search/?query={cve_id}")
+            )
+
+        elif action == act_fp:
+            self._quick_add_false_positive(cve_id, sw)
+
+    def _quick_add_false_positive(self, cve_id: str, sw: str) -> None:
+        """Add a CVE directly to the false positive list from the context menu."""
+        if not HAS_CACHE:
+            Toast.show_toast(self, "Cache module unavailable — cannot add false positive", "warn")
+            return
+        try:
+            db = _get_db()
+            # Look up the full row to get accurate name/version rather than
+            # splitting the display string which can break on multi-word names
+            full_row = next(
+                (r for r in self._scan_rows if r.get("CVE ID", "") == cve_id), {}
+            )
+            sw_name = full_row.get("Software Name", sw)
+            sw_ver  = full_row.get("Software Version", "")
+            db.add_false_positive(cve_id, sw_name, sw_ver, "Marked via Results Browser")
+            Toast.show_toast(self, f"{cve_id} added to false positives", "ok")
+        except Exception as e:
+            Toast.show_toast(self, f"Could not add false positive: {e}", "error")
 
     def _render_cve_detail(self, row: Dict[str, Any]) -> str:
         """Render a rich HTML CVE detail card for the detail panel."""
@@ -4316,7 +4633,7 @@ class CVEScannerWindow(QMainWindow):
                     for row in reader:
                         rows.append(dict(row))
             except Exception as e:
-                QMessageBox.critical(self, "Load Error", f"Could not read CSV:\n{e}")
+                self._styled_msgbox("critical", "Load Error", f"Could not read CSV:\n{e}")
                 return
         else:
             path, _ = QFileDialog.getOpenFileName(
@@ -4327,11 +4644,11 @@ class CVEScannerWindow(QMainWindow):
             try:
                 rows = load_scan_csv(path)
             except Exception as e:
-                QMessageBox.critical(self, "Load Error", f"Could not read CSV:\n{e}")
+                self._styled_msgbox("critical", "Load Error", f"Could not read CSV:\n{e}")
                 return
 
         if not rows:
-            QMessageBox.warning(self, "Empty File", "No data found in the selected CSV.")
+            self._styled_msgbox("warning", "Empty File", "No data found in the selected CSV.")
             return
 
         self._scan_rows = rows
@@ -4373,7 +4690,7 @@ class CVEScannerWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _run_diff(self):
         if not HAS_DIFF:
-            QMessageBox.warning(self, "Unavailable",
+            self._styled_msgbox("warning", "Unavailable",
                 "draugr_diff.py not found. Place it in the same directory as draugr.py.")
             return
 
@@ -4409,7 +4726,7 @@ class CVEScannerWindow(QMainWindow):
                 ))
             n_csv = export_diff_csv(diff, str(diff_csv_out))
 
-            QMessageBox.information(self, "Diff Complete",
+            self._styled_msgbox("information", "Diff Complete",
                 f"Delta report generated:\n\n"
                 f"  New findings:  {stats['new_findings']}\n"
                 f"  Resolved:      {stats['resolved']}\n"
@@ -4424,14 +4741,14 @@ class CVEScannerWindow(QMainWindow):
                 "ok"
             )
         except Exception as e:
-            QMessageBox.critical(self, "Diff Error", str(e))
+            self._styled_msgbox("critical", "Diff Error", str(e))
 
     # ------------------------------------------------------------------
     # False Positive Manager
     # ------------------------------------------------------------------
     def _manage_false_positives(self):
         if not HAS_CACHE:
-            QMessageBox.warning(self, "Unavailable",
+            self._styled_msgbox("warning", "Unavailable",
                 "draugr_cache.py not found. Place it in the same directory as draugr.py.")
             return
 
@@ -4439,10 +4756,10 @@ class CVEScannerWindow(QMainWindow):
             db  = _get_db()
             fps = db.all_false_positives()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not load false positives:\n{e}")
+            self._styled_msgbox("critical", "Error", f"Could not load false positives:\n{e}")
             return
 
-        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QDialogButtonBox
+        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem
 
         dlg = QDialog(self)
         dlg.setWindowTitle("False Positive Suppression List")
@@ -4547,14 +4864,14 @@ class CVEScannerWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _view_scan_history(self):
         if not HAS_CACHE:
-            QMessageBox.warning(self, "Unavailable",
+            self._styled_msgbox("warning", "Unavailable",
                 "draugr_cache.py not found. Place it in the same directory as draugr.py.")
             return
         try:
             db      = _get_db()
             systems = db.get_all_systems()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not load scan history:\n{e}")
+            self._styled_msgbox("critical", "Error", f"Could not load scan history:\n{e}")
             return
 
         from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QComboBox
@@ -4654,7 +4971,7 @@ class CVEScannerWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _configure_alerts(self):
         if not HAS_ALERTS:
-            QMessageBox.warning(self, "Unavailable",
+            self._styled_msgbox("warning", "Unavailable",
                 "draugr_alerts.py not found. Place it in the same directory as draugr.py.")
             return
 
@@ -4777,7 +5094,7 @@ class CVEScannerWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _change_theme(self) -> None:
         if not HAS_THEMES:
-            QMessageBox.information(self, "Theme", "draugr_themes.py not found — using default theme.")
+            self._styled_msgbox("information", "Theme", "draugr_themes.py not found — using default theme.")
             return
         from PyQt6.QtWidgets import QDialog, QListWidget
         dlg = QDialog(self)
@@ -4825,7 +5142,7 @@ class CVEScannerWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _set_confidence_threshold(self) -> None:
         global _CPE_CONFIDENCE_THRESHOLD
-        from PyQt6.QtWidgets import QDialog, QSlider, QDoubleSpinBox
+        from PyQt6.QtWidgets import QDialog, QDoubleSpinBox
         dlg = QDialog(self)
         dlg.setWindowTitle("CPE Confidence Threshold")
         dlg.setFixedSize(380, 200)
@@ -4971,7 +5288,7 @@ class CVEScannerWindow(QMainWindow):
     # Scan profiles
     # ------------------------------------------------------------------
     def _manage_profiles(self) -> None:
-        from PyQt6.QtWidgets import QDialog, QListWidget, QListWidgetItem
+        from PyQt6.QtWidgets import QDialog, QListWidget
         dlg = QDialog(self)
         dlg.setWindowTitle("Scan Profiles")
         dlg.setMinimumSize(500, 360)
@@ -5001,14 +5318,14 @@ class CVEScannerWindow(QMainWindow):
             if not ok or not name.strip():
                 return
             self._profiles[name.strip()] = {
-                "sw_path":       self.sw_row.text(),
-                "out_path":      self.out_row.text(),
-                "kev_path":      self.kev_row.text(),
-                "cpe_path":      self.cpe_row.text(),
-                "resources_dir": self.resources_row.text(),
-                "api_key":       "",    # never save API keys in profiles
-                "show_medium":   self.chk_medium.isChecked(),
-                "show_low":      self.chk_low.isChecked(),
+                "sw_path":        self.sw_row.text(),
+                "out_path":       self.out_row.text(),
+                "kev_path":       self.kev_row.text(),
+                "cpe_path":       self.cpe_row.text(),
+                "resources_dir":  self.resources_row.text(),
+                "api_key":        "",    # never save API keys in profiles
+                "show_medium":    self.chk_medium.isChecked(),
+                "show_low":       self.chk_low.isChecked(),
                 "show_unverified": self.chk_unverified.isChecked(),
             }
             self._save_profiles()
@@ -5033,9 +5350,9 @@ class CVEScannerWindow(QMainWindow):
                 self.cpe_row.setText(p["cpe_path"])
             if p.get("resources_dir"):
                 self.resources_row.setText(p["resources_dir"])
-            self.chk_medium.setChecked(p.get("show_medium", True))
+            self.chk_medium.setChecked(p.get("show_medium", False))
             self.chk_low.setChecked(p.get("show_low", False))
-            self.chk_unverified.setChecked(p.get("show_unverified", True))
+            self.chk_unverified.setChecked(p.get("show_unverified", False))
             self._append_log(f"Profile loaded: {name}", "ok")
             dlg.accept()
 
@@ -5098,17 +5415,17 @@ class CVEScannerWindow(QMainWindow):
         try:
             import weasyprint as wp
             wp.HTML(filename=html_path).write_pdf(pdf_path)
-            QMessageBox.information(self, "PDF Export", f"PDF saved:\n{pdf_path}")
+            self._styled_msgbox("information", "PDF Export", f"PDF saved:\n{pdf_path}")
             self._append_log(f"📄 PDF exported → {pdf_path}", "ok")
         except Exception as e:
-            QMessageBox.critical(self, "PDF Export Error", str(e))
+            self._styled_msgbox("critical", "PDF Export Error", str(e))
 
     # ------------------------------------------------------------------
     # Plugins manager
     # ------------------------------------------------------------------
     def _manage_plugins(self) -> None:
         if not HAS_PLUGINS:
-            QMessageBox.warning(self, "Unavailable",
+            self._styled_msgbox("warning", "Unavailable",
                 "draugr_plugins.py not found. Place it in the same directory as draugr.py.")
             return
 
@@ -5212,14 +5529,14 @@ class CVEScannerWindow(QMainWindow):
         are newly listed (not in the KEV at scan time but now listed).
         """
         if not self._scan_rows:
-            QMessageBox.information(self, "KEV Check",
+            self._styled_msgbox("information", "KEV Check",
                 "No scan results loaded. Run a scan first.")
             return
         try:
             self._append_log("🔄 Fetching live CISA KEV feed…", "info")
             live_kev = fetch_kev_online()
             if not live_kev:
-                QMessageBox.warning(self, "KEV Check", "Could not fetch the live KEV feed.")
+                self._styled_msgbox("warning", "KEV Check", "Could not fetch the live KEV feed.")
                 return
             scan_cve_ids = {str(r.get("CVE ID","")).upper() for r in self._scan_rows}
             newly_kev    = [
@@ -5237,14 +5554,14 @@ class CVEScannerWindow(QMainWindow):
                     + "\n".join(f"  • {c}" for c in sorted(newly_kev)[:20])
                 )
                 self._append_log(msg, "warn")
-                QMessageBox.warning(self, "Newly KEV-Listed CVEs", msg)
+                self._styled_msgbox("warning", "Newly KEV-Listed CVEs", msg)
             else:
                 self._append_log("✓ No newly KEV-listed CVEs found in the last scan.", "ok")
-                QMessageBox.information(self, "KEV Check",
+                self._styled_msgbox("information", "KEV Check",
                     "No new KEV listings found for CVEs in your last scan.")
         except Exception as e:
             self._append_log(f"KEV check error: {e}", "error")
-            QMessageBox.critical(self, "KEV Check Error", str(e))
+            self._styled_msgbox("critical", "KEV Check Error", str(e))
 
 
     # ------------------------------------------------------------------
@@ -5356,7 +5673,7 @@ class CVEScannerWindow(QMainWindow):
                 )
                 self._append_log(f"✓ Draugr v{DRAUGR_VERSION} is up to date.", "ok")
         except Exception as e:
-            QMessageBox.warning(self, "Update Check Failed",
+            self._styled_msgbox("warning", "Update Check Failed",
                 f"Could not reach GitHub:\n{e}")
             self._append_log(f"Update check failed: {e}", "warn")
     def _manage_tags(self) -> None:
