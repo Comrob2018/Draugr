@@ -27,14 +27,12 @@ packaging
 jsonschema  # optional for enrichment validation
 ```
 ⚙️ Usage  
-Prepare a software list file (see sample_list.txt, or sample_list.csv in resources folder).  
+**  *Prepare a software list file* (see sample_list.txt, or sample_list.csv in resources folder).  
 Optionally download the CISA KEV JSON feed:  
-
 ```  
 https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json  
 ```
 Optionally create a cpe_mappings.json file to override heuristic matching:  
-
 json  
 ```
 {  
@@ -43,7 +41,7 @@ json
   "microsoft edge": "microsoft:edge_chromium"  
 }
 ```  
-Run the scanner:  
+** *Run the scanner:*  
 ```
 python draugr.py  
 ```
