@@ -7,11 +7,9 @@ Aggregates scan history across all known systems and produces:
   - Per-system trend charts embedded as inline SVG
 """
 import html
-import json
 import re
 from collections import defaultdict
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 
 _e = lambda s: html.escape(str(s or ""))
