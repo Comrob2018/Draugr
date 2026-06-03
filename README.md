@@ -15,11 +15,11 @@ PyQt6 GUI — Clean, modular interface with progress tracking and theme support.
 
 🧩 Requirements  
 Install dependencies:  
-
-bash  
+```
 pip install -r requirements.txt  
-requirements.txt  
+```
 
+Contents of requirements.txt:
 ```  
 PyQt6  
 requests  
