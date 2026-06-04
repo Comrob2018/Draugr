@@ -1,52 +1,86 @@
-Let me find the exact scan area button layout first.
+Let me read the relevant sections before laying out the plan.
 
-Good, now I have the full picture. Here are the exact steps:
+Now I have everything. Here’s the complete breakdown:
 
-Step 1 — Add the Rescan button definition in the scan area (after self.trend_btn definition, before btn_row.addWidget calls, around line 3547):
+Change 1 — Initialise _loaded_csv_path alongside _scan_rows (~line 3134)
 
-Add this block:
+Add one line:
 
-        self.rescan_btn = QPushButton("🔄  Rescan")
-        self.rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.rescan_btn.setFixedSize(150, 44)
-        self.rescan_btn.setToolTip("Re-run a fresh scan using the software list from the currently loaded CSV")
-        self.rescan_btn.setStyleSheet(ACTION_BTN_STYLE.replace(C.RED, C.YELLOW))
+self._loaded_csv_path: str = ""   # path of the last CSV loaded into the browser
 
 
-Step 2 — Add it to btn_row (after self.trend_btn is added, around line 3556):
+Change 2 — Store the path when a CSV is loaded in _load_csv_into_browser (~line 4760)
 
-        btn_row.addSpacing(5)
-        btn_row.addWidget(self.rescan_btn)
+After self._scan_rows = rows, add:
 
-
-Step 3 — Connect its signal (with the other .clicked.connect calls, around line 3561):
-
-        self.rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
+self._loaded_csv_path = path
+self._update_data_action_buttons()
 
 
-Step 4 — Remove the Rescan button from the Results Browser source bar (around line 3756). Remove these lines:
+Change 3 — Update _loaded_csv_path and button state after a live scan completes in _scan_finished (~line 4288)
 
-        rescan_btn = QPushButton("🔄  Rescan")
-        rescan_btn.setFixedHeight(28)
-        rescan_btn.setToolTip(
-            "Re-run a fresh scan using the software list from the currently loaded CSV"
-        )
-        rescan_btn.setStyleSheet(
-            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
-            f"border:1px solid {C.BORDER}; border-radius:4px; "
-            f"padding:2px 10px; font-size:11px; }}"
-            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
-            f"QPushButton:disabled {{ background:{C.BORDER}; color:{C.FG_DIM}; }}"
-        )
-        rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
-        self._rescan_btn = rescan_btn
+After self._scan_rows = completed_rows, add:
+
+self._loaded_csv_path = ""   # live scan, no CSV path
+self._update_data_action_buttons()
 
 
-And remove its widget addition:
+Change 4 — Add _update_data_action_buttons helper method
 
-        source_bar.addWidget(rescan_btn)
+New method that enables/disables Generate Reports and Rescan based on whether _scan_rows is populated:
+
+def _update_data_action_buttons(self) -> None:
+    """Enable or disable data-action buttons based on whether results are loaded."""
+    has_data = bool(self._scan_rows)
+    self._gen_reports_btn.setEnabled(has_data)
+    self.rescan_btn.setEnabled(has_data and not self.scanning)
 
 
-Step 5 — Update self._rescan_btn — since the button is now self.rescan_btn (a proper instance attribute like scan_btn, stop_btn etc.) you can remove the self._rescan_btn = rescan_btn line entirely from step 4, as the reference is already stored as self.rescan_btn in step 1.
+Change 5 — Disable both buttons at startup
 
-That’s all four files locations touched, all in draugr.py. Want me to implement it?
+In the UI build where gen_reports_btn and rescan_btn are defined, add after each:
+
+gen_reports_btn.setEnabled(False)
+...
+self.rescan_btn.setEnabled(False)
+
+
+Change 6 — Also disable Rescan while scanning in _start_scan (~line 4357)
+
+Where scan_btn.setEnabled(False) is called, add:
+
+self.rescan_btn.setEnabled(False)
+
+
+And re-enable it in _scan_finished via the _update_data_action_buttons call already added in Change 3.
+
+Change 7 — Fix report stem to use _loaded_csv_path in _generate_reports_from_loaded_csv (~line 4797)
+
+Replace the label-parsing stem logic with:
+
+if self._loaded_csv_path:
+    stem = Path(self._loaded_csv_path).stem
+else:
+    import datetime as _dt
+    stem = f"scan_{_dt.datetime.now().strftime('%Y%m%d_%H%M')}"
+import re as _re
+stem = _re.sub(r"[^\w\-]", "_", stem).strip("_") or "report"
+
+
+Change 8 — Add a status bar message during report generation
+
+At the start of the try block in _generate_reports_from_loaded_csv, add:
+
+self._update_status("Generating reports…")
+
+
+And at the end after the Toast:
+
+self._update_status("Reports generated.")
+
+
+Change 9 — Fix _gen_reports_btn naming consistency
+
+Rename self._gen_reports_btn → self.gen_reports_btn to match the pattern of all other buttons. Three places: the assignment in the UI build, the _update_data_action_buttons call, and the setEnabled call at startup.
+
+That’s 9 discrete changes, all in draugr.py. Want me to implement them all now?
