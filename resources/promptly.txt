@@ -1,14 +1,30 @@
-Looking at the screenshot, Start Scan, Stop Scan, and Compare Scans have icons that are blending into the button. Rescan, Skip Current, and Scan History look crisper. The difference is likely the icon characters themselves — let me check what’s being used.
+draugr.py — insert after the from urllib.parse import quote_plus line:
 
-That’s the issue. ▶, ■, and Δ are plain Unicode characters that render as text glyphs — thin and flat. The ones that pop (⏭, 📈, 🔄) are emoji/pictographs that render with visual weight. Simple fix — swap them for emoji equivalents:
+# ── Subdirectory path injection ────────────────────────────────────────
+# Companion modules are organised into subdirectories. Adding them to
+# sys.path here means all imports throughout the file stay unchanged.
+_APP_DIR = Path(__file__).parent
+for _subdir in ("core", "reports", "intelligence"):
+    _p = _APP_DIR / _subdir
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
-Also need to update the two places where scan_btn text is reset after a scan:
 
-All consistent. Copying to outputs:
+draugr_reports.py — two things:
 
-Four icons swapped:
+Add import sys to the standard library block (it’s missing there currently):
 
-	•	▶ → ▶️ (Start Scan — updated in definition and both setText reset calls)
-	•	■ → ⏹️ (Stop Scan)
-	•	⏭ → ⏭️ (Skip Current — the variation selector added for consistency)
-	•	Δ → 🔀 (Compare Scans — the Greek delta was the most visually weak, swapped for the shuffle/compare arrows emoji)
+import sys
+
+
+Then insert after the from typing import ... line:
+
+# ── Subdirectory path injection ────────────────────────────────────────
+_APP_DIR = Path(__file__).parent.parent   # reports/ → project root
+for _subdir in ("core", "reports", "intelligence"):
+    _p = _APP_DIR / _subdir
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+
+The only difference between the two is .parent vs .parent.parent — draugr.py is at the root so one level up is enough, draugr_reports.py will be inside reports/ so it needs to climb two levels to reach the project root.
