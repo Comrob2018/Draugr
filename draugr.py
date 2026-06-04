@@ -191,6 +191,7 @@ try:
         QTextEdit,
         QVBoxLayout,
         QWidget,
+        QTableWidgetItem
     )
     HAS_PYQT6 = True
 except ImportError:  # pragma: no cover
@@ -208,7 +209,7 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
-DRAUGR_VERSION = "2.2.1"
+DRAUGR_VERSION = "3.0.1"
 # GitHub repository for update checks — format: "owner/repo"
 # Configurable via Settings → Update Settings. Stored in prefs.json.
 _GITHUB_REPO: str = "https://github.com/Comrob2018/Draugr/tree/main"
@@ -2319,10 +2320,23 @@ class ScanWorker(QThread):
             # ── Check resume cache ─────────────────────────────────────
             if db and session_id:
                 cached = db.get_cached_rows(session_id, name, version, publisher)
+                if cached is None:
+                    # Fall back to cross-session per-item intel cache
+                    cached = db.get_sw_intel(name, version, publisher)
+                    if cached is not None:
+                        self._emit_log(
+                            f"[{idx}/{total}] ♻ {name} {version} — loaded from intel cache",
+                            "dim"
+                        )
+                        all_rows.extend(cached)
+                        # Promote into session cache so subsequent items stay consistent
+                        db.put_cached_rows(session_id, name, version, publisher, cached)
+                        self.progress_signal.emit(idx, total)
+                        continue
                 if cached is not None:
                     self._emit_log(f"[{idx}/{total}] ♻ {name} {version} — loaded from cache", "dim")
                     self.progress_signal.emit(idx, total)
-                    continue   # rows already loaded above
+                    continue
 
             label = f"{name} {version}".strip()
             self._emit_log(f"[{idx}/{total}] Querying NVD for: {label}", "info")
@@ -2765,6 +2779,7 @@ class ScanWorker(QThread):
                 try:
                     sw_rows_for_cache = [r for r in all_rows if r.get("Software Name") == name and r.get("Software Version") == version]
                     db.put_cached_rows(session_id, name, version, publisher, sw_rows_for_cache)
+                    db.put_sw_intel(name, version, publisher, sw_rows_for_cache)
                 except Exception:
                     pass
 
@@ -3065,6 +3080,27 @@ class Toast(QFrame):
     @staticmethod
     def show_toast(parent, message: str, level: str = "info", duration_ms: int = 4000):
         return Toast(parent, message, level, duration_ms)
+
+
+# ── Custom sort items ──────────────────────────────────────────────────────
+
+class NumericItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts by numeric value instead of string."""
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        try:
+            return (float(self.text().rstrip("%")) <
+                    float(other.text().rstrip("%")))
+        except (ValueError, TypeError):
+            return self.text() < other.text()
+
+
+class SeverityItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts by severity order: CRITICAL > HIGH > MEDIUM > LOW."""
+    _ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "": 0}
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        return (self._ORDER.get(self.text().upper(), 0) <
+                self._ORDER.get(other.text().upper(), 0))
 
 
 # ----------------------------------------------------------------------
@@ -3690,8 +3726,38 @@ class CVEScannerWindow(QMainWindow):
             f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
         )
         load_csv_btn.clicked.connect(self._load_csv_into_browser)
+        gen_reports_btn = QPushButton("📄  Generate Reports")
+        gen_reports_btn.setFixedHeight(28)
+        gen_reports_btn.setToolTip(
+            "Generate Executive, Technical, and Red Team HTML reports from the currently loaded results"
+        )
+        gen_reports_btn.setStyleSheet(
+            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; "
+            f"padding:2px 10px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
+            f"QPushButton:disabled {{ background:{C.BORDER}; color:{C.FG_DIM}; }}"
+        )
+        gen_reports_btn.clicked.connect(self._generate_reports_from_loaded_csv)
+        self._gen_reports_btn = gen_reports_btn
+        rescan_btn = QPushButton("🔄  Rescan")
+        rescan_btn.setFixedHeight(28)
+        rescan_btn.setToolTip(
+            "Re-run a fresh scan using the software list from the currently loaded CSV"
+        )
+        rescan_btn.setStyleSheet(
+            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; "
+            f"padding:2px 10px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
+            f"QPushButton:disabled {{ background:{C.BORDER}; color:{C.FG_DIM}; }}"
+        )
+        rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
+        self._rescan_btn = rescan_btn
         source_bar.addWidget(self._results_source_label, 1)
         source_bar.addWidget(load_csv_btn)
+        source_bar.addWidget(gen_reports_btn)
+        source_bar.addWidget(rescan_btn)
         results_left_layout.addLayout(source_bar)
 
         # Filter bar
@@ -3958,7 +4024,7 @@ class CVEScannerWindow(QMainWindow):
 
         self._act_write_logs = QAction("Write Logs to File", self)
         self._act_write_logs.setCheckable(True)
-        self._act_write_logs.setChecked(True)
+        self._act_write_logs.setChecked(False)
         settings_menu.addAction(self._act_write_logs)
 
         settings_menu.addSeparator()
@@ -4016,6 +4082,16 @@ class CVEScannerWindow(QMainWindow):
         act_tags.setToolTip("Assign tags to software items (e.g. internet-facing, critical) to influence risk scoring")
         act_tags.triggered.connect(self._manage_tags)
         settings_menu.addAction(act_tags)
+
+        settings_menu.addSeparator()
+
+        act_clear_intel = QAction("Clear Software Intel Cache…", self)
+        act_clear_intel.setToolTip(
+            "Force all software items to be re-scanned on the next run "
+            "(clears the 30-day per-item cache)"
+        )
+        act_clear_intel.triggered.connect(self._clear_sw_intel_cache)
+        settings_menu.addAction(act_clear_intel)
 
         settings_menu.addSeparator()
 
@@ -4127,6 +4203,19 @@ class CVEScannerWindow(QMainWindow):
     def _copy_log(self):
         QApplication.clipboard().setText(self.log.toPlainText())
 
+    def _clear_sw_intel_cache(self) -> None:
+        """Clear the 30-day per-item software intel cache."""
+        if not HAS_CACHE:
+            self._styled_msgbox("warning", "Unavailable",
+                                "Cache module not available.")
+            return
+        try:
+            db = _get_db()
+            db.clear_sw_intel()
+            Toast.show_toast(self, "Software intel cache cleared — all items will be re-scanned", "ok")
+        except Exception as e:
+            self._styled_msgbox("critical", "Error", f"Could not clear cache:\n{e}")
+
     def _scan_finished(self):
         self._append_log("Scan Finished.", "info")
         self.scanning = False
@@ -4203,14 +4292,16 @@ class CVEScannerWindow(QMainWindow):
             self.tab_widget.setCurrentIndex(1)
         self.worker = None
 
-    def _start_scan(self, generate_executive_report: bool = False):
+    def _start_scan(self, generate_executive_report: bool = False,
+                    software_override: Optional[List] = None):
         if self.scanning:
             return
 
         sw_path = self.sw_row.text()
-        if not sw_path or not os.path.isfile(sw_path):
-            self._styled_msgbox("critical", "Error", "Please select a valid software list file.")
-            return
+        if software_override is None:
+            if not sw_path or not os.path.isfile(sw_path):
+                self._styled_msgbox("critical", "Error", "Please select a valid software list file.")
+                return
         out_path = self.out_row.text()
         if not out_path:
             self._styled_msgbox("critical", "Error", "Please specify an output path.")
@@ -4243,11 +4334,14 @@ class CVEScannerWindow(QMainWindow):
             if write_logs:
                 error_log_path = log_dir / str(out_base.with_name(f"{out_base.stem}_error.log"))
                 scan_log_path  = log_dir / str(out_base.with_name(f"{out_base.stem}_scan.log"))
-        try:
-            software = parse_software_input(sw_path)
-        except Exception as exc:
-            self._styled_msgbox("critical", "Error", f"Failed to parse software list:\n{exc}")
-            return
+        if software_override is not None:
+            software = software_override
+        else:
+            try:
+                software = parse_software_input(sw_path)
+            except Exception as exc:
+                self._styled_msgbox("critical", "Error", f"Failed to parse software list:\n{exc}")
+                return
         if not software:
             self._styled_msgbox("warning", "Warning", "Software list is empty.")
             return
@@ -4328,7 +4422,12 @@ class CVEScannerWindow(QMainWindow):
                 str(row.get("EPSS Score","")),
             ]
             for ci, val in enumerate(vals):
-                item = QTableWidgetItem(val)
+                if ci in (3, 4, 7):       # Risk Score, CVSS, EPSS — numeric sort
+                    item = NumericItem(val)
+                elif ci == 2:             # Severity — CRITICAL > HIGH > MEDIUM > LOW
+                    item = SeverityItem(val)
+                else:
+                    item = QTableWidgetItem(val)
                 if ci == 2 and sev in sev_colors:
                     item.setForeground(QColor(sev_colors[sev]))
                 if kev and ci == 5:
@@ -4665,6 +4764,160 @@ class CVEScannerWindow(QMainWindow):
         self._append_log(
             f"📂 Loaded {len(rows)} findings from {filename}", "ok"
         )
+
+    # ------------------------------------------------------------------
+    # Generate reports from loaded CSV
+    # ------------------------------------------------------------------
+    def _generate_reports_from_loaded_csv(self) -> None:
+        """
+        Build Executive, Technical, and Red Team HTML reports (plus POA&M and
+        SBOM if available) from whatever is currently loaded in self._scan_rows.
+        Works identically whether the rows came from a live scan or a loaded CSV.
+        """
+        if not self._scan_rows:
+            self._styled_msgbox(
+                "warning", "No Data",
+                "No results are loaded. Run a scan or load a CSV first."
+            )
+            return
+
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "Select Output Directory for Reports"
+        )
+        if not out_dir:
+            return
+
+        # Derive a stem name from the source label (e.g. "agent_1.csv — …" → "agent_1")
+        source_text = self._results_source_label.text()
+        raw_stem = source_text.split("—")[0].strip() if "—" in source_text else "report"
+        # Strip extension if present
+        stem = Path(raw_stem).stem if raw_stem else "report"
+        # Sanitise: keep only alphanumeric, dash, underscore
+        import re as _re
+        stem = _re.sub(r"[^\w\-]", "_", stem).strip("_") or "report"
+
+        report_dir = Path(out_dir)
+
+        try:
+            self._append_log(f"Generating reports from {len(self._scan_rows)} findings…", "info")
+
+            # ── Executive Report ─────────────────────────────────────
+            exec_path = report_dir / f"{stem}_executive_report.html"
+            exec_html = build_executive_report_markdown(
+                self._scan_rows,
+                report_title="Executive Threat Intelligence Report",
+            )
+            exec_path.write_text(exec_html, encoding="utf-8")
+            self._append_log(f"✅ Executive Report  → {exec_path.name}", "ok")
+
+            # ── Technical Report ─────────────────────────────────────
+            tech_path = report_dir / f"{stem}_technical_report.html"
+            tech_html = build_defensive_report(
+                self._scan_rows,
+                report_title="Technical Security Assessment Report",
+            )
+            tech_path.write_text(tech_html, encoding="utf-8")
+            self._append_log(f"✅ Technical Report  → {tech_path.name}", "ok")
+
+            # ── Red Team Report ──────────────────────────────────────
+            rt_path = report_dir / f"{stem}_redteam_report.html"
+            rt_html = build_redteam_report(
+                self._scan_rows,
+                report_title="Red Team Target Report",
+            )
+            rt_path.write_text(rt_html, encoding="utf-8")
+            self._append_log(f"✅ Red Team Report   → {rt_path.name}", "ok")
+
+            # ── POA&M (optional) ─────────────────────────────────────
+            if HAS_POAM:
+                try:
+                    poam_path = report_dir / f"{stem}_poam.xlsx"
+                    n_poam = export_poam(
+                        self._scan_rows,
+                        str(poam_path),
+                        system_name=stem,
+                    )
+                    self._append_log(f"✅ POA&M Export      → {poam_path.name} ({n_poam} entries)", "ok")
+                except Exception as e:
+                    self._append_log(f"⚠ POA&M export failed: {e}", "warn")
+
+            # ── SBOM (optional) ──────────────────────────────────────
+            if HAS_SBOM:
+                try:
+                    sbom_path = report_dir / f"{stem}_sbom.json"
+                    n_comp = export_sbom(
+                        self._scan_rows,
+                        str(sbom_path),
+                        system_name=stem,
+                    )
+                    self._append_log(f"📦 SBOM Export       → {sbom_path.name} ({n_comp} components)", "ok")
+                except Exception as e:
+                    self._append_log(f"⚠ SBOM export failed: {e}", "warn")
+
+            Toast.show_toast(self, f"Reports written to {Path(out_dir).name}", "ok")
+            self._styled_msgbox(
+                "information", "Reports Generated",
+                f"Reports written to:\n{out_dir}\n\n"
+                f"  • {stem}_executive_report.html\n"
+                f"  • {stem}_technical_report.html\n"
+                f"  • {stem}_redteam_report.html"
+                + (f"\n  • {stem}_poam.xlsx" if HAS_POAM else "")
+                + (f"\n  • {stem}_sbom.json" if HAS_SBOM else "")
+            )
+
+        except Exception as e:
+            self._append_log(f"❌ Report generation failed: {e}", "error")
+            self._styled_msgbox("critical", "Report Error", str(e))
+
+    # ------------------------------------------------------------------
+    # Rescan from loaded CSV
+    # ------------------------------------------------------------------
+    def _rescan_from_loaded_csv(self) -> None:
+        """
+        Reconstruct the software list from the currently loaded CSV rows and
+        launch a full fresh scan, reusing all current settings (output path,
+        API keys, KEV file, etc.).  The output path must already be set —
+        the user is prompted if it is not.
+        """
+        if not self._scan_rows:
+            self._styled_msgbox(
+                "warning", "No Data",
+                "No results are loaded. Load a scan CSV first."
+            )
+            return
+
+        # Deduplicate software entries preserving original order
+        seen: set = set()
+        software = []
+        for r in self._scan_rows:
+            name      = str(r.get("Software Name",  "") or "").strip()
+            version   = str(r.get("Software Version","") or "").strip()
+            publisher = str(r.get("Publisher",       "") or "").strip()
+            install   = str(r.get("Install Date",    "") or "").strip()
+            key = (name, version, publisher)
+            if name and key not in seen:
+                seen.add(key)
+                software.append((name, version, publisher, install))
+
+        if not software:
+            self._styled_msgbox(
+                "warning", "No Software",
+                "No software entries could be extracted from the loaded results."
+            )
+            return
+
+        # Ensure an output path is set
+        if not self.out_row.text().strip():
+            self._styled_msgbox(
+                "critical", "No Output Path",
+                "Please set an output directory in the Configuration panel before rescanning."
+            )
+            return
+
+        self._append_log(
+            f"🔄 Rescan initiated — {len(software)} unique software item(s) from loaded CSV", "info"
+        )
+        self._start_scan(generate_executive_report=True, software_override=software)
 
     # ------------------------------------------------------------------
     # Stop / Skip scan
@@ -5951,7 +6204,7 @@ class DraugrSplash(QSplashScreen):
         p.setFont(ver_font)
         p.setPen(QColor(85, 30, 30, 200))
         p.drawText(0, H - 22, W - 12, 20,
-                   Qt.AlignmentFlag.AlignRight, "v2.8.2  //  INTERNAL USE ONLY")
+                   Qt.AlignmentFlag.AlignRight, f"v{DRAUGR_VERSION}  //  INTERNAL USE ONLY")
 
     def _overlay_text(self, pm: QPixmap) -> QPixmap:
         W, H = pm.width(), pm.height()
