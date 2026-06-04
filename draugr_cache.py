@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS false_positives (
 );
 """
 
+_SCHEMA_SW_INTEL = """
+CREATE TABLE IF NOT EXISTS sw_intel_cache (
+    sw_key      TEXT PRIMARY KEY,      -- "name||version||publisher"
+    rows_json   TEXT NOT NULL,         -- JSON-serialised list of CVE row dicts
+    scanned_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sw_intel_scanned ON sw_intel_cache(scanned_at);
+"""
+
 
 class DraugrDB:
     """
@@ -70,10 +79,11 @@ class DraugrDB:
     """
 
     # NVD CPE dictionary entries change rarely; CVE data changes more often
-    NVD_CPE_TTL  = 7 * 86400   # 7 days
-    NVD_CVE_TTL  = 1 * 86400   # 1 day
-    EPSS_TTL     = 6 * 3600    # 6 hours
-    SCAN_TTL     = 24 * 3600   # resume window: 24 hours
+    NVD_CPE_TTL  = 7 * 86400    # 7 days
+    NVD_CVE_TTL  = 1 * 86400    # 1 day
+    EPSS_TTL     = 6 * 3600     # 6 hours
+    SCAN_TTL     = 24 * 3600    # resume window: 24 hours
+    SW_INTEL_TTL = 30 * 86400   # per-item intel cache: 30 days
 
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
@@ -91,6 +101,7 @@ class DraugrDB:
         self._con.executescript(_SCHEMA_NVD)
         self._con.executescript(_SCHEMA_SCAN)
         self._con.executescript(_SCHEMA_FP)
+        self._con.executescript(_SCHEMA_SW_INTEL)
         self._con.commit()
 
     def close(self) -> None:
@@ -251,8 +262,43 @@ class DraugrDB:
         self.con.commit()
 
     # ------------------------------------------------------------------
-    # False positive suppression
+    # Per-item software intelligence cache (cross-session, 30-day TTL)
     # ------------------------------------------------------------------
+    def get_sw_intel(self, name: str, version: str,
+                     publisher: str = "") -> Optional[List[Dict[str, Any]]]:
+        """
+        Return cached CVE rows for this software item regardless of session.
+        Returns None if not cached or if the entry has expired (> 30 days).
+        """
+        key = self._sw_key(name, version, publisher)
+        row = self.con.execute(
+            "SELECT rows_json, scanned_at FROM sw_intel_cache WHERE sw_key=?",
+            (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        if time.time() - row[1] > self.SW_INTEL_TTL:
+            return None
+        try:
+            return json.loads(row[0])
+        except json.JSONDecodeError:
+            return None
+
+    def put_sw_intel(self, name: str, version: str, publisher: str,
+                     rows: List[Dict[str, Any]]) -> None:
+        """Persist CVE rows for a software item in the cross-session cache."""
+        key = self._sw_key(name, version, publisher)
+        self.con.execute(
+            "INSERT OR REPLACE INTO sw_intel_cache (sw_key, rows_json, scanned_at) "
+            "VALUES (?,?,?)",
+            (key, json.dumps(rows), time.time())
+        )
+        self.con.commit()
+
+    def clear_sw_intel(self) -> None:
+        """Wipe the entire per-item intel cache (e.g. force-rescan all)."""
+        self.con.execute("DELETE FROM sw_intel_cache")
+        self.con.commit()
     def add_false_positive(self, cve_id: str, sw_name: str, reason: str = "") -> None:
         self.con.execute(
             """INSERT OR REPLACE INTO false_positives
