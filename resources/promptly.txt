@@ -1,7 +1,3 @@
-Let me read the relevant sections before laying out the plan.
-
-Now I have everything. Here’s the complete breakdown:
-
 Change 1 — Initialise _loaded_csv_path alongside _scan_rows (~line 3134)
 
 Add one line:
