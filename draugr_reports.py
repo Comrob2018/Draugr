@@ -20,12 +20,10 @@ All functions take pre-computed scan row dicts; no NVD/network calls are made he
 # Standard library
 # ----------------------------------------------------------------------
 import base64
-import datetime
 import html
 import os
 import re
 from collections import defaultdict, Counter
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ----------------------------------------------------------------------
@@ -340,6 +338,7 @@ def _markdown_body_to_html(md: str) -> str:
             out.append("<hr>")
             continue
 
+        # --- Table row ---
         if line.startswith("|"):
             close_list()
             cells = [c.strip() for c in line.strip("|").split("|")]
@@ -355,13 +354,7 @@ def _markdown_body_to_html(md: str) -> str:
             if not in_table:
                 out.append('<table>')
                 in_table = True
-            # If a cell already contains HTML tags (e.g. <br>, <a>), pass it
-            # through inline() without escaping — it was pre-built as safe HTML.
-            def _cell(c: str) -> str:
-                if re.search(r"<[a-zA-Z/]", c):
-                    return f"<td>{inline(c)}</td>"
-                return f"<td>{inline(escape(c))}</td>"
-            row_html = "".join(_cell(c) for c in cells)
+            row_html = "".join(f"<td>{inline(escape(c))}</td>" for c in cells)
             out.append(f"<tr>{row_html}</tr>")
             continue
 
@@ -861,14 +854,14 @@ def _svg_risk_matrix(
     grouped: Dict[Any, List[Dict[str, Any]]],
 ) -> str:
     """
-    Inline SVG 5×5 likelihood vs consequence risk matrix.
+    Inline SVG 5×5 likelihood vs impact risk matrix.
     Each software item is plotted as a labelled dot.
     Legend sits below the chart to avoid overlapping dots.
     """
     import math
 
-    W, H    = 480, 420   # extra height for below-chart legend
-    PAD_L   = 60
+    W, H    = 500, 420   # extra height for below-chart legend
+    PAD_L   = 76
     PAD_B   = 50
     PAD_T   = 30
     PAD_R   = 20
@@ -896,16 +889,16 @@ def _svg_risk_matrix(
         score += min(epss * 3.0, 1.5)
         return min(score, 5.0)
 
-    def _consequence(rows: List[Dict[str, Any]]) -> float:
+    def _impact(rows: List[Dict[str, Any]]) -> float:
         crit = any(str(r.get("CVSS Severity","")).upper()=="CRITICAL" for r in rows)
         high = any(str(r.get("CVSS Severity","")).upper()=="HIGH"     for r in rows)
         max_rs = max((_to_float(r.get("Risk Score",0)) for r in rows), default=0.0)
         base = 5.0 if crit else 3.5 if high else 2.0
         return min(base + max_rs / 50.0, 5.0)
 
-    def _px(likelihood: float, consequence: float):
+    def _px(likelihood: float, impact: float):
         x = PAD_L + (likelihood / 5.0) * (W - PAD_L - PAD_R)
-        y = PAD_T + PLOT_H - (consequence / 5.0) * PLOT_H
+        y = PAD_T + PLOT_H - (impact / 5.0) * PLOT_H
         return x, y
 
     parts = [
@@ -932,16 +925,16 @@ def _svg_risk_matrix(
         parts.append(f'<text x="{x:.1f}" y="{PAD_T + PLOT_H + 16}" {axis_style}>{lbl}</text>')
     for i, lbl in enumerate(y_labels):
         y = PAD_T + PLOT_H - (i + 0.5) * CH
-        parts.append(f'<text x="{PAD_L - 8}" y="{y:.1f}" font-size="10" fill="#555" '
+        parts.append(f'<text x="{PAD_L - 14}" y="{y:.1f}" font-size="10" fill="#555" '
                      f'text-anchor="end" dominant-baseline="middle">{lbl}</text>')
 
     # Axis titles
     parts += [
         f'<text x="{PAD_L + (W-PAD_L-PAD_R)/2:.1f}" y="{PAD_T + PLOT_H + 34}" '
         f'font-size="11" fill="#333" text-anchor="middle" font-weight="600">LIKELIHOOD</text>',
-        f'<text x="10" y="{PAD_T + PLOT_H/2:.1f}" '
+        f'<text x="12" y="{PAD_T + PLOT_H/2:.1f}" '
         f'font-size="11" fill="#333" text-anchor="middle" font-weight="600" '
-        f'transform="rotate(-90,10,{PAD_T+PLOT_H/2:.1f})">CONSEQUENCE</text>',
+        f'transform="rotate(-90,12,{PAD_T+PLOT_H/2:.1f})">IMPACT</text>',
     ]
 
     # Plot software dots
@@ -954,7 +947,7 @@ def _svg_risk_matrix(
         ))
     ):
         lik  = _likelihood(sw_rows)
-        con  = _consequence(sw_rows)
+        con  = _impact(sw_rows)
         px, py = _px(lik, con)
         colour  = dot_colours[idx % len(dot_colours)]
         label   = sw_name[:22] + ("…" if len(sw_name) > 22 else "")
@@ -1891,7 +1884,7 @@ def build_executive_report_markdown(
         lines.append(
             "- **Immediate response capacity** — Security and IT personnel will need to be "
             f"allocated for emergency patching of the {kev_total} actively exploited "
-            f"{'system' if kev_total == 1 else 'systems'}, potentially requiring after-hours effort."
+            "{'system' if kev_total == 1 else 'systems'}, potentially requiring after-hours effort."
         )
     if sev_counts["CRITICAL"] + sev_counts["HIGH"] > 0:
         lines.append(
