@@ -47,7 +47,8 @@ python draugr.py
 ```
 
 ## 📂 Output  
-### CSV report — Contains CVE details, risk scores, exploit indicators, and KEV flags.  
+### CSV report
+* Contains all CVE details, risk scores, exploit indicators, and KEV flags, MITRE ATT&Ck and ICS codes.  
 ### HTML Reports  
 * Executive Report - Focused C-Suite sytle report  
 * Technical Report - Technical implementation for mitigations and remediations
