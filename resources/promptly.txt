@@ -1,27 +1,65 @@
-No, it wouldn’t. If there’s only one software item, several of the graphics become meaningless or misleading:
+One new function, one modified function, both in draugr.py.
 
-	•	Risk matrix — a single dot on a grid with no other points to compare against tells you nothing. The matrix only has value when you can see relative positioning between multiple items.
-	•	Bar chart — a single bar is just a number with decoration. The severity badges in the executive summary already convey the same information.
-	•	Controls heatmap — a single column heatmap loses its “which systems are missing which controls” comparative value entirely.
+Step 1 — Add _normalise_version just above parse_software_list (line 1926):
 
-The donut chart is the only one that still makes sense with a single software item — it shows the severity breakdown of CVEs which is meaningful regardless of how many systems are scanned.
-
-The fix is simple — add a minimum item count guard before each SVG is generated:
-
-In _svg_risk_matrix, return "" if fewer than 2 items:
-
-    if len(grouped) < 2:
-        return ""
-
-
-In _svg_bar_chart, already handles single items fine visually but loses comparative value — guard at 2:
-
-    if len(ranked) < 2:
-        return ""
+def _normalise_version(ver: str) -> str:
+    """
+    Normalise a version string for deduplication purposes.
+    Pads to 3 dot-separated segments so that '0.4' and '0.4.0' compare equal,
+    while '0.4.0' and '1.4.0' remain distinct.
+    Only used as a dedup key — the original string is preserved in the tuple.
+    """
+    parts = str(ver).strip().split(".")
+    while len(parts) < 3:
+        parts.append("0")
+    return ".".join(parts)
 
 
-In _svg_controls_heatmap, guard at 2 software items:
+Step 2 — Replace the body of parse_software_input (line 6289):
 
-    if len(sw_names) < 2 or not top_controls:
-        return ""
+Change it from early-returning into each parser branch, to collecting into raw first, then running a dedup pass at the end:
 
+def parse_software_input(path: str) -> List[Tuple[str, str, str, str]]:
+    """
+    Auto-detect input format and dispatch to the correct parser.
+    Supports: CSV/TXT (inventory lists), CycloneDX JSON, SPDX JSON.
+
+    After parsing, deduplicates entries whose (name, normalised_version, publisher)
+    key is identical — e.g. '0.4' and '0.4.0' are treated as the same version.
+    When two entries collide, the most specific version string (most dot segments)
+    is kept for better NVD/CPE matching.
+    """
+    path_lower = path.lower()
+
+    if path_lower.endswith(".json"):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                peek = json.load(f)
+            if peek.get("bomFormat", "").lower() == "cyclonedx" or "components" in peek:
+                raw = parse_sbom_cyclonedx(path)
+            elif "SPDX" in str(peek.get("spdxVersion", "")) or "packages" in peek:
+                raw = parse_sbom_spdx(path)
+            else:
+                raw = parse_software_list(path)
+        except (json.JSONDecodeError, KeyError):
+            raw = parse_software_list(path)
+    else:
+        raw = parse_software_list(path)
+
+    # Deduplicate: (name, normalised_version, publisher) → keep most specific version string
+    seen: Dict[Tuple[str, str, str], Tuple[str, str, str, str]] = {}
+    for entry in raw:
+        name, version, publisher, idate = entry
+        key = (name.lower(), _normalise_version(version), publisher.lower())
+        if key not in seen:
+            seen[key] = entry
+        else:
+            # Prefer the version string with more dot segments (most specific)
+            existing_ver = seen[key][1]
+            if version.count(".") > existing_ver.count("."):
+                seen[key] = entry
+
+    return list(seen.values())
+
+
+That’s it. No other files touched. The rescan path, CLI headless path, and all three parser formats (CSV, CycloneDX, SPDX) all go through parse_software_input, so they all get the dedup behaviour automatically.
