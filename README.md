@@ -143,7 +143,6 @@ The Results Browser tab provides a searchable, filterable view of scan findings.
 
 - **📂 Load CSV** — Load any previous Draugr scan CSV into the browser
 - **📄 Generate Reports** — Generate all HTML reports, POA&M, and SBOM from the currently loaded results
-- **🔄 Rescan** *(scan area)* — Re-run a fresh scan against the software list from the currently loaded CSV, using all current configuration settings
 
 The Show MEDIUM, Show LOW, and Show Unverified filters are available in the Scan Log tab toolbar and control what severity levels are written to the log during an active scan.
 
