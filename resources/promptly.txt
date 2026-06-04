@@ -1,65 +1,52 @@
-One new function, one modified function, both in draugr.py.
+Let me find the exact scan area button layout first.
 
-Step 1 — Add _normalise_version just above parse_software_list (line 1926):
+Good, now I have the full picture. Here are the exact steps:
 
-def _normalise_version(ver: str) -> str:
-    """
-    Normalise a version string for deduplication purposes.
-    Pads to 3 dot-separated segments so that '0.4' and '0.4.0' compare equal,
-    while '0.4.0' and '1.4.0' remain distinct.
-    Only used as a dedup key — the original string is preserved in the tuple.
-    """
-    parts = str(ver).strip().split(".")
-    while len(parts) < 3:
-        parts.append("0")
-    return ".".join(parts)
+Step 1 — Add the Rescan button definition in the scan area (after self.trend_btn definition, before btn_row.addWidget calls, around line 3547):
+
+Add this block:
+
+        self.rescan_btn = QPushButton("🔄  Rescan")
+        self.rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rescan_btn.setFixedSize(150, 44)
+        self.rescan_btn.setToolTip("Re-run a fresh scan using the software list from the currently loaded CSV")
+        self.rescan_btn.setStyleSheet(ACTION_BTN_STYLE.replace(C.RED, C.YELLOW))
 
 
-Step 2 — Replace the body of parse_software_input (line 6289):
+Step 2 — Add it to btn_row (after self.trend_btn is added, around line 3556):
 
-Change it from early-returning into each parser branch, to collecting into raw first, then running a dedup pass at the end:
-
-def parse_software_input(path: str) -> List[Tuple[str, str, str, str]]:
-    """
-    Auto-detect input format and dispatch to the correct parser.
-    Supports: CSV/TXT (inventory lists), CycloneDX JSON, SPDX JSON.
-
-    After parsing, deduplicates entries whose (name, normalised_version, publisher)
-    key is identical — e.g. '0.4' and '0.4.0' are treated as the same version.
-    When two entries collide, the most specific version string (most dot segments)
-    is kept for better NVD/CPE matching.
-    """
-    path_lower = path.lower()
-
-    if path_lower.endswith(".json"):
-        try:
-            with open(path, "r", encoding="utf-8-sig") as f:
-                peek = json.load(f)
-            if peek.get("bomFormat", "").lower() == "cyclonedx" or "components" in peek:
-                raw = parse_sbom_cyclonedx(path)
-            elif "SPDX" in str(peek.get("spdxVersion", "")) or "packages" in peek:
-                raw = parse_sbom_spdx(path)
-            else:
-                raw = parse_software_list(path)
-        except (json.JSONDecodeError, KeyError):
-            raw = parse_software_list(path)
-    else:
-        raw = parse_software_list(path)
-
-    # Deduplicate: (name, normalised_version, publisher) → keep most specific version string
-    seen: Dict[Tuple[str, str, str], Tuple[str, str, str, str]] = {}
-    for entry in raw:
-        name, version, publisher, idate = entry
-        key = (name.lower(), _normalise_version(version), publisher.lower())
-        if key not in seen:
-            seen[key] = entry
-        else:
-            # Prefer the version string with more dot segments (most specific)
-            existing_ver = seen[key][1]
-            if version.count(".") > existing_ver.count("."):
-                seen[key] = entry
-
-    return list(seen.values())
+        btn_row.addSpacing(5)
+        btn_row.addWidget(self.rescan_btn)
 
 
-That’s it. No other files touched. The rescan path, CLI headless path, and all three parser formats (CSV, CycloneDX, SPDX) all go through parse_software_input, so they all get the dedup behaviour automatically.
+Step 3 — Connect its signal (with the other .clicked.connect calls, around line 3561):
+
+        self.rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
+
+
+Step 4 — Remove the Rescan button from the Results Browser source bar (around line 3756). Remove these lines:
+
+        rescan_btn = QPushButton("🔄  Rescan")
+        rescan_btn.setFixedHeight(28)
+        rescan_btn.setToolTip(
+            "Re-run a fresh scan using the software list from the currently loaded CSV"
+        )
+        rescan_btn.setStyleSheet(
+            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; "
+            f"padding:2px 10px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
+            f"QPushButton:disabled {{ background:{C.BORDER}; color:{C.FG_DIM}; }}"
+        )
+        rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
+        self._rescan_btn = rescan_btn
+
+
+And remove its widget addition:
+
+        source_bar.addWidget(rescan_btn)
+
+
+Step 5 — Update self._rescan_btn — since the button is now self.rescan_btn (a proper instance attribute like scan_btn, stop_btn etc.) you can remove the self._rescan_btn = rescan_btn line entirely from step 4, as the reference is already stored as self.rescan_btn in step 1.
+
+That’s all four files locations touched, all in draugr.py. Want me to implement it?
