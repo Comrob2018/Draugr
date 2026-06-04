@@ -209,7 +209,7 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
-DRAUGR_VERSION = "3.0.1"
+DRAUGR_VERSION = "3.0.3"
 # GitHub repository for update checks — format: "owner/repo"
 # Configurable via Settings → Update Settings. Stored in prefs.json.
 _GITHUB_REPO: str = "https://github.com/Comrob2018/Draugr/tree/main"
@@ -1922,6 +1922,18 @@ def load_kev_with_fallback(path: str, *, log=None) -> Dict[str, Dict[str, str]]:
     emit("⚠ No local KEV file available. KEV checks will be skipped.", "warn")
     return {}
 
+def _normalise_version(ver: str) -> str:
+    """
+    Normalise a version string for deduplication purposes.
+    Pads to 3 dot-separated segments so that '0.4' and '0.4.0' compare equal,
+    while '0.4.0' and '1.4.0' remain distinct.
+    Only used as a dedup key — the original string is preserved in the tuple.
+    """
+    parts = str(ver).strip().split(".")
+    while len(parts) < 3:
+        parts.append("0")
+    return ".".join(parts)
+
 
 def parse_software_list(path: str) -> List[Tuple[str, str, str, str]]:
     """
@@ -3518,32 +3530,41 @@ class CVEScannerWindow(QMainWindow):
         self.skip_btn.setFixedSize(160, 44)
         self.skip_btn.setEnabled(False)
         self.skip_btn.setToolTip("Skip the software item currently being scanned and move to the next one")
-        self.skip_btn.setStyleSheet(ACTION_BTN_STYLE.replace(C.RED, C.ORANGE))
+        self.skip_btn.setStyleSheet(ACTION_BTN_STYLE)
+
+        self.rescan_btn = QPushButton("🔄  Rescan")
+        self.rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rescan_btn.setFixedSize(150, 44)
+        self.rescan_btn.setToolTip("Re-run a fresh scan using the software list from the currently loaded CSV")
+        self.rescan_btn.setStyleSheet(ACTION_BTN_STYLE)
 
         self.diff_btn = QPushButton("Δ   Compare Scans")
         self.diff_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.diff_btn.setFixedSize(160, 44)
         self.diff_btn.setToolTip("Compare two Draugr output CSVs and generate a delta report")
-        self.diff_btn.setStyleSheet(ACTION_BTN_STYLE.replace(C.RED, C.BLUE))
+        self.diff_btn.setStyleSheet(ACTION_BTN_STYLE)
 
         self.trend_btn = QPushButton("📈  Scan History")
         self.trend_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.trend_btn.setFixedSize(150, 44)
         self.trend_btn.setToolTip("View scan history and trends across all systems")
-        self.trend_btn.setStyleSheet(ACTION_BTN_STYLE.replace(C.RED, "#2a7a2a"))
+        self.trend_btn.setStyleSheet(ACTION_BTN_STYLE)
 
         btn_row.addWidget(self.scan_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.stop_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.skip_btn)
-        btn_row.addSpacing(14)
+        btn_row.addSpacing(5)
+        btn_row.addWidget(self.rescan_btn)
+        btn_row.addSpacing(5)
         btn_row.addWidget(self.diff_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.trend_btn)
         self.scan_btn.clicked.connect(lambda: self._start_scan(generate_executive_report=True))
         self.stop_btn.clicked.connect(self._stop_scan)
         self.skip_btn.clicked.connect(self._skip_current_software)
+        self.rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
         self.diff_btn.clicked.connect(self._run_diff)
         self.trend_btn.clicked.connect(self._view_scan_history)
         btn_row.addStretch()
@@ -3740,24 +3761,9 @@ class CVEScannerWindow(QMainWindow):
         )
         gen_reports_btn.clicked.connect(self._generate_reports_from_loaded_csv)
         self._gen_reports_btn = gen_reports_btn
-        rescan_btn = QPushButton("🔄  Rescan")
-        rescan_btn.setFixedHeight(28)
-        rescan_btn.setToolTip(
-            "Re-run a fresh scan using the software list from the currently loaded CSV"
-        )
-        rescan_btn.setStyleSheet(
-            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
-            f"border:1px solid {C.BORDER}; border-radius:4px; "
-            f"padding:2px 10px; font-size:11px; }}"
-            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
-            f"QPushButton:disabled {{ background:{C.BORDER}; color:{C.FG_DIM}; }}"
-        )
-        rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
-        self._rescan_btn = rescan_btn
         source_bar.addWidget(self._results_source_label, 1)
         source_bar.addWidget(load_csv_btn)
         source_bar.addWidget(gen_reports_btn)
-        source_bar.addWidget(rescan_btn)
         results_left_layout.addLayout(source_bar)
 
         # Filter bar
@@ -6290,25 +6296,43 @@ def parse_software_input(path: str) -> List[Tuple[str, str, str, str]]:
     """
     Auto-detect input format and dispatch to the correct parser.
     Supports: CSV/TXT (inventory lists), CycloneDX JSON, SPDX JSON.
+
+    After parsing, deduplicates entries whose (name, normalised_version, publisher)
+    key is identical — e.g. '0.4' and '0.4.0' are treated as the same version.
+    When two entries collide, the most specific version string (most dot segments)
+    is kept for better NVD/CPE matching.
     """
     path_lower = path.lower()
 
-    # Try SBOM formats based on extension or content sniff
     if path_lower.endswith(".json"):
         try:
             with open(path, "r", encoding="utf-8-sig") as f:
                 peek = json.load(f)
-            # CycloneDX detection
             if peek.get("bomFormat", "").lower() == "cyclonedx" or "components" in peek:
-                return parse_sbom_cyclonedx(path)
-            # SPDX detection
-            if "SPDX" in str(peek.get("spdxVersion", "")) or "packages" in peek:
-                return parse_sbom_spdx(path)
+                raw = parse_sbom_cyclonedx(path)
+            elif "SPDX" in str(peek.get("spdxVersion", "")) or "packages" in peek:
+                raw = parse_sbom_spdx(path)
+            else:
+                raw = parse_software_list(path)
         except (json.JSONDecodeError, KeyError):
-            pass
+            raw = parse_software_list(path)
+    else:
+        raw = parse_software_list(path)
 
-    # Default: CSV / plain-text inventory
-    return parse_software_list(path)
+    # Deduplicate: (name, normalised_version, publisher) → keep most specific version string
+    seen: Dict[Tuple[str, str, str], Tuple[str, str, str, str]] = {}
+    for entry in raw:
+        name, version, publisher, idate = entry
+        key = (name.lower(), _normalise_version(version), publisher.lower())
+        if key not in seen:
+            seen[key] = entry
+        else:
+            # Prefer the version string with more dot segments (most specific)
+            existing_ver = seen[key][1]
+            if version.count(".") > existing_ver.count("."):
+                seen[key] = entry
+
+    return list(seen.values())
 
 
 def aggregate_multi_host(
