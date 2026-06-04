@@ -81,6 +81,74 @@ self._update_status("Reports generated.")
 
 Change 9 — Fix _gen_reports_btn naming consistency
 
-Rename self._gen_reports_btn → self.gen_reports_btn to match the pattern of all other buttons. Three places: the assignment in the UI build, the _update_data_action_buttons call, and the setEnabled call at startup.
+Rename self._gen_reports_btn → self.gen_reports_btn to match the pattern of all other buttons. Three places: the assignment in the UI build, the _update_data_action_buttons call, and the setEnabled call at Let me find exactly where those buttons and the log tab are built.
 
-That’s 9 discrete changes, all in draugr.py. Want me to implement them all now?
+
+Step 10 — Remove the Copy and Clear buttons from filter_row
+
+Remove these lines (~3633–3651):
+
+_log_btn_style = (...)
+log_copy_btn = QPushButton("⎘ Copy")
+log_copy_btn.setFixedHeight(22)
+log_copy_btn.setToolTip("Copy the full log to clipboard")
+log_copy_btn.setStyleSheet(_log_btn_style)
+log_copy_btn.clicked.connect(self._copy_log)
+filter_row.addWidget(log_copy_btn)
+
+log_clear_btn = QPushButton("✕ Clear")
+log_clear_btn.setFixedHeight(22)
+log_clear_btn.setToolTip("Clear the scan log")
+log_clear_btn.setStyleSheet(_log_btn_style)
+log_clear_btn.clicked.connect(lambda: self.log.clear())
+filter_row.addWidget(log_clear_btn)
+
+
+Also remove the log_label and its addWidget call just above them since the label only labelled that section.
+
+Step 2 — Wrap the Scan Log tab in a QWidget with a toolbar
+
+Currently the tab is just the bare QTextEdit:
+
+self.tab_widget.addTab(self.log, "📋  Scan Log")
+
+
+Replace it with a QWidget containing a small toolbar row above the log:
+
+# Scan Log tab — log + toolbar
+log_tab = QWidget()
+log_tab_layout = QVBoxLayout(log_tab)
+log_tab_layout.setContentsMargins(0, 0, 0, 0)
+log_tab_layout.setSpacing(0)
+
+# Toolbar
+log_toolbar = QHBoxLayout()
+log_toolbar.setContentsMargins(6, 4, 6, 4)
+
+_log_btn_style = (
+    f"QPushButton {{ background: {C.BG_INPUT}; color: {C.FG_DIM}; "
+    f"border: 1px solid {C.BORDER}; border-radius: 4px; "
+    f"padding: 1px 8px; font-size: 11px; }}"
+    f"QPushButton:hover {{ background: {C.BG_HOVER}; color: {C.FG}; }}"
+)
+log_copy_btn = QPushButton("⎘  Copy Log")
+log_copy_btn.setFixedHeight(24)
+log_copy_btn.setToolTip("Copy the full log to clipboard")
+log_copy_btn.setStyleSheet(_log_btn_style)
+log_copy_btn.clicked.connect(self._copy_log)
+
+log_clear_btn = QPushButton("✕  Clear Log")
+log_clear_btn.setFixedHeight(24)
+log_clear_btn.setToolTip("Clear the scan log")
+log_clear_btn.setStyleSheet(_log_btn_style)
+log_clear_btn.clicked.connect(lambda: self.log.clear())
+
+log_toolbar.addWidget(log_copy_btn)
+log_toolbar.addWidget(log_clear_btn)
+log_toolbar.addStretch()
+
+log_tab_layout.addLayout(log_toolbar)
+log_tab_layout.addWidget(self.log)
+self.tab_widget.addTab(log_tab, "📋  Scan Log")
+
+
