@@ -84,7 +84,7 @@ Change 9 — Fix _gen_reports_btn naming consistency
 Rename self._gen_reports_btn → self.gen_reports_btn to match the pattern of all other buttons. Three places: the assignment in the UI build, the _update_data_action_buttons call, and the setEnabled call at Let me find exactly where those buttons and the log tab are built.
 
 
-Step 10 — Remove the Copy and Clear buttons from filter_row
+Change 10 — Remove the Copy and Clear buttons from filter_row
 
 Remove these lines (~3633–3651):
 
@@ -106,7 +106,7 @@ filter_row.addWidget(log_clear_btn)
 
 Also remove the log_label and its addWidget call just above them since the label only labelled that section.
 
-Step 2 — Wrap the Scan Log tab in a QWidget with a toolbar
+Change 11 — Wrap the Scan Log tab in a QWidget with a toolbar
 
 Currently the tab is just the bare QTextEdit:
 
