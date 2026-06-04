@@ -209,7 +209,7 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
-DRAUGR_VERSION = "3.0.3"
+DRAUGR_VERSION = "3.1.0"
 # GitHub repository for update checks — format: "owner/repo"
 # Configurable via Settings → Update Settings. Stored in prefs.json.
 _GITHUB_REPO: str = "https://github.com/Comrob2018/Draugr/tree/main"
@@ -3131,6 +3131,7 @@ class CVEScannerWindow(QMainWindow):
         self.show_low       = False
         self.show_unverified = False
         self._scan_rows: List[Dict[str, Any]] = []   # last scan results for browser
+        self._loaded_csv_path: str = "" # path of the last CSV loaded into the browser
         self._profiles:  Dict[str, Dict[str, Any]] = self._load_profiles()
         self._tags:      Dict[str, str] = self._load_tags()
         _load_github_repo()   # pre-load repo slug from prefs
@@ -3511,21 +3512,21 @@ class CVEScannerWindow(QMainWindow):
         }}
         """
 
-        self.scan_btn = QPushButton("▶   Start Scan")
+        self.scan_btn = QPushButton("▶️   Start Scan")
         self.scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_btn.setFixedSize(200, 44)
         self.scan_btn.setStyleSheet(ACTION_BTN_STYLE)
         self.scan_btn.setToolTip("Start a new scan  (Ctrl+R)")
         self._scan_btn_default_style = ACTION_BTN_STYLE   # saved for reset after feedback
 
-        self.stop_btn = QPushButton("■   Stop Scan")
+        self.stop_btn = QPushButton("⏹️   Stop Scan")
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_btn.setFixedSize(200, 44)
         self.stop_btn.setEnabled(False)
         self.stop_btn.setStyleSheet(ACTION_BTN_STYLE)
         self.stop_btn.setToolTip("Stop the running scan  (Ctrl+.)")
 
-        self.skip_btn = QPushButton("⏭   Skip Current")
+        self.skip_btn = QPushButton("⏭️   Skip Current")
         self.skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.skip_btn.setFixedSize(160, 44)
         self.skip_btn.setEnabled(False)
@@ -3538,7 +3539,7 @@ class CVEScannerWindow(QMainWindow):
         self.rescan_btn.setToolTip("Re-run a fresh scan using the software list from the currently loaded CSV")
         self.rescan_btn.setStyleSheet(ACTION_BTN_STYLE)
 
-        self.diff_btn = QPushButton("Δ   Compare Scans")
+        self.diff_btn = QPushButton("🔀   Compare Scans")
         self.diff_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.diff_btn.setFixedSize(160, 44)
         self.diff_btn.setToolTip("Compare two Draugr output CSVs and generate a delta report")
@@ -3623,56 +3624,23 @@ class CVEScannerWindow(QMainWindow):
         }}
         """
 
-        log_label = QLabel("LOG")
-        log_label.setStyleSheet(
-            f"color: {C.FG_DIM}; font-size: 10px; font-weight: 600; letter-spacing: 2px;"
-        )
-        filter_row.addWidget(log_label)
 
-        _log_btn_style = (
-            f"QPushButton {{ background: {C.BG_INPUT}; color: {C.FG_DIM}; "
-            f"border: 1px solid {C.BORDER}; border-radius: 4px; "
-            f"padding: 1px 8px; font-size: 11px; }}"
-            f"QPushButton:hover {{ background: {C.BG_HOVER}; color: {C.FG}; }}"
-        )
-        log_copy_btn = QPushButton("⎘ Copy")
-        log_copy_btn.setFixedHeight(22)
-        log_copy_btn.setToolTip("Copy the full log to clipboard")
-        log_copy_btn.setStyleSheet(_log_btn_style)
-        log_copy_btn.clicked.connect(self._copy_log)
-        filter_row.addWidget(log_copy_btn)
-
-        log_clear_btn = QPushButton("✕ Clear")
-        log_clear_btn.setFixedHeight(22)
-        log_clear_btn.setToolTip("Clear the scan log")
-        log_clear_btn.setStyleSheet(_log_btn_style)
-        log_clear_btn.clicked.connect(lambda: self.log.clear())
-        filter_row.addWidget(log_clear_btn)
-
-        filter_row.addStretch()
 
         self.chk_medium = QCheckBox("Show MEDIUM")
         self.chk_medium.setChecked(False)
         self.chk_medium.setStyleSheet(CHECKBOX_STYLE)
-        filter_row.addWidget(self.chk_medium)
+
 
         self.chk_low = QCheckBox("Show LOW")
         self.chk_low.setChecked(False)
         self.chk_low.setStyleSheet(CHECKBOX_STYLE)
-        filter_row.addWidget(self.chk_low)
 
         self.chk_unverified = QCheckBox("Show Unverified")
         self.chk_unverified.setChecked(False)
         self.chk_unverified.setToolTip("Show CVEs where the version match could not be confirmed")
         self.chk_unverified.setStyleSheet(CHECKBOX_STYLE)
-        filter_row.addWidget(self.chk_unverified)
 
-        root.addLayout(filter_row)
-        root.addSpacing(4)
 
-        self.chk_medium.stateChanged.connect(self._update_show_medium)
-        self.chk_low.stateChanged.connect(self._update_show_low)
-        self.chk_unverified.stateChanged.connect(self._update_show_unverified)
 
         # ── Tab widget: Scan Log | Results Browser ─────────────────────
         from PyQt6.QtWidgets import QTabWidget, QSplitter, QTableWidget, QTableWidgetItem
@@ -3720,7 +3688,50 @@ class CVEScannerWindow(QMainWindow):
             }}
             """
         )
-        self.tab_widget.addTab(self.log, "📋  Scan Log")
+        # Scan Log tab — log + toolbar
+        log_tab = QWidget()
+        log_tab_layout = QVBoxLayout(log_tab)
+        log_tab_layout.setContentsMargins(0, 0, 0, 0)
+        log_tab_layout.setSpacing(0)
+
+        # Toolbar
+        log_toolbar = QHBoxLayout()
+        log_toolbar.setContentsMargins(6, 4, 6, 4)
+
+        _log_btn_style = (
+            f"QPushButton {{ background: {C.BG_INPUT}; color: {C.FG_DIM}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 4px; "
+            f"padding: 1px 8px; font-size: 11px; }}"
+            f"QPushButton:hover {{ background: {C.BG_HOVER}; color: {C.FG}; }}"
+        )
+        log_copy_btn = QPushButton("⎘  Copy Log")
+        log_copy_btn.setFixedHeight(24)
+        log_copy_btn.setToolTip("Copy the full log to clipboard")
+        log_copy_btn.setStyleSheet(_log_btn_style)
+        log_copy_btn.clicked.connect(self._copy_log)
+
+        log_clear_btn = QPushButton("✕  Clear Log")
+        log_clear_btn.setFixedHeight(24)
+        log_clear_btn.setToolTip("Clear the scan log")
+        log_clear_btn.setStyleSheet(_log_btn_style)
+        log_clear_btn.clicked.connect(lambda: self.log.clear())
+
+        log_toolbar.addWidget(log_copy_btn)
+        log_toolbar.addWidget(log_clear_btn)
+        log_toolbar.addStretch()
+        log_toolbar.addWidget(self.chk_medium)
+        log_toolbar.addSpacing(4)
+        log_toolbar.addWidget(self.chk_low)
+        log_toolbar.addSpacing(4)
+        log_toolbar.addWidget(self.chk_unverified)
+
+        self.chk_medium.stateChanged.connect(self._update_show_medium)
+        self.chk_low.stateChanged.connect(self._update_show_low)
+        self.chk_unverified.stateChanged.connect(self._update_show_unverified)
+
+        log_tab_layout.addLayout(log_toolbar)
+        log_tab_layout.addWidget(self.log)
+        self.tab_widget.addTab(log_tab, "📋  Scan Log")
 
         # Tab 2: Results browser (table + CVE detail panel)
         results_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -3761,6 +3772,7 @@ class CVEScannerWindow(QMainWindow):
         )
         gen_reports_btn.clicked.connect(self._generate_reports_from_loaded_csv)
         self._gen_reports_btn = gen_reports_btn
+        gen_reports_btn.setEnabled(False)
         source_bar.addWidget(self._results_source_label, 1)
         source_bar.addWidget(load_csv_btn)
         source_bar.addWidget(gen_reports_btn)
@@ -4203,7 +4215,7 @@ class CVEScannerWindow(QMainWindow):
         )
 
     def _reset_scan_button(self):
-        self.scan_btn.setText("▶   Start Scan")
+        self.scan_btn.setText("▶️   Start Scan")
         self.scan_btn.setStyleSheet(self._scan_btn_default_style)
 
     def _copy_log(self):
@@ -4222,12 +4234,19 @@ class CVEScannerWindow(QMainWindow):
         except Exception as e:
             self._styled_msgbox("critical", "Error", f"Could not clear cache:\n{e}")
 
+    def _update_data_action_buttons(self) -> None:
+        """Enable or disable data-action buttons based on whether results are loaded."""
+        has_data = bool(self._scan_rows)
+        self._gen_reports_btn.setEnabled(has_data)
+        self.rescan_btn.setEnabled(has_data and not self.scanning)
+
     def _scan_finished(self):
         self._append_log("Scan Finished.", "info")
         self.scanning = False
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.skip_btn.setEnabled(False)
+        self.rescan_btn.setEnabled(True)
         self._dot_timer.stop()
         self._status_dot.setText("●  IDLE")
         self._status_dot.setStyleSheet(
@@ -4285,6 +4304,8 @@ class CVEScannerWindow(QMainWindow):
 
         if completed_rows:
             self._scan_rows = completed_rows
+            self._loaded_csv_path = ""   # live scan, no CSV path
+            self._update_data_action_buttons()
             self._populate_results_table(self._scan_rows)
             import datetime as _dt
             _now = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
@@ -4354,6 +4375,7 @@ class CVEScannerWindow(QMainWindow):
 
         self.scanning = True
         self.scan_btn.setEnabled(False)
+        self.rescan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.skip_btn.setEnabled(True)
         self.scan_btn.setText("Scanning …")
@@ -4757,6 +4779,8 @@ class CVEScannerWindow(QMainWindow):
             return
 
         self._scan_rows = rows
+        self._loaded_csv_path = path
+        self._update_data_action_buttons()
         self._populate_results_table(self._scan_rows)
 
         # Update source label
@@ -4805,6 +4829,7 @@ class CVEScannerWindow(QMainWindow):
         report_dir = Path(out_dir)
 
         try:
+            self._update_status("Generating reports…")
             self._append_log(f"Generating reports from {len(self._scan_rows)} findings…", "info")
 
             # ── Executive Report ─────────────────────────────────────
@@ -4861,6 +4886,7 @@ class CVEScannerWindow(QMainWindow):
                     self._append_log(f"⚠ SBOM export failed: {e}", "warn")
 
             Toast.show_toast(self, f"Reports written to {Path(out_dir).name}", "ok")
+            self._update_status("Reports generated.")
             self._styled_msgbox(
                 "information", "Reports Generated",
                 f"Reports written to:\n{out_dir}\n\n"
