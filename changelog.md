@@ -59,7 +59,8 @@
 - Splash screen version string converted from a hardcoded literal to an f-string using `DRAUGR_VERSION` — single source of truth for all version references
 - Added Generate Reports button to the Results Browser source bar
 - Added `_generate_reports_from_loaded_csv()` — generates Executive, Technical, and Red Team HTML reports (plus POA&M and SBOM if available) from any loaded results, whether from a live scan or a loaded CSV
-- Risk matrix in executive report: Y-axis label renamed from CONSEQUENCE to IMPACT
-- Risk matrix: left padding increased (`PAD_L` 60 → 76, canvas width 480 → 500) for better spacing between axis labels and the grid
-- Risk matrix: Y-axis tick labels moved further from grid edge for readability
-- `_consequence()` function renamed to `_impact()` throughout `draugr_reports.py`
+
+-----
+
+## previous versions
+> 2.2.1 and prior
