@@ -51,7 +51,7 @@ from urllib.parse import quote_plus
 
 # Draugr companion modules (imported with fallback so headless CLI still works)
 try:
-    from draugr_themes import set_theme, load_saved_theme, qt_stylesheet, t as _t, THEMES
+    from core.draugr_themes import set_theme, load_saved_theme, qt_stylesheet, t as _t, THEMES
     HAS_THEMES = True
     load_saved_theme()
 except ImportError:
@@ -59,13 +59,13 @@ except ImportError:
     def _t(k, fb="#888"): return fb  # type: ignore
 
 try:
-    from draugr_sbom import export_sbom
+    from reports.draugr_sbom import export_sbom
     HAS_SBOM = True
 except ImportError:
     HAS_SBOM = False
 
 try:
-    from draugr_plugins import load_plugins, apply_enrich_row, apply_score_modifier, apply_on_scan_complete, collect_report_sections, ensure_plugins_dir, get_loaded_plugins, get_load_errors
+    from core.draugr_plugins import load_plugins, apply_enrich_row, apply_score_modifier, apply_on_scan_complete, collect_report_sections, ensure_plugins_dir, get_loaded_plugins, get_load_errors
     HAS_PLUGINS = True
 except ImportError:
     HAS_PLUGINS = False
@@ -75,13 +75,13 @@ except ImportError:
     def collect_report_sections(rows): return ""   # type: ignore
 
 try:
-    from draugr_ics import enrich_row_with_ics
+    from intelligence.draugr_ics import enrich_row_with_ics
     HAS_ICS = True
 except ImportError:
     HAS_ICS = False
 
 try:
-    from draugr_cache import get_db as _get_db, extract_system_id
+    from core.draugr_cache import get_db as _get_db, extract_system_id
     HAS_CACHE = True
 except ImportError:
     HAS_CACHE = False
@@ -89,32 +89,32 @@ except ImportError:
     extract_system_id = lambda f: Path(f).stem
 
 try:
-    from draugr_diff import compute_diff, build_diff_report, export_diff_csv, load_scan_csv
+    from reports.draugr_diff import compute_diff, build_diff_report, export_diff_csv, load_scan_csv
     HAS_DIFF = True
 except ImportError:
     HAS_DIFF = False
 
 try:
-    from draugr_advisories import resolve_advisory
+    from intelligence.draugr_advisories import resolve_advisory
     HAS_ADVISORIES = True
 except ImportError:
     HAS_ADVISORIES = False
 
 try:
-    from draugr_poam import export_poam
+    from reports.draugr_poam import export_poam
     HAS_POAM = True
 except ImportError:
     HAS_POAM = False
 
 try:
-    from draugr_fleet import build_fleet_report_from_db
+    from reports.draugr_fleet import build_fleet_report_from_db
     HAS_FLEET = True
 except ImportError:
     HAS_FLEET = False
     def build_fleet_report_from_db(*a, **kw) -> str: return ""  # type: ignore
 
 try:
-    from draugr_alerts import check_alerts, dispatch_alerts, load_alert_config
+    from intelligence.draugr_alerts import check_alerts, dispatch_alerts, load_alert_config
     HAS_ALERTS = True
 except ImportError:
     HAS_ALERTS = False
@@ -123,7 +123,7 @@ except ImportError:
     def dispatch_alerts(*a, **kw) -> dict: return {"email": 0, "webhook": 0}            # type: ignore
 
 try:
-    from draugr_remediation import (
+    from intelligence.draugr_remediation import (
         enrich_rows_with_remediation,
         remediation_summary,
         remediation_report_section,
@@ -135,11 +135,11 @@ except ImportError:
     def remediation_summary(db): return {}                                              # type: ignore
     def remediation_report_section(db): return ""                                       # type: ignore
 
-# draugr_reports is imported here so _THREAT_INTEL_CACHE is bound before any
+# reports.draugr_reports is imported here so _THREAT_INTEL_CACHE is bound before any
 # function that writes to it (query_otx_for_cves) is defined below.
-# The cache dict is declared in draugr_reports to avoid a circular import.
+# The cache dict is declared in reports.draugr_reports to avoid a circular import.
 try:
-    from draugr_reports import (
+    from reports.draugr_reports import (
         build_executive_report_markdown,
         build_defensive_report,
         build_redteam_report,
@@ -150,11 +150,11 @@ except ImportError:
     HAS_REPORTS = False
     _THREAT_INTEL_CACHE: Dict[str, Dict[str, Any]] = {}                                # type: ignore
     def build_executive_report_markdown(rows, report_title="", otx_results=None) -> str:  # type: ignore
-        return "# Report generation unavailable\n\ndraugr_reports.py could not be imported.\n"
+        return "# Report generation unavailable\n\nreports.draugr_reports.py could not be imported.\n"
     def build_defensive_report(rows, report_title="") -> str:                             # type: ignore
-        return "<html><body><p>draugr_reports.py could not be imported.</p></body></html>"
+        return "<html><body><p>reports.draugr_reports.py could not be imported.</p></body></html>"
     def build_redteam_report(rows, report_title="", otx_results=None) -> str:             # type: ignore
-        return "<html><body><p>draugr_reports.py could not be imported.</p></body></html>"
+        return "<html><body><p>reports.draugr_reports.py could not be imported.</p></body></html>"
 
 
 # ----------------------------------------------------------------------
@@ -219,7 +219,7 @@ def _load_github_repo() -> str:
     """Load the configured GitHub repo slug from prefs."""
     global _GITHUB_REPO
     try:
-        from draugr_cache import _default_cache_dir
+        from core.draugr_cache import _default_cache_dir
         import json as _j
         p = _default_cache_dir() / "prefs.json"
         if p.exists():
@@ -235,7 +235,7 @@ def _save_github_repo(repo: str) -> None:
     global _GITHUB_REPO
     _GITHUB_REPO = repo.strip()
     try:
-        from draugr_cache import _default_cache_dir
+        from core.draugr_cache import _default_cache_dir
         import json as _j
         p = _default_cache_dir() / "prefs.json"
         prefs: dict = {}
@@ -3146,7 +3146,7 @@ class CVEScannerWindow(QMainWindow):
                 pass
 
     def _load_profiles(self) -> Dict[str, Dict[str, Any]]:
-        from draugr_cache import _default_cache_dir
+        from core.draugr_cache import _default_cache_dir
         path = _default_cache_dir() / "scan_profiles.json"
         try:
             if path.exists():
@@ -3158,7 +3158,7 @@ class CVEScannerWindow(QMainWindow):
 
     def _save_profiles(self) -> None:
         try:
-            from draugr_cache import _default_cache_dir
+            from core.draugr_cache import _default_cache_dir
             path = _default_cache_dir() / "scan_profiles.json"
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._profiles, f, indent=2)
@@ -3167,7 +3167,7 @@ class CVEScannerWindow(QMainWindow):
 
     def _load_tags(self) -> Dict[str, str]:
         try:
-            from draugr_cache import _default_cache_dir
+            from core.draugr_cache import _default_cache_dir
             path = _default_cache_dir() / "software_tags.json"
             if path.exists():
                 with open(path, "r", encoding="utf-8") as f:
@@ -3178,7 +3178,7 @@ class CVEScannerWindow(QMainWindow):
 
     def _save_tags(self) -> None:
         try:
-            from draugr_cache import _default_cache_dir
+            from core.draugr_cache import _default_cache_dir
             path = _default_cache_dir() / "software_tags.json"
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._tags, f, indent=2)
@@ -3187,7 +3187,7 @@ class CVEScannerWindow(QMainWindow):
 
     def _load_ui_prefs(self) -> Dict[str, Any]:
         try:
-            from draugr_cache import _default_cache_dir
+            from core.draugr_cache import _default_cache_dir
             path = _default_cache_dir() / "ui_prefs.json"
             if path.exists():
                 with open(path, "r", encoding="utf-8") as f:
@@ -3198,7 +3198,7 @@ class CVEScannerWindow(QMainWindow):
 
     def _save_ui_prefs(self, prefs: Dict[str, Any]) -> None:
         try:
-            from draugr_cache import _default_cache_dir
+            from core.draugr_cache import _default_cache_dir
             path = _default_cache_dir() / "ui_prefs.json"
             existing: Dict[str, Any] = {}
             if path.exists():
@@ -4746,7 +4746,7 @@ class CVEScannerWindow(QMainWindow):
     def _load_csv_into_browser(self) -> None:
         """Load a previously saved Draugr scan CSV into the Results Browser."""
         if not HAS_DIFF:
-            # load_scan_csv lives in draugr_diff — fall back to built-in csv if missing
+            # load_scan_csv lives in reports.draugr_diff — fall back to built-in csv if missing
             import csv as _csv
             path, _ = QFileDialog.getOpenFileName(
                 self, "Open Draugr Scan CSV", "", "CSV files (*.csv);;All files (*)"
@@ -4976,7 +4976,7 @@ class CVEScannerWindow(QMainWindow):
     def _run_diff(self):
         if not HAS_DIFF:
             self._styled_msgbox("warning", "Unavailable",
-                "draugr_diff.py not found. Place it in the same directory as draugr.py.")
+                "reports.draugr_diff.py not found. Place it in the same directory as draugr.py.")
             return
 
         old_path, _ = QFileDialog.getOpenFileName(
@@ -5034,7 +5034,7 @@ class CVEScannerWindow(QMainWindow):
     def _manage_false_positives(self):
         if not HAS_CACHE:
             self._styled_msgbox("warning", "Unavailable",
-                "draugr_cache.py not found. Place it in the same directory as draugr.py.")
+                "core.draugr_cache.py not found. Place it in the same directory as draugr.py.")
             return
 
         try:
@@ -5150,7 +5150,7 @@ class CVEScannerWindow(QMainWindow):
     def _view_scan_history(self):
         if not HAS_CACHE:
             self._styled_msgbox("warning", "Unavailable",
-                "draugr_cache.py not found. Place it in the same directory as draugr.py.")
+                "core.draugr_cache.py not found. Place it in the same directory as draugr.py.")
             return
         try:
             db      = _get_db()
@@ -5224,10 +5224,10 @@ class CVEScannerWindow(QMainWindow):
 
         def _export_fleet():
             if not HAS_FLEET:
-                QMessageBox.warning(dlg, "Unavailable", "draugr_fleet.py not found.")
+                QMessageBox.warning(dlg, "Unavailable", "reports.draugr_fleet.py not found.")
                 return
             path, _ = QFileDialog.getSaveFileName(
-                dlg, "Save Fleet Report", "draugr_fleet_report.html", "HTML files (*.html)"
+                dlg, "Save Fleet Report", "reports.draugr_fleet_report.html", "HTML files (*.html)"
             )
             if not path:
                 return
@@ -5257,7 +5257,7 @@ class CVEScannerWindow(QMainWindow):
     def _configure_alerts(self):
         if not HAS_ALERTS:
             self._styled_msgbox("warning", "Unavailable",
-                "draugr_alerts.py not found. Place it in the same directory as draugr.py.")
+                "intelligence.draugr_alerts.py not found. Place it in the same directory as draugr.py.")
             return
 
         from PyQt6.QtWidgets import QDialog
@@ -5354,7 +5354,7 @@ class CVEScannerWindow(QMainWindow):
                 },
             }
             try:
-                from draugr_alerts import save_alert_config
+                from intelligence.draugr_alerts import save_alert_config
                 save_alert_config(new_cfg)
                 QMessageBox.information(dlg, "Saved", "Alert configuration saved.")
                 dlg.accept()
@@ -5379,7 +5379,7 @@ class CVEScannerWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _change_theme(self) -> None:
         if not HAS_THEMES:
-            self._styled_msgbox("information", "Theme", "draugr_themes.py not found — using default theme.")
+            self._styled_msgbox("information", "Theme", "core.draugr_themes.py not found — using default theme.")
             return
         from PyQt6.QtWidgets import QDialog, QListWidget
         dlg = QDialog(self)
@@ -5391,7 +5391,7 @@ class CVEScannerWindow(QMainWindow):
             f"QListWidget {{ background:{C.BG_INPUT}; color:{C.FG}; border:1px solid {C.BORDER}; }}"
             f"QListWidget::item:selected {{ background:{C.ACCENT}; }}"
         )
-        from draugr_themes import THEMES, get_theme_name
+        from core.draugr_themes import THEMES, get_theme_name
         current = get_theme_name()
         for key, th in THEMES.items():
             lw.addItem(th["name"])
@@ -5470,7 +5470,7 @@ class CVEScannerWindow(QMainWindow):
             if HAS_CACHE:
                 try:
                     prefs = {}
-                    from draugr_cache import _default_cache_dir
+                    from core.draugr_cache import _default_cache_dir
                     p = _default_cache_dir() / "prefs.json"
                     if p.exists():
                         import json as _j
@@ -5711,7 +5711,7 @@ class CVEScannerWindow(QMainWindow):
     def _manage_plugins(self) -> None:
         if not HAS_PLUGINS:
             self._styled_msgbox("warning", "Unavailable",
-                "draugr_plugins.py not found. Place it in the same directory as draugr.py.")
+                "core.draugr_plugins.py not found. Place it in the same directory as draugr.py.")
             return
 
         from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem
@@ -6077,7 +6077,7 @@ class DraugrSplash(QSplashScreen):
     def _build_pixmap(self) -> QPixmap:
         # ── 1. Try GitHub raw URL ────────────────────────────────────
         try:
-            from draugr_cache import _default_cache_dir
+            from core.draugr_cache import _default_cache_dir
             import json as _j
             p = _default_cache_dir() / "prefs.json"
             if p.exists() and requests is not None:
