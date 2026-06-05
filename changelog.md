@@ -1,5 +1,21 @@
 # Draugr — Changelog
+-----
+## 3.2.2
+> Report navigation and TOC bullet fix
 
+- Fixed technical report TOC — top-level items no longer show bullet points; only the software sub-items nested under section 5 (Detailed CVE Analysis) have `disc` bullets
+- Added fixed `↑ Top` button to all reports — sits in the bottom-right corner of the viewport, always visible while scrolling, links to a `<a id="top">` anchor injected at the top of every report body
+- Added `↑ Top` inline link on every `h1` and `h2` section heading across all three reports — floats right, styled as a subtle grey link; `h3` headings left clean
+- Fixed scan log not displaying during active scans — the `addTab` → `removeTab` → `insertTab` approach was reparenting `self.log` out of the tab widget; replaced with a single clean `addTab` of the wrapped container
+
+-----
+
+## 3.2.1
+> Bug fixes from 3.2.0
+
+- Fixed `QPlainTextEdit` not defined — added to the top-level PyQt6 imports block
+- Fixed `CHECKBOX_STYLE` not defined in `_open_scheduler_dialog` — the style was a local variable inside `_build_ui()` and out of scope in other methods; now stored as `self._checkbox_style` at definition time and referenced accordingly
+- Fixed 10 straggler inline imports throughout `draugr.py` that still used bare `draugr_*` names instead of the correct subpackage paths introduced in 3.2.0
 -----
 
 ## 3.2.0
