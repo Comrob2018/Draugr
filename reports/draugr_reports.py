@@ -20,10 +20,12 @@ All functions take pre-computed scan row dicts; no NVD/network calls are made he
 # Standard library
 # ----------------------------------------------------------------------
 import base64
+import datetime
 import html
 import os
 import re
 from collections import defaultdict, Counter
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ----------------------------------------------------------------------
@@ -54,7 +56,7 @@ except ImportError:
 # ATT&CK scenario library
 # ----------------------------------------------------------------------
 try:
-    from intelligence.mitre_attack_scenarios import (
+    from resources.mitre_attack_scenarios import (
         TECHNIQUE_SCENARIOS as SCENARIOS,
         get_tactics,
         get_impact,
@@ -232,7 +234,7 @@ def _load_logo_b64(script_dir: Optional[str] = None) -> str:
     """
     # ── 1. GitHub raw URL ────────────────────────────────────────────
     try:
-        from draugr_cache import _default_cache_dir
+        from core.draugr_cache import _default_cache_dir
         import json as _j
         p = _default_cache_dir() / "prefs.json"
         if p.exists():
@@ -328,7 +330,11 @@ def _markdown_body_to_html(md: str) -> str:
             text = escape(m.group(2))
             # Build a slug for anchor linking
             slug = re.sub(r"[^a-z0-9]+", "-", m.group(2).lower()).strip("-")
-            out.append(f'<h{level} id="{slug}">{text}</h{level}>')
+            toc_link = (
+                ' <a href="#top" class="toc-link">↑ Top</a>'
+                if level <= 2 else ""
+            )
+            out.append(f'<h{level} id="{slug}">{text}{toc_link}</h{level}>')
             continue
 
         # --- Horizontal rule ---
@@ -595,11 +601,15 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
     padding-left: 20px;
     margin: 0;
 }}
-.toc li {{
+.toc > ul > li {{
+    list-style: none;
     padding: 2px 0;
-    list-style: decimal;
 }}
-.toc ul > li {{
+.toc > ol > li {{
+    list-style: decimal;
+    padding: 2px 0;
+}}
+.toc ul ul > li {{
     list-style: disc;
     margin-left: 4px;
 }}
@@ -613,9 +623,38 @@ def _wrap_html_report(title: str, body_md: str, logo_b64: str = "", subtitle: st
 .toc a:hover {{
     text-decoration: underline;
 }}
+.back-to-top {{
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: #001f3f;
+    color: #ffffff;
+    font-size: 11px;
+    padding: 6px 12px;
+    border-radius: 4px;
+    text-decoration: none;
+    opacity: 0.75;
+    z-index: 999;
+}}
+.back-to-top:hover {{
+    opacity: 1;
+}}
+.toc-link {{
+    float: right;
+    font-size: 10px;
+    color: #888;
+    text-decoration: none;
+    font-weight: normal;
+    margin-top: 4px;
+}}
+.toc-link:hover {{
+    color: #004080;
+}}
 </style>
     </head>
     <body>
+    <a id="top"></a>
+    <a href="#top" class="back-to-top">↑ Top</a>
     <div class="report-header">{logo_tag}<div class="report-header-text"><h1>{escaped_title}</h1>{sub_tag}</div></div>
     <div class="content">
         {toc_block}
@@ -787,8 +826,10 @@ def _svg_donut(sev_counts: Dict[str, int], total: int) -> str:
         "HIGH":     "#d35400",
         "MEDIUM":   "#d4ac0d",
         "LOW":      "#27ae60",
+        "INFO":     "#7f8c8d",
+        "OTHER":    "#95a5a6",
     }
-    labels  = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    labels  = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "OTHER"]
     counts  = [sev_counts.get(l, 0) for l in labels]
     total_s = sum(counts)
     if total_s == 0:
@@ -1333,11 +1374,13 @@ def build_executive_report_markdown(
 
     # ── Aggregate stats ──────────────────────────────────────────────────
     total_cves   = len(all_rows)
-    sev_counts   = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    sev_counts   = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "OTHER": 0}
     for r in all_rows:
         sev = str(r.get("CVSS Severity", "") or "").upper()
         if sev in sev_counts:
             sev_counts[sev] += 1
+        else:
+            sev_counts["OTHER"] += 1
     kev_total    = sum(1 for r in all_rows if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES")
     expl_total   = sum(1 for r in all_rows if str(r.get("Public Exploit", "")).upper() == "YES")
     confirmed_total = sum(1 for r in all_rows if str(r.get("Version Confirmed", "")).upper() == "YES")
@@ -2614,7 +2657,7 @@ def build_defensive_report(
     scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M UTC")
 
     total_cves    = len(all_rows)
-    sev_counts    = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    sev_counts    = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0, "OTHER": 0}
     kev_total     = 0
     expl_total    = 0
     confirmed_total = 0
@@ -2625,6 +2668,8 @@ def build_defensive_report(
         sev = str(r.get("CVSS Severity", "") or "").upper()
         if sev in sev_counts:
             sev_counts[sev] += 1
+        else:
+            sev_counts["OTHER"] += 1
         if str(r.get("Known Exploited Vulnerability", "")).upper() == "YES":
             kev_total += 1
         if str(r.get("Public Exploit", "")).upper() == "YES":
