@@ -222,7 +222,7 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
-DRAUGR_VERSION = "3.2.1"
+DRAUGR_VERSION = "3.2.2"
 # GitHub repository for update checks — format: "owner/repo"
 # Configurable via Settings → Update Settings. Stored in prefs.json.
 _GITHUB_REPO: str = "https://github.com/Comrob2018/Draugr/tree/main"
