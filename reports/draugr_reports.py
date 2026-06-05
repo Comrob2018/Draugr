@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Draugr companion modules (all optional — graceful fallback)
 # ----------------------------------------------------------------------
 try:
-    from draugr_themes import report_css_overrides
+    from core.draugr_themes import report_css_overrides
     HAS_THEMES = True
 except ImportError:
     HAS_THEMES = False
@@ -44,7 +44,7 @@ except ImportError:
     def ics_summary_section(rows) -> str: return ""       # type: ignore
 
 try:
-    from draugr_plugins import collect_report_sections
+    from core.draugr_plugins import collect_report_sections
     HAS_PLUGINS = True
 except ImportError:
     HAS_PLUGINS = False
@@ -54,7 +54,7 @@ except ImportError:
 # ATT&CK scenario library
 # ----------------------------------------------------------------------
 try:
-    from resources.mitre_attack_scenarios import (
+    from intelligence.mitre_attack_scenarios import (
         TECHNIQUE_SCENARIOS as SCENARIOS,
         get_tactics,
         get_impact,
