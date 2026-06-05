@@ -2,6 +2,22 @@
 
 -----
 
+## 3.2.0
+> Project restructure and report accuracy fixes
+
+- Reorganised companion modules into subdirectories: `core/`, `reports/`, `intelligence/`
+- `core/` — `draugr_themes`, `draugr_plugins`, `draugr_cache`, `draugr_scheduler`
+- `reports/` — `draugr_reports`, `draugr_sbom`, `draugr_poam`, `draugr_fleet`, `draugr_diff`
+- `intelligence/` — `draugr_ics`, `draugr_advisories`, `draugr_alerts`, `draugr_remediation`
+- All imports in `draugr.py` and `draugr_reports.py` updated to use explicit package paths (e.g. `from core.draugr_themes import ...`)
+- `sys.path` bootstrap block retained in `draugr.py` for runtime resolution; removed from `draugr_reports.py` since explicit imports are now used
+- `pyrightconfig.json` added to project root to resolve Pylance import errors for the subdirectory structure
+- Fixed CVE total mismatch between donut chart and report summary — rows with unrecognised or missing CVSS severity were silently dropped from `sev_counts`, causing `total_s` in the donut to be lower than `total_cves`
+- Added `OTHER` bucket to `sev_counts` in both executive and technical reports — any severity not matching CRITICAL, HIGH, MEDIUM, or LOW is now captured there
+- Added `INFO` and `OTHER` segments to `_svg_donut()` — rendered in grey; only appear if non-zero; `total_s` now always equals `total_cves`
+
+-----
+
 ## 3.1.0
 
 > UI reorganisation and polish pass
