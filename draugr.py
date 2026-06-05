@@ -49,6 +49,15 @@ from packaging.version import Version, InvalidVersion
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus
 
+# ── Subdirectory path injection ────────────────────────────────────────
+# Companion modules are organised into subdirectories. Adding them to
+# sys.path here means all imports throughout the file stay unchanged.
+_APP_DIR = Path(__file__).parent
+for _subdir in ("core", "reports", "intelligence"):
+    _p = _APP_DIR / _subdir
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
 # Draugr companion modules (imported with fallback so headless CLI still works)
 try:
     from core.draugr_themes import set_theme, load_saved_theme, qt_stylesheet, t as _t, THEMES
@@ -81,12 +90,15 @@ except ImportError:
     HAS_ICS = False
 
 try:
-    from core.draugr_cache import get_db as _get_db, extract_system_id
+    from core.draugr_cache import get_db as _get_db, extract_system_id, \
+        get_analyst_note as _get_note, set_analyst_note as _set_note
     HAS_CACHE = True
 except ImportError:
     HAS_CACHE = False
     _get_db = None
     extract_system_id = lambda f: Path(f).stem
+    def _get_note(cve_id, sw_name): return ""    # type: ignore
+    def _set_note(cve_id, sw_name, note): pass   # type: ignore
 
 try:
     from reports.draugr_diff import compute_diff, build_diff_report, export_diff_csv, load_scan_csv
@@ -135,9 +147,9 @@ except ImportError:
     def remediation_summary(db): return {}                                              # type: ignore
     def remediation_report_section(db): return ""                                       # type: ignore
 
-# reports.draugr_reports is imported here so _THREAT_INTEL_CACHE is bound before any
+# draugr_reports is imported here so _THREAT_INTEL_CACHE is bound before any
 # function that writes to it (query_otx_for_cves) is defined below.
-# The cache dict is declared in reports.draugr_reports to avoid a circular import.
+# The cache dict is declared in draugr_reports to avoid a circular import.
 try:
     from reports.draugr_reports import (
         build_executive_report_markdown,
@@ -150,11 +162,11 @@ except ImportError:
     HAS_REPORTS = False
     _THREAT_INTEL_CACHE: Dict[str, Dict[str, Any]] = {}                                # type: ignore
     def build_executive_report_markdown(rows, report_title="", otx_results=None) -> str:  # type: ignore
-        return "# Report generation unavailable\n\nreports.draugr_reports.py could not be imported.\n"
+        return "# Report generation unavailable\n\ndraugr_reports.py could not be imported.\n"
     def build_defensive_report(rows, report_title="") -> str:                             # type: ignore
-        return "<html><body><p>reports.draugr_reports.py could not be imported.</p></body></html>"
+        return "<html><body><p>draugr_reports.py could not be imported.</p></body></html>"
     def build_redteam_report(rows, report_title="", otx_results=None) -> str:             # type: ignore
-        return "<html><body><p>reports.draugr_reports.py could not be imported.</p></body></html>"
+        return "<html><body><p>draugr_reports.py could not be imported.</p></body></html>"
 
 
 # ----------------------------------------------------------------------
@@ -183,6 +195,7 @@ try:
         QMainWindow,
         QMenu,
         QMessageBox,
+        QPlainTextEdit,
         QProgressBar,
         QPushButton,
         QSplashScreen,
@@ -209,7 +222,7 @@ EPSS_API_URL = "https://api.first.org/data/v1/epss"
 VULNERS_API_URL = "https://vulners.com/api/v3/search/id/"
 RATE_LIMIT_DELAY = 0.5
 USER_AGENT = "nvd-cve-puller/2.0"
-DRAUGR_VERSION = "3.1.0"
+DRAUGR_VERSION = "3.2.1"
 # GitHub repository for update checks — format: "owner/repo"
 # Configurable via Settings → Update Settings. Stored in prefs.json.
 _GITHUB_REPO: str = "https://github.com/Comrob2018/Draugr/tree/main"
@@ -1922,6 +1935,7 @@ def load_kev_with_fallback(path: str, *, log=None) -> Dict[str, Dict[str, str]]:
     emit("⚠ No local KEV file available. KEV checks will be skipped.", "warn")
     return {}
 
+
 def _normalise_version(ver: str) -> str:
     """
     Normalise a version string for deduplication purposes.
@@ -3131,7 +3145,7 @@ class CVEScannerWindow(QMainWindow):
         self.show_low       = False
         self.show_unverified = False
         self._scan_rows: List[Dict[str, Any]] = []   # last scan results for browser
-        self._loaded_csv_path: str = "" # path of the last CSV loaded into the browser
+        self._loaded_csv_path: str = ""               # path of last CSV loaded into browser
         self._profiles:  Dict[str, Dict[str, Any]] = self._load_profiles()
         self._tags:      Dict[str, str] = self._load_tags()
         _load_github_repo()   # pre-load repo slug from prefs
@@ -3533,12 +3547,6 @@ class CVEScannerWindow(QMainWindow):
         self.skip_btn.setToolTip("Skip the software item currently being scanned and move to the next one")
         self.skip_btn.setStyleSheet(ACTION_BTN_STYLE)
 
-        self.rescan_btn = QPushButton("🔄  Rescan")
-        self.rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.rescan_btn.setFixedSize(150, 44)
-        self.rescan_btn.setToolTip("Re-run a fresh scan using the software list from the currently loaded CSV")
-        self.rescan_btn.setStyleSheet(ACTION_BTN_STYLE)
-
         self.diff_btn = QPushButton("🔀   Compare Scans")
         self.diff_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.diff_btn.setFixedSize(160, 44)
@@ -3551,23 +3559,30 @@ class CVEScannerWindow(QMainWindow):
         self.trend_btn.setToolTip("View scan history and trends across all systems")
         self.trend_btn.setStyleSheet(ACTION_BTN_STYLE)
 
+        self.rescan_btn = QPushButton("🔄  Rescan")
+        self.rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rescan_btn.setFixedSize(150, 44)
+        self.rescan_btn.setToolTip("Re-run a fresh scan using the software list from the currently loaded CSV")
+        self.rescan_btn.setStyleSheet(ACTION_BTN_STYLE)
+        self.rescan_btn.setEnabled(False)
+
         btn_row.addWidget(self.scan_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.stop_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.skip_btn)
-        btn_row.addSpacing(5)
-        btn_row.addWidget(self.rescan_btn)
-        btn_row.addSpacing(5)
+        btn_row.addSpacing(14)
         btn_row.addWidget(self.diff_btn)
         btn_row.addSpacing(5)
         btn_row.addWidget(self.trend_btn)
+        btn_row.addSpacing(5)
+        btn_row.addWidget(self.rescan_btn)
         self.scan_btn.clicked.connect(lambda: self._start_scan(generate_executive_report=True))
         self.stop_btn.clicked.connect(self._stop_scan)
         self.skip_btn.clicked.connect(self._skip_current_software)
-        self.rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
         self.diff_btn.clicked.connect(self._run_diff)
         self.trend_btn.clicked.connect(self._view_scan_history)
+        self.rescan_btn.clicked.connect(self._rescan_from_loaded_csv)
         btn_row.addStretch()
         root.addLayout(btn_row)
 
@@ -3623,13 +3638,11 @@ class CVEScannerWindow(QMainWindow):
             border-color: {C.FG_DIM};
         }}
         """
-
-
+        self._checkbox_style = CHECKBOX_STYLE
 
         self.chk_medium = QCheckBox("Show MEDIUM")
         self.chk_medium.setChecked(False)
         self.chk_medium.setStyleSheet(CHECKBOX_STYLE)
-
 
         self.chk_low = QCheckBox("Show LOW")
         self.chk_low.setChecked(False)
@@ -3640,7 +3653,11 @@ class CVEScannerWindow(QMainWindow):
         self.chk_unverified.setToolTip("Show CVEs where the version match could not be confirmed")
         self.chk_unverified.setStyleSheet(CHECKBOX_STYLE)
 
+        root.addSpacing(4)
 
+        self.chk_medium.stateChanged.connect(self._update_show_medium)
+        self.chk_low.stateChanged.connect(self._update_show_low)
+        self.chk_unverified.stateChanged.connect(self._update_show_unverified)
 
         # ── Tab widget: Scan Log | Results Browser ─────────────────────
         from PyQt6.QtWidgets import QTabWidget, QSplitter, QTableWidget, QTableWidgetItem
@@ -3688,47 +3705,38 @@ class CVEScannerWindow(QMainWindow):
             }}
             """
         )
-        # Scan Log tab — log + toolbar
-        log_tab = QWidget()
-        log_tab_layout = QVBoxLayout(log_tab)
-        log_tab_layout.setContentsMargins(0, 0, 0, 0)
-        log_tab_layout.setSpacing(0)
-
-        # Toolbar
-        log_toolbar = QHBoxLayout()
-        log_toolbar.setContentsMargins(6, 4, 6, 4)
-
+        # Wrap the log in a QWidget with a toolbar above it
         _log_btn_style = (
             f"QPushButton {{ background: {C.BG_INPUT}; color: {C.FG_DIM}; "
             f"border: 1px solid {C.BORDER}; border-radius: 4px; "
             f"padding: 1px 8px; font-size: 11px; }}"
             f"QPushButton:hover {{ background: {C.BG_HOVER}; color: {C.FG}; }}"
         )
+        log_tab = QWidget()
+        log_tab_layout = QVBoxLayout(log_tab)
+        log_tab_layout.setContentsMargins(0, 0, 0, 0)
+        log_tab_layout.setSpacing(0)
+        log_toolbar = QHBoxLayout()
+        log_toolbar.setContentsMargins(6, 4, 6, 4)
         log_copy_btn = QPushButton("⎘  Copy Log")
         log_copy_btn.setFixedHeight(24)
         log_copy_btn.setToolTip("Copy the full log to clipboard")
         log_copy_btn.setStyleSheet(_log_btn_style)
         log_copy_btn.clicked.connect(self._copy_log)
-
         log_clear_btn = QPushButton("✕  Clear Log")
         log_clear_btn.setFixedHeight(24)
         log_clear_btn.setToolTip("Clear the scan log")
         log_clear_btn.setStyleSheet(_log_btn_style)
         log_clear_btn.clicked.connect(lambda: self.log.clear())
-
         log_toolbar.addWidget(log_copy_btn)
+        log_toolbar.addSpacing(4)
         log_toolbar.addWidget(log_clear_btn)
         log_toolbar.addStretch()
         log_toolbar.addWidget(self.chk_medium)
-        log_toolbar.addSpacing(4)
+        log_toolbar.addSpacing(8)
         log_toolbar.addWidget(self.chk_low)
-        log_toolbar.addSpacing(4)
+        log_toolbar.addSpacing(8)
         log_toolbar.addWidget(self.chk_unverified)
-
-        self.chk_medium.stateChanged.connect(self._update_show_medium)
-        self.chk_low.stateChanged.connect(self._update_show_low)
-        self.chk_unverified.stateChanged.connect(self._update_show_unverified)
-
         log_tab_layout.addLayout(log_toolbar)
         log_tab_layout.addWidget(self.log)
         self.tab_widget.addTab(log_tab, "📋  Scan Log")
@@ -3771,8 +3779,8 @@ class CVEScannerWindow(QMainWindow):
             f"QPushButton:disabled {{ background:{C.BORDER}; color:{C.FG_DIM}; }}"
         )
         gen_reports_btn.clicked.connect(self._generate_reports_from_loaded_csv)
-        self._gen_reports_btn = gen_reports_btn
         gen_reports_btn.setEnabled(False)
+        self.gen_reports_btn = gen_reports_btn
         source_bar.addWidget(self._results_source_label, 1)
         source_bar.addWidget(load_csv_btn)
         source_bar.addWidget(gen_reports_btn)
@@ -3812,6 +3820,18 @@ class CVEScannerWindow(QMainWindow):
         filter_bar.addWidget(self._sev_filter)
         filter_bar.addWidget(self._kev_filter)
         filter_bar.addWidget(self._unverified_filter)
+        filter_bar.addSpacing(8)
+        _export_view_btn = QPushButton("📥  Export View")
+        _export_view_btn.setFixedHeight(26)
+        _export_view_btn.setToolTip("Export only the currently visible (filtered) rows to CSV")
+        _export_view_btn.setStyleSheet(
+            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; "
+            f"padding:2px 10px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
+        )
+        _export_view_btn.clicked.connect(self._export_visible_rows)
+        filter_bar.addWidget(_export_view_btn)
         results_left_layout.addLayout(filter_bar)
 
         RESULTS_TABLE_COLS = ["CVE ID", "Software", "Severity", "Risk", "CVSS", "KEV", "Exploit", "EPSS"]
@@ -3886,6 +3906,34 @@ class CVEScannerWindow(QMainWindow):
         self._detail_panel.setPlaceholderText("Select a CVE from the table to see details…")
         self._detail_panel.setOpenExternalLinks(True)
         detail_layout.addWidget(self._detail_panel)
+
+        # Analyst notes
+        _notes_label = QLabel("ANALYST NOTES")
+        _notes_label.setStyleSheet(
+            f"color:{C.FG_DIM}; font-size:10px; font-weight:600; "
+            f"letter-spacing:2px; padding:6px 0 2px 0;"
+        )
+        detail_layout.addWidget(_notes_label)
+        self._notes_edit = QPlainTextEdit()
+        self._notes_edit.setPlaceholderText("Add analyst notes for this CVE…")
+        self._notes_edit.setFixedHeight(80)
+        self._notes_edit.setStyleSheet(
+            f"QPlainTextEdit {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:6px; "
+            f"padding:6px; font-size:12px; }}"
+            f"QPlainTextEdit:focus {{ border-color:{C.ACCENT}; }}"
+        )
+        self._notes_edit.setEnabled(False)
+        self._notes_edit.textChanged.connect(self._on_notes_changed)
+        detail_layout.addWidget(self._notes_edit)
+        self._notes_cve_id  = ""   # CVE ID currently shown in notes
+        self._notes_sw_name = ""   # software name for the current note
+        # Debounce timer — saves note 800ms after the user stops typing
+        from PyQt6.QtCore import QTimer as _QTimer
+        self._notes_save_timer = _QTimer(self)
+        self._notes_save_timer.setSingleShot(True)
+        self._notes_save_timer.setInterval(800)
+        self._notes_save_timer.timeout.connect(self._save_analyst_note)
         results_splitter.addWidget(detail_widget)
         results_splitter.setSizes([520, 380])
         results_splitter.setStyleSheet(
@@ -4056,6 +4104,11 @@ class CVEScannerWindow(QMainWindow):
         act_alerts.setToolTip("Configure email and webhook alerting")
         act_alerts.triggered.connect(self._configure_alerts)
         settings_menu.addAction(act_alerts)
+
+        act_scheduler = QAction("Scheduler…", self)
+        act_scheduler.setToolTip("Configure automated scheduled scanning")
+        act_scheduler.triggered.connect(self._open_scheduler_dialog)
+        settings_menu.addAction(act_scheduler)
 
         settings_menu.addSeparator()
 
@@ -4237,7 +4290,7 @@ class CVEScannerWindow(QMainWindow):
     def _update_data_action_buttons(self) -> None:
         """Enable or disable data-action buttons based on whether results are loaded."""
         has_data = bool(self._scan_rows)
-        self._gen_reports_btn.setEnabled(has_data)
+        self.gen_reports_btn.setEnabled(has_data)
         self.rescan_btn.setEnabled(has_data and not self.scanning)
 
     def _scan_finished(self):
@@ -4246,7 +4299,6 @@ class CVEScannerWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.skip_btn.setEnabled(False)
-        self.rescan_btn.setEnabled(True)
         self._dot_timer.stop()
         self._status_dot.setText("●  IDLE")
         self._status_dot.setStyleSheet(
@@ -4277,7 +4329,7 @@ class CVEScannerWindow(QMainWindow):
                 self._scan_btn_default_style.replace(C.RED, C.GREEN)
             )
         else:
-            self.scan_btn.setText("▶   Start Scan")
+            self.scan_btn.setText("▶️   Start Scan")
         QTimer.singleShot(3000, self._reset_scan_button)
 
         # Toast notification
@@ -4305,7 +4357,6 @@ class CVEScannerWindow(QMainWindow):
         if completed_rows:
             self._scan_rows = completed_rows
             self._loaded_csv_path = ""   # live scan, no CSV path
-            self._update_data_action_buttons()
             self._populate_results_table(self._scan_rows)
             import datetime as _dt
             _now = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
@@ -4317,6 +4368,7 @@ class CVEScannerWindow(QMainWindow):
             )
             self.tab_widget.setTabText(1, f"🔍  Results ({len(self._scan_rows)})")
             self.tab_widget.setCurrentIndex(1)
+            self._update_data_action_buttons()
         self.worker = None
 
     def _start_scan(self, generate_executive_report: bool = False,
@@ -4375,9 +4427,9 @@ class CVEScannerWindow(QMainWindow):
 
         self.scanning = True
         self.scan_btn.setEnabled(False)
-        self.rescan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.skip_btn.setEnabled(True)
+        self.rescan_btn.setEnabled(False)
         self.scan_btn.setText("Scanning …")
         self.tab_widget.setTabText(1, "🔍  Results Browser")
         self.log.clear()
@@ -4492,15 +4544,81 @@ class CVEScannerWindow(QMainWindow):
 
     def _on_result_row_selected(self, current_row: int) -> None:
         if current_row < 0 or not self._scan_rows:
+            self._notes_edit.setEnabled(False)
             return
-        # Find the matching row from _scan_rows by CVE ID
         cve_item = self._results_table.item(current_row, 0)
+        sw_item  = self._results_table.item(current_row, 1)
         if not cve_item:
             return
-        cve_id = cve_item.text()
+        cve_id  = cve_item.text()
+        sw_name = sw_item.text() if sw_item else ""
         row = next((r for r in self._scan_rows if r.get("CVE ID","") == cve_id), None)
         if row:
             self._detail_panel.setHtml(self._render_cve_detail(row))
+        # Load analyst note — block signals to avoid triggering save on load
+        self._notes_cve_id  = cve_id
+        self._notes_sw_name = sw_name
+        self._notes_edit.blockSignals(True)
+        if HAS_CACHE:
+            self._notes_edit.setPlainText(_get_note(cve_id, sw_name))
+        else:
+            self._notes_edit.setPlainText("")
+        self._notes_edit.blockSignals(False)
+        self._notes_edit.setEnabled(True)
+
+    def _on_notes_changed(self) -> None:
+        """Restart the debounce timer whenever the notes field changes."""
+        self._notes_save_timer.start()
+
+    def _save_analyst_note(self) -> None:
+        """Persist the current note to the DB after the debounce timer fires."""
+        if not HAS_CACHE or not self._notes_cve_id:
+            return
+        try:
+            _set_note(self._notes_cve_id, self._notes_sw_name,
+                      self._notes_edit.toPlainText())
+        except Exception:
+            pass
+
+    def _export_visible_rows(self) -> None:
+        """Export only the currently visible (non-hidden) rows to a CSV file."""
+        visible_rows = [
+            self._scan_rows[ri]
+            for ri in range(self._results_table.rowCount())
+            if not self._results_table.isRowHidden(ri)
+            and ri < len(self._scan_rows)
+        ]
+        if not visible_rows:
+            self._styled_msgbox("warning", "Nothing to Export",
+                                "No visible rows to export. Adjust your filters and try again.")
+            return
+
+        # Build visible row list using CVE ID lookup to guarantee correct data
+        cve_ids = set()
+        for ri in range(self._results_table.rowCount()):
+            if not self._results_table.isRowHidden(ri):
+                item = self._results_table.item(ri, 0)
+                if item:
+                    cve_ids.add(item.text())
+        export_rows = [r for r in self._scan_rows if r.get("CVE ID","") in cve_ids]
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Visible Rows", "filtered_results.csv",
+            "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            import csv as _csv
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                if export_rows:
+                    writer = _csv.DictWriter(f, fieldnames=export_rows[0].keys())
+                    writer.writeheader()
+                    writer.writerows(export_rows)
+            self._append_log(f"📥 Exported {len(export_rows)} visible row(s) → {path}", "ok")
+            Toast.show_toast(self, f"Exported {len(export_rows)} rows", "ok")
+        except Exception as e:
+            self._styled_msgbox("critical", "Export Error", str(e))
 
     def _results_context_menu(self, pos) -> None:
         row_index = self._results_table.rowAt(pos.y())
@@ -4746,7 +4864,7 @@ class CVEScannerWindow(QMainWindow):
     def _load_csv_into_browser(self) -> None:
         """Load a previously saved Draugr scan CSV into the Results Browser."""
         if not HAS_DIFF:
-            # load_scan_csv lives in reports.draugr_diff — fall back to built-in csv if missing
+            # load_scan_csv lives in draugr_diff — fall back to built-in csv if missing
             import csv as _csv
             path, _ = QFileDialog.getOpenFileName(
                 self, "Open Draugr Scan CSV", "", "CSV files (*.csv);;All files (*)"
@@ -4780,8 +4898,8 @@ class CVEScannerWindow(QMainWindow):
 
         self._scan_rows = rows
         self._loaded_csv_path = path
-        self._update_data_action_buttons()
         self._populate_results_table(self._scan_rows)
+        self._update_data_action_buttons()
 
         # Update source label
         import datetime as _dt
@@ -4817,12 +4935,12 @@ class CVEScannerWindow(QMainWindow):
         if not out_dir:
             return
 
-        # Derive a stem name from the source label (e.g. "agent_1.csv — …" → "agent_1")
-        source_text = self._results_source_label.text()
-        raw_stem = source_text.split("—")[0].strip() if "—" in source_text else "report"
-        # Strip extension if present
-        stem = Path(raw_stem).stem if raw_stem else "report"
-        # Sanitise: keep only alphanumeric, dash, underscore
+        # Derive stem from the actual loaded CSV path if available, else timestamp
+        if self._loaded_csv_path:
+            stem = Path(self._loaded_csv_path).stem
+        else:
+            import datetime as _dt
+            stem = f"scan_{_dt.datetime.now().strftime('%Y%m%d_%H%M')}"
         import re as _re
         stem = _re.sub(r"[^\w\-]", "_", stem).strip("_") or "report"
 
@@ -4899,6 +5017,7 @@ class CVEScannerWindow(QMainWindow):
 
         except Exception as e:
             self._append_log(f"❌ Report generation failed: {e}", "error")
+            self._update_status("Report generation failed.")
             self._styled_msgbox("critical", "Report Error", str(e))
 
     # ------------------------------------------------------------------
@@ -4976,7 +5095,7 @@ class CVEScannerWindow(QMainWindow):
     def _run_diff(self):
         if not HAS_DIFF:
             self._styled_msgbox("warning", "Unavailable",
-                "reports.draugr_diff.py not found. Place it in the same directory as draugr.py.")
+                "draugr_diff.py not found. Place it in the same directory as draugr.py.")
             return
 
         old_path, _ = QFileDialog.getOpenFileName(
@@ -4989,44 +5108,115 @@ class CVEScannerWindow(QMainWindow):
         )
         if not new_path:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
-        if not out_dir:
-            return
 
         try:
-            old_rows = load_scan_csv(old_path)
-            new_rows = load_scan_csv(new_path)
-            diff     = compute_diff(old_rows, new_rows)
-            stats    = diff["stats"]
-
-            stem          = Path(new_path).stem
-            diff_html     = Path(out_dir) / f"{stem}_diff.html"
-            diff_csv_out  = Path(out_dir) / f"{stem}_diff.csv"
-
-            with open(diff_html, "w", encoding="utf-8") as f:
-                f.write(build_diff_report(
-                    diff,
-                    old_label=Path(old_path).name,
-                    new_label=Path(new_path).name,
-                ))
-            n_csv = export_diff_csv(diff, str(diff_csv_out))
-
-            self._styled_msgbox("information", "Diff Complete",
-                f"Delta report generated:\n\n"
-                f"  New findings:  {stats['new_findings']}\n"
-                f"  Resolved:      {stats['resolved']}\n"
-                f"  Worsened:      {stats['worsened']}\n"
-                f"  Improved:      {stats['improved']}\n"
-                f"  Newly KEV:     {stats['newly_kev']}\n\n"
-                f"HTML: {diff_html}\n"
-                f"CSV:  {diff_csv_out}"
+            old_rows  = load_scan_csv(old_path)
+            new_rows  = load_scan_csv(new_path)
+            diff      = compute_diff(old_rows, new_rows)
+            stats     = diff["stats"]
+            diff_html = build_diff_report(
+                diff,
+                old_label=Path(old_path).name,
+                new_label=Path(new_path).name,
             )
             self._append_log(
-                f"Δ Diff complete: {stats['new_findings']} new, {stats['resolved']} resolved → {diff_html}",
+                f"Δ Diff: {stats['new_findings']} new, {stats['resolved']} resolved, "
+                f"{stats['worsened']} worsened, {stats['newly_kev']} newly KEV",
                 "ok"
             )
+            self._show_diff_viewer(diff_html, diff, Path(new_path).stem,
+                                   old_path, new_path)
         except Exception as e:
             self._styled_msgbox("critical", "Diff Error", str(e))
+
+    def _show_diff_viewer(self, html: str, diff: dict, stem: str,
+                          old_path: str, new_path: str) -> None:
+        """Show the diff report in an in-app viewer dialog."""
+        from PyQt6.QtWidgets import QDialog, QTextBrowser, QDialogButtonBox
+        from PyQt6.QtCore import Qt as _Qt
+
+        stats = diff["stats"]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Diff Report — {stem}")
+        dlg.setMinimumSize(1000, 700)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        # Stats bar
+        stats_bar = QHBoxLayout()
+        _sbar_style = (
+            f"background:{C.BG_CARD}; border:1px solid {C.BORDER}; "
+            f"border-radius:6px; padding:6px 14px; font-size:12px;"
+        )
+        for label, value, colour in [
+            ("New",        stats["new_findings"], C.RED),
+            ("Resolved",   stats["resolved"],     C.GREEN),
+            ("Worsened",   stats["worsened"],      C.ORANGE),
+            ("Improved",   stats["improved"],      C.GREEN),
+            ("Newly KEV",  stats["newly_kev"],     C.RED),
+        ]:
+            lbl = QLabel(f'{label}: <b style="color:{colour}">{value}</b>')
+            lbl.setStyleSheet(_sbar_style)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            stats_bar.addWidget(lbl)
+        stats_bar.addStretch()
+        layout.addLayout(stats_bar)
+
+        # HTML viewer
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        browser.setHtml(html)
+        browser.setStyleSheet(
+            f"QTextBrowser {{ background:#ffffff; color:#1a1a1a; "
+            f"border:1px solid {C.BORDER}; border-radius:6px; }}"
+        )
+        layout.addWidget(browser)
+
+        # Buttons
+        btn_box = QHBoxLayout()
+        _btn_style = (
+            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; padding:6px 16px; }}"
+            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
+        )
+        save_btn = QPushButton("💾  Save HTML")
+        save_btn.setStyleSheet(_btn_style)
+        csv_btn  = QPushButton("📥  Export CSV")
+        csv_btn.setStyleSheet(_btn_style)
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(_btn_style)
+        close_btn.clicked.connect(dlg.accept)
+
+        def _save_html():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, "Save Diff Report", f"{stem}_diff.html", "HTML Files (*.html)"
+            )
+            if path:
+                Path(path).write_text(html, encoding="utf-8")
+                Toast.show_toast(self, f"Saved → {Path(path).name}", "ok")
+
+        def _export_csv():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, "Export Diff CSV", f"{stem}_diff.csv", "CSV Files (*.csv)"
+            )
+            if path:
+                n = export_diff_csv(diff, path)
+                Toast.show_toast(self, f"Exported {n} rows → {Path(path).name}", "ok")
+
+        save_btn.clicked.connect(_save_html)
+        csv_btn.clicked.connect(_export_csv)
+
+        btn_box.addWidget(save_btn)
+        btn_box.addWidget(csv_btn)
+        btn_box.addStretch()
+        btn_box.addWidget(close_btn)
+        layout.addLayout(btn_box)
+
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # False Positive Manager
@@ -5034,7 +5224,7 @@ class CVEScannerWindow(QMainWindow):
     def _manage_false_positives(self):
         if not HAS_CACHE:
             self._styled_msgbox("warning", "Unavailable",
-                "core.draugr_cache.py not found. Place it in the same directory as draugr.py.")
+                "draugr_cache.py not found. Place it in the same directory as draugr.py.")
             return
 
         try:
@@ -5150,7 +5340,7 @@ class CVEScannerWindow(QMainWindow):
     def _view_scan_history(self):
         if not HAS_CACHE:
             self._styled_msgbox("warning", "Unavailable",
-                "core.draugr_cache.py not found. Place it in the same directory as draugr.py.")
+                "draugr_cache.py not found. Place it in the same directory as draugr.py.")
             return
         try:
             db      = _get_db()
@@ -5224,10 +5414,10 @@ class CVEScannerWindow(QMainWindow):
 
         def _export_fleet():
             if not HAS_FLEET:
-                QMessageBox.warning(dlg, "Unavailable", "reports.draugr_fleet.py not found.")
+                QMessageBox.warning(dlg, "Unavailable", "draugr_fleet.py not found.")
                 return
             path, _ = QFileDialog.getSaveFileName(
-                dlg, "Save Fleet Report", "reports.draugr_fleet_report.html", "HTML files (*.html)"
+                dlg, "Save Fleet Report", "draugr_fleet_report.html", "HTML files (*.html)"
             )
             if not path:
                 return
@@ -5257,7 +5447,7 @@ class CVEScannerWindow(QMainWindow):
     def _configure_alerts(self):
         if not HAS_ALERTS:
             self._styled_msgbox("warning", "Unavailable",
-                "intelligence.draugr_alerts.py not found. Place it in the same directory as draugr.py.")
+                "draugr_alerts.py not found. Place it in the same directory as draugr.py.")
             return
 
         from PyQt6.QtWidgets import QDialog
@@ -5375,11 +5565,181 @@ class CVEScannerWindow(QMainWindow):
 
 
     # ------------------------------------------------------------------
+    # Scheduler dialog
+    # ------------------------------------------------------------------
+    def _open_scheduler_dialog(self) -> None:
+        """Settings dialog for draugr_scheduler — configure and save scheduler jobs."""
+        from PyQt6.QtWidgets import (
+            QDialog, QTabWidget, QTableWidget, QTableWidgetItem,
+            QSpinBox, QDialogButtonBox, QHeaderView
+        )
+        from PyQt6.QtCore import Qt as _Qt
+
+        try:
+            from core.draugr_scheduler import load_scheduler_config, save_scheduler_config
+        except ImportError:
+            self._styled_msgbox("warning", "Unavailable",
+                "draugr_scheduler.py not found.")
+            return
+
+        cfg = load_scheduler_config()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Scheduler Configuration")
+        dlg.setMinimumSize(780, 520)
+        dlg.setStyleSheet(f"background:{C.BG}; color:{C.FG};")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        _label_style  = f"color:{C.FG_DIM}; font-size:11px;"
+        _input_style  = (
+            f"QLineEdit {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; padding:4px 8px; }}"
+            f"QLineEdit:focus {{ border-color:{C.ACCENT}; }}"
+        )
+        _spin_style = (
+            f"QSpinBox {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; padding:4px 8px; }}"
+        )
+        _check_style = self._checkbox_style
+        _btn_style = (
+            f"QPushButton {{ background:{C.BG_INPUT}; color:{C.FG}; "
+            f"border:1px solid {C.BORDER}; border-radius:4px; padding:5px 14px; }}"
+            f"QPushButton:hover {{ background:{C.BG_HOVER}; }}"
+        )
+
+        # ── Enable + interval ────────────────────────────────────────
+        top_row = QHBoxLayout()
+        chk_enabled = QCheckBox("Enable scheduled scanning")
+        chk_enabled.setStyleSheet(_check_style)
+        chk_enabled.setChecked(bool(cfg.get("enabled", False)))
+        top_row.addWidget(chk_enabled)
+        top_row.addStretch()
+        top_row.addWidget(QLabel("Interval (hours):"))
+        spin_interval = QSpinBox()
+        spin_interval.setRange(1, 720)
+        spin_interval.setValue(int(cfg.get("interval_hours", 24)))
+        spin_interval.setStyleSheet(_spin_style)
+        spin_interval.setFixedWidth(80)
+        top_row.addWidget(spin_interval)
+        layout.addLayout(top_row)
+
+        # ── Log file ─────────────────────────────────────────────────
+        log_row = QHBoxLayout()
+        log_row.addWidget(QLabel("Log file:"))
+        log_edit = QLineEdit(str(cfg.get("log_file", "draugr_scheduler.log")))
+        log_edit.setStyleSheet(_input_style)
+        log_row.addWidget(log_edit, 1)
+        layout.addLayout(log_row)
+
+        layout.addWidget(_sep := QFrame())
+        _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setStyleSheet(f"color:{C.BORDER};")
+
+        # ── Jobs table ───────────────────────────────────────────────
+        layout.addWidget(_jlbl := QLabel("Scan Jobs"))
+        _jlbl.setStyleSheet(f"color:{C.FG_DIM}; font-size:10px; font-weight:600; letter-spacing:2px;")
+
+        JOB_COLS = ["Name", "Input File", "Output Directory", "Diff", "Alert"]
+        tbl = QTableWidget(0, len(JOB_COLS))
+        tbl.setHorizontalHeaderLabels(JOB_COLS)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        tbl.setStyleSheet(
+            f"QTableWidget {{ background:{C.BG_CARD}; color:{C.FG}; "
+            f"gridline-color:{C.BORDER}; border:1px solid {C.BORDER}; }}"
+            f"QHeaderView::section {{ background:{C.BG_INPUT}; color:{C.FG_DIM}; "
+            f"border:1px solid {C.BORDER}; padding:4px; }}"
+        )
+        tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+
+        def _load_jobs():
+            tbl.setRowCount(0)
+            for job in cfg.get("jobs", []):
+                ri = tbl.rowCount()
+                tbl.insertRow(ri)
+                tbl.setItem(ri, 0, QTableWidgetItem(job.get("name", "")))
+                tbl.setItem(ri, 1, QTableWidgetItem(job.get("input", "")))
+                tbl.setItem(ri, 2, QTableWidgetItem(job.get("output", "")))
+                tbl.setItem(ri, 3, QTableWidgetItem("Yes" if job.get("diff", True) else "No"))
+                tbl.setItem(ri, 4, QTableWidgetItem("Yes" if job.get("alert", True) else "No"))
+
+        _load_jobs()
+        layout.addWidget(tbl)
+
+        # Job action buttons
+        job_btns = QHBoxLayout()
+        add_btn = QPushButton("➕  Add Job")
+        add_btn.setStyleSheet(_btn_style)
+        rem_btn = QPushButton("🗑  Remove Selected")
+        rem_btn.setStyleSheet(_btn_style)
+        job_btns.addWidget(add_btn)
+        job_btns.addWidget(rem_btn)
+        job_btns.addStretch()
+        layout.addLayout(job_btns)
+
+        def _add_job():
+            ri = tbl.rowCount()
+            tbl.insertRow(ri)
+            tbl.setItem(ri, 0, QTableWidgetItem("new-job"))
+            tbl.setItem(ri, 1, QTableWidgetItem(""))
+            tbl.setItem(ri, 2, QTableWidgetItem(""))
+            tbl.setItem(ri, 3, QTableWidgetItem("Yes"))
+            tbl.setItem(ri, 4, QTableWidgetItem("Yes"))
+
+        def _remove_job():
+            rows = sorted({i.row() for i in tbl.selectedItems()}, reverse=True)
+            for r in rows:
+                tbl.removeRow(r)
+
+        add_btn.clicked.connect(_add_job)
+        rem_btn.clicked.connect(_remove_job)
+
+        # ── Save / Cancel ─────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        save_btn   = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+        save_btn.setStyleSheet(_btn_style)
+        cancel_btn.setStyleSheet(_btn_style)
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        def _save():
+            jobs = []
+            for ri in range(tbl.rowCount()):
+                def _cell(c): return (tbl.item(ri, c).text() if tbl.item(ri, c) else "")
+                jobs.append({
+                    "name":   _cell(0),
+                    "input":  _cell(1),
+                    "output": _cell(2),
+                    "diff":   _cell(3).lower() == "yes",
+                    "alert":  _cell(4).lower() == "yes",
+                })
+            cfg["enabled"]        = chk_enabled.isChecked()
+            cfg["interval_hours"] = spin_interval.value()
+            cfg["log_file"]       = log_edit.text().strip() or "draugr_scheduler.log"
+            cfg["jobs"]           = jobs
+            try:
+                save_scheduler_config(cfg)
+                Toast.show_toast(self, "Scheduler configuration saved", "ok")
+                dlg.accept()
+            except Exception as e:
+                self._styled_msgbox("critical", "Save Error", str(e))
+
+        save_btn.clicked.connect(_save)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
     # Theme switcher
     # ------------------------------------------------------------------
     def _change_theme(self) -> None:
         if not HAS_THEMES:
-            self._styled_msgbox("information", "Theme", "core.draugr_themes.py not found — using default theme.")
+            self._styled_msgbox("information", "Theme", "draugr_themes.py not found — using default theme.")
             return
         from PyQt6.QtWidgets import QDialog, QListWidget
         dlg = QDialog(self)
@@ -5711,7 +6071,7 @@ class CVEScannerWindow(QMainWindow):
     def _manage_plugins(self) -> None:
         if not HAS_PLUGINS:
             self._styled_msgbox("warning", "Unavailable",
-                "core.draugr_plugins.py not found. Place it in the same directory as draugr.py.")
+                "draugr_plugins.py not found. Place it in the same directory as draugr.py.")
             return
 
         from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem
@@ -6330,12 +6690,15 @@ def parse_software_input(path: str) -> List[Tuple[str, str, str, str]]:
     """
     path_lower = path.lower()
 
+    # Try SBOM formats based on extension or content sniff
     if path_lower.endswith(".json"):
         try:
             with open(path, "r", encoding="utf-8-sig") as f:
                 peek = json.load(f)
+            # CycloneDX detection
             if peek.get("bomFormat", "").lower() == "cyclonedx" or "components" in peek:
                 raw = parse_sbom_cyclonedx(path)
+            # SPDX detection
             elif "SPDX" in str(peek.get("spdxVersion", "")) or "packages" in peek:
                 raw = parse_sbom_spdx(path)
             else:
