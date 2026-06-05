@@ -37,7 +37,7 @@ except ImportError:
     def report_css_overrides() -> str: return ""          # type: ignore
 
 try:
-    from draugr_ics import ics_summary_section
+    from intelligence.draugr_ics import ics_summary_section
     HAS_ICS = True
 except ImportError:
     HAS_ICS = False
